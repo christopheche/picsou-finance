@@ -8,6 +8,7 @@ import com.picsou.mcp.RequiresScope;
 import com.picsou.mcp.Scopes;
 import com.picsou.model.AccountType;
 import com.picsou.model.BalanceSnapshot;
+import com.picsou.service.AccountConnectionService;
 import com.picsou.service.AccountService;
 import com.picsou.service.UserContext;
 import org.springframework.ai.tool.annotation.Tool;
@@ -23,16 +24,22 @@ import java.util.List;
  * authenticated key owner's member via {@link UserContext} and delegates to the already
  * member-scoped {@link AccountService}; an access-key can therefore only ever touch its own
  * owner's accounts. Writes are restricted to <em>manual</em> accounts — {@link #createManualAccount}
- * always sets {@code isManual=true}; synced bank/broker/crypto accounts are managed by their sync.
+ * always sets {@code isManual=true}, and every other write tool refuses a synced account through
+ * {@link #requireManual}; synced bank/broker/crypto accounts are managed by their sync, and a
+ * leaked {@code accounts:write} key must not be able to rewrite their balance history or holdings.
  */
 @Component
 public class AccountTools {
 
     private final AccountService accountService;
+    private final AccountConnectionService accountConnectionService;
     private final UserContext userContext;
 
-    public AccountTools(AccountService accountService, UserContext userContext) {
+    public AccountTools(AccountService accountService,
+                        AccountConnectionService accountConnectionService,
+                        UserContext userContext) {
         this.accountService = accountService;
+        this.accountConnectionService = accountConnectionService;
         this.userContext = userContext;
     }
 
@@ -94,15 +101,24 @@ public class AccountTools {
         @ToolParam(description = "Balance; omit to leave the service default", required = false) BigDecimal currentBalance,
         @ToolParam(description = "Optional hex colour like #1a2b3c", required = false) String color,
         @ToolParam(description = "Optional ticker for single-asset accounts", required = false) String ticker) {
+        Long memberId = userContext.currentMemberId();
+        requireManual(accountId, memberId);
         AccountRequest req = new AccountRequest(name, type, null, currency, currentBalance, true, color, ticker, null, null);
-        return accountService.update(accountId, req, userContext.currentMemberId());
+        return accountService.update(accountId, req, memberId);
     }
 
-    @Tool(name = "delete_account", description = "Delete (soft-delete) an account of the authenticated member.")
+    /**
+     * Same path as {@code AccountController.delete}: {@link AccountConnectionService}, not
+     * {@code accountService.delete}, so the connection behind the account goes with it when no
+     * other live account is left on it (account-deletion ADR) rather than syncing on forever.
+     */
+    @Tool(name = "delete_account", description = "Delete (soft-delete) a manual account of the authenticated member.")
     @RequiresScope(Scopes.ACCOUNTS_WRITE)
     public String deleteAccount(
         @ToolParam(description = "The account id") Long accountId) {
-        accountService.delete(accountId, userContext.currentMemberId());
+        Long memberId = userContext.currentMemberId();
+        requireManual(accountId, memberId);
+        accountConnectionService.deleteAccount(accountId, memberId);
         return "Deleted account " + accountId;
     }
 
@@ -113,7 +129,9 @@ public class AccountTools {
         @ToolParam(description = "The account id") Long accountId,
         @ToolParam(description = "The balance to record") BigDecimal balance,
         @ToolParam(description = "Snapshot date, ISO yyyy-MM-dd") LocalDate date) {
-        return accountService.addManualSnapshot(accountId, userContext.currentMemberId(), new SnapshotRequest(balance, date));
+        Long memberId = userContext.currentMemberId();
+        requireManual(accountId, memberId);
+        return accountService.addManualSnapshot(accountId, memberId, new SnapshotRequest(balance, date));
     }
 
     @Tool(name = "upsert_holding",
@@ -126,6 +144,7 @@ public class AccountTools {
         @ToolParam(description = "Quantity held") BigDecimal quantity,
         @ToolParam(description = "Current price per unit in EUR") BigDecimal currentPriceEur) {
         Long memberId = userContext.currentMemberId();
+        requireManual(accountId, memberId);
         accountService.upsertHolding(accountId, memberId, ticker, name, quantity, currentPriceEur);
         return accountService.getHoldings(accountId, memberId);
     }
@@ -135,7 +154,21 @@ public class AccountTools {
     public String deleteHolding(
         @ToolParam(description = "The account id") Long accountId,
         @ToolParam(description = "Ticker symbol to remove") String ticker) {
-        accountService.deleteHolding(accountId, userContext.currentMemberId(), ticker);
+        Long memberId = userContext.currentMemberId();
+        requireManual(accountId, memberId);
+        accountService.deleteHolding(accountId, memberId, ticker);
         return "Deleted holding " + ticker + " from account " + accountId;
+    }
+
+    /**
+     * The documented {@code accounts:write} contract: writes reach manual accounts only. Resolved
+     * through the member-scoped service so a foreign id is a 404 here, before any write.
+     */
+    private void requireManual(Long accountId, Long memberId) {
+        AccountResponse account = accountService.findById(accountId, memberId);
+        if (!account.isManual()) {
+            throw new IllegalArgumentException(
+                "Account " + accountId + " is synced and managed by its connection; MCP writes are limited to manual accounts");
+        }
     }
 }

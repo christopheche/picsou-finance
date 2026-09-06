@@ -40,6 +40,8 @@ Two separate override mechanisms:
 - **GoalMonthOverride**: Overrides the monthly savings *objective* for a specific month. Useful when the user plans to save more or less than the computed target.
 - **GoalManualContribution**: Overrides the monthly savings *actual* for a specific month. Useful when the user wants to track contributions that don't appear in account balances (e.g. cash savings).
 
+Both are keyed by the `{yearMonth}` path variable, stored as-is. `GoalService` validates it as strict `YYYY-MM` (`parseYearMonth`) before any lookup or write and rejects anything else with `IllegalArgumentException` → 400; previously a loose value ("2025-3", "foo") was saved first and only then blew up in `YearMonth.parse`, surfacing as a 500 (`GoalServiceTest.*_malformedMonth_*`).
+
 ### History backfill (before goal creation)
 
 Users often start a goal in Picsou after they've already been saving for it. The backfill feature lets them extend the calendar *earlier* than the goal's creation date so they can record that prior history (typically as manual contributions).

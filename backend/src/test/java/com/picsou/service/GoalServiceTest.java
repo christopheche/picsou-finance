@@ -281,6 +281,71 @@ class GoalServiceTest {
         verify(manualContributionRepository, never()).delete(any());
     }
 
+    // ─── month key validation: rejected before any lookup or write ──────────
+    // The path variable is persisted as the row key, so a loose value used to be saved and then
+    // fail in YearMonth.parse — a rolled-back transaction surfacing as a 500 rather than a 400.
+
+    @Test
+    void setMonthOverride_malformedMonth_rejectsBeforeAnyWrite() {
+        assertThatThrownBy(() -> goalService.setMonthOverride(99L, "2025-3", new BigDecimal("100"), 42L))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("YYYY-MM");
+
+        verify(goalRepository, never()).findByIdAndMemberId(any(), any());
+        verify(overrideRepository, never()).save(any());
+    }
+
+    @Test
+    void setManualContribution_malformedMonth_rejectsBeforeAnyWrite() {
+        assertThatThrownBy(() -> goalService.setManualContribution(99L, "foo", new BigDecimal("100"), 42L))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("YYYY-MM");
+
+        verify(goalRepository, never()).findByIdAndMemberId(any(), any());
+        verify(manualContributionRepository, never()).save(any());
+    }
+
+    @Test
+    void deleteMonthOverride_malformedMonth_rejectsBeforeAnyLookup() {
+        assertThatThrownBy(() -> goalService.deleteMonthOverride(99L, "2026-13", 42L))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("YYYY-MM");
+
+        verify(goalRepository, never()).findByIdAndMemberId(any(), any());
+        verify(overrideRepository, never()).delete(any());
+    }
+
+    @Test
+    void deleteManualContribution_malformedMonth_rejectsBeforeAnyLookup() {
+        assertThatThrownBy(() -> goalService.deleteManualContribution(99L, "2026-06-01", 42L))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("YYYY-MM");
+
+        verify(goalRepository, never()).findByIdAndMemberId(any(), any());
+        verify(manualContributionRepository, never()).delete(any());
+    }
+
+    @Test
+    void setMonthOverride_wellFormedMonth_isAccepted() {
+        Goal goal = Goal.builder()
+            .member(GOAL_OWNER)
+            .id(99L)
+            .name("Trip")
+            .targetAmount(new BigDecimal("1200"))
+            .deadline(LocalDate.now().plusMonths(6))
+            .accounts(List.of())
+            .build();
+        when(goalRepository.findByIdAndMemberId(99L, 42L)).thenReturn(Optional.of(goal));
+        when(overrideRepository.findByGoalIdAndYearMonth(99L, "2026-06")).thenReturn(Optional.empty());
+        when(manualContributionRepository.findByGoalIdAndYearMonth(99L, "2026-06")).thenReturn(Optional.empty());
+
+        var response = goalService.setMonthOverride(99L, "2026-06", new BigDecimal("150"), 42L);
+
+        verify(overrideRepository).save(any(GoalMonthOverride.class));
+        assertThat(response.yearMonth()).isEqualTo("2026-06");
+        assertThat(response.override()).isEqualByComparingTo("150");
+    }
+
     @Test
     void deleteMonthOverride_ownedGoal_deletesEntry() {
         Goal goal = Goal.builder()

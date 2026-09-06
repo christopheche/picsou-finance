@@ -33,6 +33,11 @@ import java.util.Map;
  * deliberately NOT under {@code /api/admin/**}: every logged-in member manages their OWN keys. The
  * service scopes every read/revoke by the caller's member id, so one member can never see or revoke
  * another's keys, and {@code create} binds the new key to the caller's own member.
+ *
+ * <p>Every operation resolves {@link UserContext#ownMemberId()} rather than {@code currentMemberId()}:
+ * a key is bound to the {@code AppUser} that created it (a login-less managed profile cannot own one,
+ * see the access-key ADR), so an admin impersonating a managed profile keeps listing, throttling and
+ * revoking their own keys — the ones {@code create} would bind to anyway.
  */
 @RestController
 @RequestMapping("/api/access-keys")
@@ -52,14 +57,14 @@ public class AccessKeyController {
 
     @GetMapping
     public List<AccessKeyResponse> list() {
-        return accessKeyService.list(userContext.currentMemberId()).stream()
+        return accessKeyService.list(userContext.ownMemberId()).stream()
             .map(AccessKeyResponse::from)
             .toList();
     }
 
     @PostMapping
     public ResponseEntity<?> create(@Valid @RequestBody AccessKeyCreateRequest request) {
-        Long memberId = userContext.currentMemberId();
+        Long memberId = userContext.ownMemberId();
         if (!consumeCreateToken(memberId)) {
             ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.TOO_MANY_REQUESTS);
             detail.setDetail("Too many access-key creations. Try again later.");
@@ -81,7 +86,7 @@ public class AccessKeyController {
 
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> delete(@PathVariable Long id) {
-        boolean revoked = accessKeyService.revoke(id, userContext.currentMemberId());
+        boolean revoked = accessKeyService.revoke(id, userContext.ownMemberId());
         if (!revoked) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Access key not found");
         }

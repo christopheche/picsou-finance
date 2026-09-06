@@ -2,6 +2,7 @@ package com.picsou.controller;
 
 import com.picsou.dto.FamilyMemberRequest;
 import com.picsou.dto.FamilyMemberResponse;
+import com.picsou.dto.FamilyMemberUpdateRequest;
 import com.picsou.dto.SharingSettingsRequest;
 import com.picsou.dto.SharingSettingsResponse;
 import com.picsou.service.FamilyService;
@@ -45,14 +46,10 @@ public class FamilyController {
     @PutMapping("/members/{id}")
     public FamilyMemberResponse updateMember(
         @PathVariable Long id,
-        @RequestBody Map<String, String> body
+        @Valid @RequestBody FamilyMemberUpdateRequest req
     ) {
         requireAdmin();
-        String displayName = body.get("displayName");
-        if (displayName == null || displayName.isBlank()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "displayName is required");
-        }
-        return familyService.updateDisplayName(id, displayName);
+        return familyService.updateDisplayName(id, req.displayName());
     }
 
     @DeleteMapping("/members/{id}")

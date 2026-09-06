@@ -26,7 +26,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Optional;
 
@@ -107,6 +109,111 @@ class FamilyServiceTest {
     @Test
     void deriveUsername_fallsBackToUserWhenNameHasNoAlphanumerics() {
         assertThat(usernameFromActivation("!!!")).isEqualTo("user");
+    }
+
+    // ─── activation / reset tokens ────────────────────────────────────────
+    // Both mint a token that lets whoever holds it set the member's password, so what each
+    // one refuses, and what it leaves untouched, is the privacy boundary.
+
+    @Test
+    void generateActivationToken_activatedUser_throwsBadRequest() {
+        AppUser independent = AppUser.builder().activated(true).passwordHash("hash").build();
+        when(memberRepository.findById(3L)).thenReturn(Optional.of(member("Alice")));
+        when(userRepository.findByMemberId(3L)).thenReturn(Optional.of(independent));
+
+        assertThatThrownBy(() -> familyService.generateActivationToken(3L))
+            .isInstanceOfSatisfying(ResponseStatusException.class, e ->
+                assertThat(e.getStatusCode()).isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST))
+            .hasMessageContaining("already has an active login");
+
+        verify(userRepository, never()).save(any());
+        assertThat(independent.getActivationToken()).isNull();
+    }
+
+    @Test
+    void generateActivationToken_existingUnactivatedUser_rotatesTokenWithoutCreatingUser() {
+        AppUser pending = AppUser.builder()
+            .username("alice")
+            .activated(false)
+            .activationToken("old-token")
+            .activationTokenExpires(Instant.now().minus(1, ChronoUnit.DAYS))
+            .build();
+        when(memberRepository.findById(3L)).thenReturn(Optional.of(member("Alice")));
+        when(userRepository.findByMemberId(3L)).thenReturn(Optional.of(pending));
+
+        String token = familyService.generateActivationToken(3L);
+
+        ArgumentCaptor<AppUser> captor = ArgumentCaptor.forClass(AppUser.class);
+        verify(userRepository).save(captor.capture());
+        assertThat(captor.getValue()).isSameAs(pending);       // rotated in place, no second login
+        assertThat(token).matches("[0-9a-f]{64}").isNotEqualTo("old-token");
+        assertThat(pending.getActivationToken()).isEqualTo(token);
+        assertThat(pending.getActivationTokenExpires()).isAfter(Instant.now().plus(6, ChronoUnit.DAYS));
+        assertThat(pending.getUsername()).isEqualTo("alice");   // username is not re-derived
+        verify(userRepository, never()).existsByUsername(any());
+    }
+
+    @Test
+    void generateActivationToken_unknownMember_throwsNotFound() {
+        when(memberRepository.findById(3L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> familyService.generateActivationToken(3L))
+            .isInstanceOfSatisfying(ResponseStatusException.class, e ->
+                assertThat(e.getStatusCode()).isEqualTo(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    void resetPasswordToken_existingLogin_setsTokenAndSevenDayExpiry_keepsActivationAndPassword() {
+        AppUser user = AppUser.builder()
+            .username("alice")
+            .passwordHash("existing-hash")
+            .activated(true)
+            .build();
+        when(memberRepository.findById(3L)).thenReturn(Optional.of(member("Alice")));
+        when(userRepository.findByMemberId(3L)).thenReturn(Optional.of(user));
+
+        String token = familyService.resetPasswordToken(3L);
+
+        ArgumentCaptor<AppUser> captor = ArgumentCaptor.forClass(AppUser.class);
+        verify(userRepository).save(captor.capture());
+        AppUser saved = captor.getValue();
+        assertThat(saved).isSameAs(user);
+        assertThat(token).matches("[0-9a-f]{64}");
+        assertThat(saved.getActivationToken()).isEqualTo(token);
+        assertThat(saved.getActivationTokenExpires())
+            .isAfter(Instant.now().plus(7, ChronoUnit.DAYS).minus(1, ChronoUnit.MINUTES))
+            .isBefore(Instant.now().plus(7, ChronoUnit.DAYS).plus(1, ChronoUnit.MINUTES));
+        // A reset does not lock the member out: password and activation survive until the
+        // token is consumed.
+        assertThat(saved.getPasswordHash()).isEqualTo("existing-hash");
+        assertThat(saved.isActivated()).isTrue();
+    }
+
+    @Test
+    void resetPasswordToken_memberWithoutLogin_throwsBadRequest() {
+        when(memberRepository.findById(3L)).thenReturn(Optional.of(member("Child")));
+        when(userRepository.findByMemberId(3L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> familyService.resetPasswordToken(3L))
+            .isInstanceOfSatisfying(ResponseStatusException.class, e ->
+                assertThat(e.getStatusCode()).isEqualTo(org.springframework.http.HttpStatus.BAD_REQUEST))
+            .hasMessageContaining("no login to reset");
+
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    void resetPasswordToken_unknownMember_throwsNotFound() {
+        when(memberRepository.findById(3L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> familyService.resetPasswordToken(3L))
+            .isInstanceOfSatisfying(ResponseStatusException.class, e ->
+                assertThat(e.getStatusCode()).isEqualTo(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        verify(userRepository, never()).findByMemberId(any());
+        verify(userRepository, never()).save(any());
     }
 
     // ─── deleteMember ───────────────────────────────────────────────────

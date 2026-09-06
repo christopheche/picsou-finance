@@ -17,6 +17,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '
 import { Separator } from '@/components/ui/separator'
 import { ArrowLeft, Calendar, LayoutGrid, Clock, Loader2, Plus } from 'lucide-react'
 import { cn, formatCurrency, localeFromLanguage, parseAmount } from '@/lib/utils'
+import { formatApiError } from '@/lib/errors'
 import type { GoalMonthEntry } from '@/types/api'
 
 // ---------------------------------------------------------------------------
@@ -27,6 +28,17 @@ function isPastOrCurrent(ym: string): boolean {
   const now = new Date()
   const [y, m] = ym.split('-').map(Number)
   return y < now.getFullYear() || (y === now.getFullYear() && m <= now.getMonth() + 1)
+}
+
+/**
+ * Strictly before the current month -- the definition `isOnTrack` uses (see
+ * `docs/features/goals.md`). The month in progress has not had its chance yet, so it belongs
+ * in the views (which show it as ongoing) but never in a scorecard denominator.
+ */
+function isStrictlyPast(ym: string): boolean {
+  const now = new Date()
+  const [y, m] = ym.split('-').map(Number)
+  return y < now.getFullYear() || (y === now.getFullYear() && m < now.getMonth() + 1)
 }
 
 function monthDate(ym: string): Date {
@@ -221,7 +233,7 @@ function YearGridView({ months, selectedYm, onSelect, onAddPreviousMonth, isAddi
                         </div>
                       </div>
                       <span className="text-[10px] text-muted-foreground leading-none">
-                        obj.&nbsp;{formatCompact(monthObjective(entry), locale, currency)}
+                        {t('goals.objectiveShort')}&nbsp;{formatCompact(monthObjective(entry), locale, currency)}
                       </span>
                     </button>
                   )
@@ -242,7 +254,7 @@ function YearGridView({ months, selectedYm, onSelect, onAddPreviousMonth, isAddi
 function TimelineView({ months, selectedYm, onSelect }: {
   months: GoalMonthEntry[]; selectedYm: string | null; onSelect: (ym: string) => void
 }) {
-  const { i18n } = useTranslation()
+  const { t, i18n } = useTranslation()
   const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
   const sorted = useMemo(() =>
     [...(months ?? [])].filter(e => isPastOrCurrent(e.yearMonth)).reverse(),
@@ -276,10 +288,10 @@ function TimelineView({ months, selectedYm, onSelect }: {
                 {entry.effective != null ? <CurrencyDisplay value={entry.effective} /> : ''}
               </span>
               {entry.manualActual != null && (
-                <Badge variant="secondary" className="text-[10px] px-1.5 py-0">manu.</Badge>
+                <Badge variant="secondary" className="text-[10px] px-1.5 py-0">{t('goals.manualShort')}</Badge>
               )}
               {entry.override != null && (
-                <Badge variant="outline" className="text-[10px] px-1.5 py-0">modif.</Badge>
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0">{t('goals.modifiedShort')}</Badge>
               )}
             </button>
           )
@@ -296,7 +308,7 @@ function TimelineView({ months, selectedYm, onSelect }: {
 function CalendarGridView({ months, selectedYm, onSelect }: {
   months: GoalMonthEntry[]; selectedYm: string | null; onSelect: (ym: string) => void
 }) {
-  const { i18n } = useTranslation()
+  const { t, i18n } = useTranslation()
   const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
   const years = useMemo(() => groupByYear(months), [months])
 
@@ -330,7 +342,7 @@ function CalendarGridView({ months, selectedYm, onSelect }: {
                           <div className="h-full rounded-full bg-primary/70 transition-[width]" style={{ width: `${Math.min(100, pct * 100)}%` }} />
                         </div>
                         <div className="flex justify-between text-[11px] text-muted-foreground">
-                          <span>obj. <CurrencyDisplay value={monthObjective(entry)} className="text-[11px]" /></span>
+                          <span>{t('goals.objectiveShort')} <CurrencyDisplay value={monthObjective(entry)} className="text-[11px]" /></span>
                           <span><CurrencyDisplay value={entry.effective} className="text-[11px]" /></span>
                         </div>
                       </div>
@@ -339,8 +351,8 @@ function CalendarGridView({ months, selectedYm, onSelect }: {
                     )}
                     {(entry.manualActual != null || entry.override != null) && (
                       <div className="flex gap-1 mt-1.5">
-                        {entry.manualActual != null && <Badge variant="secondary" className="text-[9px] px-1 py-0">manu.</Badge>}
-                        {entry.override != null && <Badge variant="outline" className="text-[9px] px-1 py-0 text-violet-500 border-violet-300">modif.</Badge>}
+                        {entry.manualActual != null && <Badge variant="secondary" className="text-[9px] px-1 py-0">{t('goals.manualShort')}</Badge>}
+                        {entry.override != null && <Badge variant="outline" className="text-[9px] px-1 py-0 text-violet-500 border-violet-300">{t('goals.modifiedShort')}</Badge>}
                       </div>
                     )}
                   </button>
@@ -508,7 +520,7 @@ export function GoalCalendarPage() {
   const { t, i18n } = useTranslation()
   const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
 
-  const { data: goal, isLoading: goalLoading, error: goalError } = useGoal(goalId)
+  const { data: goal, isLoading: goalLoading, error: goalError, refetch: refetchGoal } = useGoal(goalId)
   const { data: months, isLoading: monthsLoading } = useGoalMonths(goalId)
   const extendHistory = useExtendGoalHistory()
   const extendHistoryByMonth = useExtendGoalHistoryByMonth()
@@ -563,12 +575,20 @@ export function GoalCalendarPage() {
     return (
       <div className="space-y-6">
         <PageHeader title={t('goals.calendar')} />
-        <ErrorState message={goalError?.message ?? t('common.notFound')} onRetry={() => window.location.reload()} />
+        {/* Never `goalError.message`: that is the raw axios line ("Request failed with status
+            code 404"). `formatApiError` translates it; a missing goal with no error is a 404
+            in spirit. */}
+        <ErrorState
+          message={goalError ? formatApiError(goalError, t) : t('error.notFound')}
+          onRetry={() => { void refetchGoal() }}
+        />
       </div>
     )
   }
 
-  const pastMonths = (months ?? []).filter(e => isPastOrCurrent(e.yearMonth))
+  // Strictly past: the month in progress has not had its chance yet, so counting it as a miss
+  // put the badge at odds with the "on track" verdict on the goal card (docs/features/goals.md).
+  const pastMonths = (months ?? []).filter(e => isStrictlyPast(e.yearMonth))
   const achievedCount = pastMonths.filter(
     e => e.effective != null && e.effective >= monthObjective(e)
   ).length
@@ -653,7 +673,15 @@ export function GoalCalendarPage() {
         {/* Desktop: sticky side panel (does not collapse → no layout shift) */}
         <div className="hidden lg:block lg:sticky lg:top-4">
           {selectedEntry ? (
-            <MonthDetailPanel goalId={goalId} entry={selectedEntry} onClose={() => setSelectedYm(null)} />
+            /* Keyed per month: the inputs are seeded by lazy `useState` initializers, so
+               without a remount a different month reuses the previously typed values and
+               "Save" writes them to the wrong month (docs/conventions/frontend.md). */
+            <MonthDetailPanel
+              key={selectedEntry.yearMonth}
+              goalId={goalId}
+              entry={selectedEntry}
+              onClose={() => setSelectedYm(null)}
+            />
           ) : (
             <Card className="flex items-center justify-center p-6">
               <p className="text-center text-sm text-muted-foreground">{t('goals.clickMonthHint')}</p>
@@ -678,6 +706,7 @@ export function GoalCalendarPage() {
           </SheetHeader>
           {selectedEntry && (
             <MonthDetailPanel
+              key={selectedEntry.yearMonth}
               goalId={goalId}
               entry={selectedEntry}
               onClose={() => setSelectedYm(null)}

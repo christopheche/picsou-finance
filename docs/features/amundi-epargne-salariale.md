@@ -1,6 +1,6 @@
 # Feature: Amundi Épargne Salariale sync
 
-> Last updated: 2026-08-09
+> Last updated: 2026-09-06 (`AmundiSyncRecoveryTest` added)
 
 ## Context
 
@@ -209,6 +209,9 @@ See [the ADR](../decisions/2026-08-09-amundi-epargne-salariale-sidecar.md).
   sidecar contract, every error-code mapping, the explicit null `code` for an
   app push, and that the validation timeout outlives the auth timeout
 - `AmundiAdapterWiringTest` — Spring picks the production constructor
+- `AmundiSyncRecoveryTest` — the boot runner delegates to
+  `recoverInterruptedSyncs()` and is ordered before `StartupSyncService`, so a
+  stale RUNNING row cannot make the startup `queueSync` return early
 - `AmundiControllerTest` — member scoping, 202 on sync, rate limiting, an app
   push accepted without a code
 - `AccountServiceTest` — an Amundi account with unpriceable FCPEs falls back to

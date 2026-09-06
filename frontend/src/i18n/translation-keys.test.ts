@@ -58,3 +58,69 @@ describe('translation keys used in code', () => {
     expect(Object.keys(sources).length).toBeGreaterThan(100)
   })
 })
+
+/**
+ * And the third direction: a key every locale defines but no code ever asks for.
+ * Parity keeps the four files in step, so a dead string is dead four times over and
+ * translators keep maintaining it; ~49 of them had piled up (the whole `realEstate.*`
+ * namespace, superseded by `property.*`, among them) before this check existed.
+ *
+ * The scan is deliberately generous — it counts a key as used on any of:
+ *   - the full dotted path appearing as a string literal anywhere in `src/`
+ *     (not only inside `t()`: `labelKey:` maps and `i18nKey` props count too);
+ *   - an *ancestor* path of two or more segments appearing as a literal, which covers
+ *     namespace access — `labelNs="holdings.insight.countryNames"` and
+ *     `t('setup.greetings', { returnObjects: true })`;
+ *   - a template literal in the source matching the key once every `${…}` is treated
+ *     as one path segment: `` t(`property.kind.${kind}`) `` and the mid-segment
+ *     `` t(`property.add.step${step}Hint`) `` both resolve here.
+ * A single-segment ancestor (`'goals'`, `'settings'`) is *not* enough: those words
+ * appear as plain strings all over the app and would whitewash their whole namespace.
+ * A key no rule can reach belongs in ALLOWED_DYNAMIC below, with a reason.
+ */
+
+// Any dotted path in quotes of any kind.
+const DOTTED_LITERAL = /['"`]([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)['"`]/g
+// A template literal made only of key characters and `${…}` holes, e.g. `sync.finary.step${s}`.
+// One starting with a hole (`` `${labelNs}.${raw}` ``) names no namespace, so it is skipped —
+// the literal-ancestor rule is what covers those call sites.
+const KEY_TEMPLATE = /`([A-Za-z0-9_.]+(?:\$\{[^`{}]*\}[A-Za-z0-9_.]*)+)`/g
+
+// Keys reached in a way the scan cannot see. Empty on purpose: keep it that way.
+const ALLOWED_DYNAMIC: string[] = []
+
+function templateToPattern(body: string): RegExp {
+  const segments = body.split(/\$\{[^{}]*\}/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  return new RegExp(`^${segments.join('[A-Za-z0-9_]+')}$`)
+}
+
+describe('translation keys defined in the bundles', () => {
+  const literals = new Set<string>()
+  const patterns: RegExp[] = []
+  for (const [path, content] of Object.entries(sources)) {
+    if (/\.(test|spec)\.tsx?$/.test(path)) continue
+    for (const match of content.matchAll(DOTTED_LITERAL)) literals.add(match[1])
+    for (const match of content.matchAll(KEY_TEMPLATE)) patterns.push(templateToPattern(match[1]))
+  }
+
+  const isUsed = (key: string) => {
+    if (literals.has(key)) return true
+    const segments = key.split('.')
+    for (let cut = 2; cut < segments.length; cut++) {
+      if (literals.has(segments.slice(0, cut).join('.'))) return true
+    }
+    return patterns.some((pattern) => pattern.test(key))
+  }
+
+  it('are all referenced from the source', () => {
+    const allowed = new Set(ALLOWED_DYNAMIC)
+    const unused = [...collectKeys(en as TranslationNode)]
+      .filter((key) => !allowed.has(key) && !isUsed(key))
+      .sort()
+    expect(unused).toEqual([])
+    // The rules are only as good as the scan: a glob or a regex that stops matching
+    // would mark everything unused, or nothing.
+    expect(patterns.length).toBeGreaterThan(20)
+    expect(literals.size).toBeGreaterThan(500)
+  })
+})

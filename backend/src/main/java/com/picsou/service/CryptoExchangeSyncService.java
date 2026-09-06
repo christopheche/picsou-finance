@@ -24,6 +24,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -127,10 +128,22 @@ public class CryptoExchangeSyncService {
             .orElseThrow(() -> new ResourceNotFoundException("Exchange session not found"));
 
         CryptoExchangePort adapter = findAdapter(session.getExchangeType());
-        String decryptedKey = encryption.decrypt(session.getApiKey());
-        String decryptedSecret = encryption.decrypt(session.getApiSecret());
 
         try {
+            // Inside the guarded block, so a rotated CRYPTO_ENCRYPTION_KEY (or a corrupt row)
+            // marks the session ERROR and tells the user what to do, instead of escaping as a
+            // generic 500 while the exchange keeps reading CONNECTED. Same rule as IBKR.
+            String decryptedKey;
+            String decryptedSecret;
+            try {
+                decryptedKey = encryption.decrypt(session.getApiKey());
+                decryptedSecret = encryption.decrypt(session.getApiSecret());
+            } catch (RuntimeException ex) {
+                throw new SyncException("Could not decrypt the stored " + session.getExchangeType()
+                    + " credentials — the encryption key may have changed. Please remove the "
+                    + "exchange and connect it again with fresh API keys.", ex);
+            }
+
             List<ExchangePosition> positions = adapter.fetchPositions(decryptedKey, decryptedSecret);
 
             // The account balance and its holdings are per asset, whatever product it sits under;
@@ -206,13 +219,24 @@ public class CryptoExchangeSyncService {
             }
 
             // Persist individual holdings before snapshot (so calculateInvestedAmount finds them)
+            Set<String> heldTickers = new HashSet<>();
             for (var holding : quantities.entrySet()) {
+                if (holding.getValue().signum() > 0) {
+                    heldTickers.add(holding.getKey());
+                }
                 BigDecimal price = prices.get(holding.getKey());
                 if (price != null) {
                     accountService.upsertHolding(account.getId(), memberId, holding.getKey(),
                         holding.getKey(), holding.getValue(), price);
                 }
             }
+            // Drop the holdings of assets the exchange no longer reports — sold, withdrawn — or
+            // they keep being valued at live price by AccountService.valuation, and through it by
+            // the dashboard and every daily snapshot, long after the coins are gone. Keyed on
+            // what is *held*, never on what *priced*: a CoinGecko outage returns no prices, and
+            // pruning on those would wipe every holding and its cost basis. Same rule as
+            // WalletSyncService.
+            accountService.pruneHoldings(account, heldTickers);
 
             replacePositions(account, positions);
 
@@ -279,8 +303,14 @@ public class CryptoExchangeSyncService {
         for (CryptoExchangeSession session : sessions) {
             try {
                 sync(session.getId(), memberId);
-            } catch (Exception ex) {
+            } catch (SyncException ex) {
+                // Expected upstream flakiness: sync() has already marked the session ERROR and
+                // the message is the whole story.
                 log.warn("Crypto exchange resync failed for {}: {}", session.getExchangeType(), ex.getMessage());
+            } catch (RuntimeException ex) {
+                // Anything else escaped before sync()'s own guard (a missing session row, say)
+                // and is a bug: keep the trace, "null" for an NPE diagnoses nothing.
+                log.error("Crypto exchange resync failed for {}", session.getExchangeType(), ex);
             }
         }
     }

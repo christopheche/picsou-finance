@@ -23,6 +23,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -163,7 +164,15 @@ public class WalletSyncService {
             Set<String> tickers = balances.stream()
                 .map(b -> b.symbol().toUpperCase(Locale.ROOT))
                 .collect(Collectors.toSet());
-            Map<String, BigDecimal> prices = priceService.refreshPrices(tickers);
+            // Crypto-only, like the exchange sync: an on-chain symbol CoinGecko does not map must
+            // read as "no price", never as the share price of the same-named equity Yahoo would
+            // return — that figure would be written into the balance and today's snapshot with
+            // nothing in the logs to reveal it. Quotes rather than raw prices, so an asset the
+            // provider cannot deliver right now is valued from the last price recorded for it
+            // instead of leaving a hole in the net-worth history.
+            Map<String, PriceService.Quote> quotes = priceService.refreshCryptoQuotes(tickers);
+            Map<String, BigDecimal> prices = new HashMap<>();
+            quotes.forEach((ticker, quote) -> prices.put(ticker, quote.price()));
 
             // Resolve each balance's ticker + price once, then reuse it for both the
             // EUR total and the holding upserts (one pass, one price lookup).
@@ -247,9 +256,17 @@ public class WalletSyncService {
 
             return Optional.of(account);
 
-        } catch (WalletRpcException | SyncException ex) {
-            // Expected external failure (bad RPC response, no balances): a routine
-            // sync problem, not a bug. Keep the friendly 422 the user sees.
+        } catch (SyncException ex) {
+            // Rethrown as-is: the messages built above name what went wrong and what to do
+            // about it (no price for any held asset, an adapter returning nothing). Wrapping
+            // them in the generic text below told the user to retry a condition that retrying
+            // never resolves — an unmapped coin stays unmapped. Same rule as the exchange sync.
+            log.warn("Wallet sync failed for {} {}: {}", wallet.getChain(), wallet.getAddress(), ex.getMessage());
+            throw ex;
+        } catch (WalletRpcException ex) {
+            // Expected external failure (bad RPC response): a routine sync problem, not a
+            // bug, and a technical signal with no user-facing text of its own. Keep the
+            // friendly 422 the user sees.
             log.warn("Wallet sync failed for {} {}: {}", wallet.getChain(), wallet.getAddress(), ex.getMessage());
             throw new SyncException("Could not sync your " + wallet.getChain() + " wallet. Please try again later.", ex);
         } catch (Exception ex) {

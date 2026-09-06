@@ -19,6 +19,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -57,6 +58,11 @@ class WalletSyncServiceTest {
         return WalletAddress.builder().id(id).chain(chain).address(address).build();
     }
 
+    /** A live quote at the given EUR price, as {@code refreshCryptoQuotes} returns them. */
+    private static PriceService.Quote quote(String priceEur) {
+        return new PriceService.Quote(new BigDecimal(priceEur), LocalDate.now(), true);
+    }
+
     @Test
     void sync_wrapsRpcErrorInSyncException_andDoesNotMarkWalletSynced() {
         WalletAddress wallet = wallet(1L, Chain.EVM, "0xabc");
@@ -88,8 +94,8 @@ class WalletSyncServiceTest {
             new WalletBalance("USDC", new BigDecimal("50"))));
 
         // 1 SOL @ 20 EUR + 50 USDC @ 1 EUR = 70.00 EUR.
-        when(priceService.refreshPrices(any()))
-            .thenReturn(Map.of("SOL", new BigDecimal("20"), "USDC", new BigDecimal("1")));
+        when(priceService.refreshCryptoQuotes(any()))
+            .thenReturn(Map.of("SOL", quote("20"), "USDC", quote("1")));
         when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
         Account savedAccount = mock(Account.class);
@@ -135,12 +141,15 @@ class WalletSyncServiceTest {
         when(adapter.fetchBalances(any())).thenReturn(List.of(
             new WalletBalance("ETH", BigDecimal.ONE),
             new WalletBalance("USDC", new BigDecimal("50"))));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of()); // price outage
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of()); // price outage
 
         WalletSyncService service = serviceWith(adapter);
 
         assertThatThrownBy(() -> service.sync(1L, MEMBER_ID))
-            .isInstanceOf(SyncException.class);
+            .isInstanceOf(SyncException.class)
+            // The specific refusal, not the generic "try again later": an unmapped coin never
+            // maps by retrying, and the user needs to know what to act on.
+            .hasMessageContaining("refusing to record a zero balance");
 
         // Nothing persisted: no zero balance, no zero snapshot, no prune, and the wallet
         // is not marked synced. It keeps whatever balance it last had.
@@ -163,7 +172,7 @@ class WalletSyncServiceTest {
         when(adapter.fetchBalances(any())).thenReturn(List.of(
             new WalletBalance("ETH", BigDecimal.ONE),
             new WalletBalance("SOMETOKEN", new BigDecimal("50"))));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("ETH", new BigDecimal("2000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("ETH", quote("2000")));
 
         when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
@@ -200,7 +209,7 @@ class WalletSyncServiceTest {
         WalletPort adapter = mock(WalletPort.class);
         when(adapter.chain()).thenReturn(Chain.EVM);
         when(adapter.fetchBalances(any())).thenReturn(List.of(new WalletBalance("ETH", BigDecimal.ONE)));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("ETH", new BigDecimal("2000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("ETH", quote("2000")));
         when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
         Account savedAccount = mock(Account.class);
@@ -230,7 +239,7 @@ class WalletSyncServiceTest {
         WalletPort adapter = mock(WalletPort.class);
         when(adapter.chain()).thenReturn(Chain.EVM);
         when(adapter.fetchBalances(any())).thenReturn(List.of(new WalletBalance("ETH", BigDecimal.ZERO)));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of());
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of());
 
         when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
@@ -254,7 +263,40 @@ class WalletSyncServiceTest {
         WalletSyncService service = serviceWith(adapter);
 
         assertThatThrownBy(() -> service.sync(1L, MEMBER_ID))
-            .isInstanceOf(SyncException.class);
+            .isInstanceOf(SyncException.class)
+            .hasMessageContaining("no balances");
+    }
+
+    @Test
+    void sync_pricesCryptoOnly_soAnUnmappedSymbolIsNeverValuedAsAnEquity() {
+        // A token the wallet adapters emit but CoinGecko does not map (a future ERC-20 entry,
+        // a chain renaming its native symbol) must read as "no price". The generic refreshPrices
+        // would hand it to Yahoo Finance and value it at the share price of the same-named
+        // company — SNX at TD SYNNEX — and stamp that into the daily snapshot.
+        WalletAddress wallet = wallet(1L, Chain.EVM, "0xabc");
+        when(walletRepository.findByIdAndMemberId(1L, MEMBER_ID)).thenReturn(Optional.of(wallet));
+
+        WalletPort adapter = mock(WalletPort.class);
+        when(adapter.chain()).thenReturn(Chain.EVM);
+        when(adapter.fetchBalances(any())).thenReturn(List.of(
+            new WalletBalance("ETH", BigDecimal.ONE),
+            new WalletBalance("SNX", new BigDecimal("40"))));
+        when(priceService.refreshCryptoQuotes(Set.of("ETH", "SNX"))).thenReturn(Map.of("ETH", quote("2000")));
+        when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
+        when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
+        Account savedAccount = mock(Account.class);
+        when(savedAccount.getId()).thenReturn(100L);
+        when(accountRepository.save(any())).thenReturn(savedAccount);
+
+        serviceWith(adapter).sync(1L, MEMBER_ID);
+
+        verify(priceService, never()).refreshPrices(any());
+        // SNX stays held (kept through the prune) but is neither valued nor upserted.
+        verify(accountService).pruneHoldings(eq(savedAccount), eq(Set.of("ETH", "SNX")));
+        verify(accountService, never()).upsertHolding(any(), any(), eq("SNX"), any(), any(), any());
+        ArgumentCaptor<BigDecimal> balanceEur = ArgumentCaptor.forClass(BigDecimal.class);
+        verify(accountService).upsertSnapshot(eq(savedAccount), balanceEur.capture(), any());
+        assertThat(balanceEur.getValue()).isEqualByComparingTo("2000.00");
     }
 
     @Test
@@ -274,7 +316,7 @@ class WalletSyncServiceTest {
         when(solAdapter.fetchBalances(any())).thenThrow(new WalletRpcException("Solana getBalance: RPC error"));
 
         // Happy-path wiring for the ETH sync.
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("ETH", new BigDecimal("2000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("ETH", quote("2000")));
         when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
         Account savedAccount = mock(Account.class);
@@ -459,7 +501,7 @@ class WalletSyncServiceTest {
         // first match, so a stub here would fail Mockito's strict-stub check.
         WalletPort solAdapter = mock(WalletPort.class);
 
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("ETH", new BigDecimal("2000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("ETH", quote("2000")));
         when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
         Account accountA = mock(Account.class);
@@ -493,7 +535,7 @@ class WalletSyncServiceTest {
         WalletPort adapter = mock(WalletPort.class);
         when(adapter.chain()).thenReturn(Chain.EVM);
         when(adapter.fetchBalances(any())).thenReturn(List.of(new WalletBalance("ETH", BigDecimal.ONE)));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("ETH", new BigDecimal("2000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("ETH", quote("2000")));
         when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
         Account saved = mock(Account.class);
@@ -531,7 +573,7 @@ class WalletSyncServiceTest {
         WalletPort adapter = mock(WalletPort.class);
         when(adapter.chain()).thenReturn(Chain.EVM);
         when(adapter.fetchBalances(any())).thenReturn(List.of(new WalletBalance("ETH", BigDecimal.ONE)));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("ETH", new BigDecimal("2000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("ETH", quote("2000")));
         Account existing = Account.builder().id(100L).logoKey("ledger").build();
         when(accountRepository.findByExternalAccountIdAndMemberId("wallet_evm_1", MEMBER_ID))
             .thenReturn(Optional.of(existing));
@@ -553,7 +595,7 @@ class WalletSyncServiceTest {
         WalletPort adapter = mock(WalletPort.class);
         when(adapter.chain()).thenReturn(Chain.EVM);
         when(adapter.fetchBalances(any())).thenReturn(List.of(new WalletBalance("ETH", BigDecimal.ONE)));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("ETH", new BigDecimal("2000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("ETH", quote("2000")));
         when(accountRepository.findByExternalAccountIdAndMemberId(any(), any())).thenReturn(Optional.empty());
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
         Account saved = mock(Account.class);
@@ -625,7 +667,7 @@ class WalletSyncServiceTest {
         WalletPort adapter = mock(WalletPort.class);
         when(adapter.chain()).thenReturn(Chain.EVM);
         when(adapter.fetchBalances(any())).thenReturn(List.of(new WalletBalance("ETH", BigDecimal.ONE)));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("ETH", new BigDecimal("2000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("ETH", quote("2000")));
         when(familyMemberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(mock(FamilyMember.class)));
 
         Account winner = mock(Account.class);
@@ -656,7 +698,7 @@ class WalletSyncServiceTest {
         WalletPort adapter = mock(WalletPort.class);
         when(adapter.chain()).thenReturn(Chain.BITCOIN);
         when(adapter.fetchBalances(any())).thenReturn(List.of(new WalletBalance("BTC", BigDecimal.ONE)));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("BTC", new BigDecimal("50000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("BTC", quote("50000")));
         when(accountRepository.findByExternalAccountIdAndMemberId("wallet_bitcoin_2", MEMBER_ID))
             .thenReturn(Optional.empty());
         when(accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId("wallet_bitcoin_2", MEMBER_ID))
@@ -685,7 +727,7 @@ class WalletSyncServiceTest {
         WalletPort adapter = mock(WalletPort.class);
         when(adapter.chain()).thenReturn(Chain.BITCOIN);
         when(adapter.fetchBalances(any())).thenReturn(List.of(new WalletBalance("BTC", BigDecimal.ONE)));
-        when(priceService.refreshPrices(any())).thenReturn(Map.of("BTC", new BigDecimal("50000")));
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of("BTC", quote("50000")));
         when(accountRepository.findByExternalAccountIdAndMemberId("wallet_bitcoin_2", MEMBER_ID))
             .thenReturn(Optional.empty());
         when(accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId("wallet_bitcoin_2", MEMBER_ID))

@@ -21,15 +21,18 @@ public class BourseDirectController {
     private final BourseDirectSyncService service;
     private final UserContext userContext;
     private final Map<String, Bucket> authBuckets;
+    private final Map<String, Bucket> syncBuckets;
 
     public BourseDirectController(
         BourseDirectSyncService service,
         UserContext userContext,
-        @org.springframework.beans.factory.annotation.Qualifier("bourseDirectAuthBuckets") Map<String, Bucket> authBuckets
+        @org.springframework.beans.factory.annotation.Qualifier("bourseDirectAuthBuckets") Map<String, Bucket> authBuckets,
+        @org.springframework.beans.factory.annotation.Qualifier("syncBuckets") Map<String, Bucket> syncBuckets
     ) {
         this.service = service;
         this.userContext = userContext;
         this.authBuckets = authBuckets;
+        this.syncBuckets = syncBuckets;
     }
 
     @PostMapping("/auth/initiate")
@@ -44,8 +47,17 @@ public class BourseDirectController {
         return ResponseEntity.ok(service.completeAuth(req.processId(), req.code(), userContext.currentMemberId()));
     }
 
+    /**
+     * Throttled like every other sync entry point: queueing takes a row lock, decrypts the
+     * stored session and can hand a browser-backed job to the sidecar. {@code queueSync}
+     * already refuses to stack jobs, but nothing otherwise stops a caller re-queueing the
+     * moment each one finishes.
+     */
     @PostMapping("/sync")
-    public ResponseEntity<BourseDirectSyncService.SessionStatusResponse> sync() {
+    public ResponseEntity<?> sync(HttpServletRequest request) {
+        if (!consumeSyncToken(request)) {
+            return rateLimited("Too many Bourse Direct synchronization requests. Please wait before retrying.");
+        }
         return ResponseEntity.accepted().body(service.queueSync(userContext.currentMemberId()));
     }
 
@@ -66,9 +78,21 @@ public class BourseDirectController {
             .tryConsume(1);
     }
 
+    private boolean consumeSyncToken(HttpServletRequest request) {
+        return syncBuckets.computeIfAbsent(
+            ClientIp.resolve(request),
+            key -> RateLimitConfig.createSyncBucket()
+        )
+            .tryConsume(1);
+    }
+
     private ResponseEntity<ProblemDetail> rateLimited() {
+        return rateLimited("Too many Bourse Direct authentication attempts. Please wait before retrying.");
+    }
+
+    private ResponseEntity<ProblemDetail> rateLimited(String message) {
         ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.TOO_MANY_REQUESTS);
-        detail.setDetail("Too many Bourse Direct authentication attempts. Please wait before retrying.");
+        detail.setDetail(message);
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(detail);
     }
 

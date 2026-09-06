@@ -4,6 +4,9 @@ import com.picsou.dto.AccountResponse;
 import com.picsou.model.Chain;
 import com.picsou.service.UserContext;
 import com.picsou.service.WalletSyncService;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -22,7 +25,7 @@ public class WalletController {
     }
 
     @PostMapping
-    public AccountResponse addWallet(@RequestBody AddWalletRequest req) {
+    public AccountResponse addWallet(@Valid @RequestBody AddWalletRequest req) {
         return walletService.addWallet(req.chain(), req.address(), req.label(), userContext.currentMemberId());
     }
 
@@ -42,5 +45,16 @@ public class WalletController {
         return ResponseEntity.noContent().build();
     }
 
-    record AddWalletRequest(Chain chain, String address, String label) {}
+    /**
+     * {@code address} is bounded and format-checked by {@code WalletSyncService.addWallet},
+     * which returns a 400 naming the problem — bean validation cannot reach the per-chain rule.
+     * {@code label} has no such guard, so it is bounded here to the width of
+     * {@code wallet_address.label} ({@code varchar(100)}); without it a long label reaches the
+     * insert and comes back as a 500, rolling back the on-chain sync that already ran.
+     */
+    record AddWalletRequest(
+        @NotNull Chain chain,
+        String address,
+        @Size(max = 100) String label
+    ) {}
 }

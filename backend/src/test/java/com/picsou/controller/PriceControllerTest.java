@@ -13,9 +13,11 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -42,5 +44,27 @@ class PriceControllerTest {
         assertThat(controller.getPrices(" BTC, SNX ,IWDA.AS,, ")).isSameAs(prices);
 
         verify(priceService, never()).refreshPrices(any());
+    }
+
+    /**
+     * {@code months} feeds {@code LocalDate.now().minusMonths(months)}: an unbounded value
+     * overflows the supported year range and throws {@code DateTimeException}, which no handler
+     * covers, so the caller sees a 500 instead of a 400 naming the bound.
+     */
+    @Test
+    void getPriceHistory_rejectsAWindowThatOverflowsLocalDateArithmetic() {
+        assertThatThrownBy(() -> controller.getPriceHistory("BTC", Integer.MAX_VALUE))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("months must be between 1 and " + PriceController.MAX_MONTHS);
+
+        verifyNoInteractions(priceSnapshotRepository);
+    }
+
+    @Test
+    void getPriceHistory_rejectsANegativeWindowInsteadOfReturningAnEmptySeries() {
+        assertThatThrownBy(() -> controller.getPriceHistory("BTC", -5))
+            .isInstanceOf(IllegalArgumentException.class);
+
+        verifyNoInteractions(priceSnapshotRepository);
     }
 }

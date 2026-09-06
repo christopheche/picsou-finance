@@ -2,6 +2,21 @@
 
 > This document is manually maintained. When adding or changing an endpoint, update this file accordingly.
 
+> **Coverage.** This reference is not exhaustive. The following live route groups are **not**
+> documented below yet, so treat their absence here as "undocumented", never as "does not
+> exist": `/api/auth/mfa/*`, `/api/auth/sessions`, `/api/auth/username`, `/api/auth/activate`,
+> `/api/family/*`, `/api/admin/*`, `/api/setup/*`, `/api/history/*`, `/api/securities/*`,
+> `/api/ibkr/*`, `/api/bourso/*`, `/api/access-keys`, `POST /api/me/export`,
+> `POST /api/accounts/{id}/transactions/import`, `/api/accounts/{id}/debt`,
+> `/api/accounts/{id}/real-estate`, `/api/accounts/{id}/loan-summary`,
+> `/api/accounts/{id}/realized-pnl`, `/api/accounts/{id}/deletion-impact`, the manual
+> transaction and holding write endpoints (`POST`/`PUT`/`DELETE`
+> `/api/accounts/{id}/transactions[/{txId}]`, `PUT`/`DELETE`
+> `/api/accounts/{id}/holdings/{ticker}`), the goal
+> history/extend and manual-month endpoints, `POST /api/sync/{id}/reconnect`,
+> `POST /api/finary/login`, `POST /api/finary/check-totp` and `POST /api/finary/api-sync/auto`.
+> The controllers under `com.picsou.controller` remain the authority when the two disagree.
+
 ## Overview
 
 | Property | Value |
@@ -14,28 +29,49 @@
 
 ### Auth flow
 
-1. `POST /api/auth/login` — sends credentials, receives `access_token` + `refresh_token` as HttpOnly, SameSite=Strict cookies
+1. `POST /api/auth/login` — sends credentials, receives `access_token` + `refresh_token` as HttpOnly, SameSite=Lax cookies (`Lax`, not `Strict`, for Safari iOS compatibility — see [`docs/conventions/api-rest.md`](../../docs/conventions/api-rest.md))
 2. All subsequent requests include cookies automatically — no header needed
 3. On 401, the frontend calls `POST /api/auth/refresh` to get new tokens; the old refresh token is invalidated (rotation)
 4. `POST /api/auth/logout` clears both cookies
 
 ### Rate limiting
 
+Buckets live in `RateLimitConfig` and are consumed explicitly in the controller, which
+returns a 429 ProblemDetail directly (never through the exception handler).
+
 | Endpoint group | Limit |
 |---------------|-------|
-| Login (`/api/auth/login`) | 5 requests / IP / 15 min |
-| Bank sync (`/api/sync/initiate`, `/complete`, `/{id}/reconnect`, `/countries`) | Throttled — each on its own bucket, keyed by `ip + endpoint` |
-| TR auth (`/api/tr/auth/initiate`) | Throttled |
+| Login (`/api/auth/login`) | 5 / IP / 15 min |
+| Step-up re-auth (`/api/auth/change-password`, `/api/auth/mfa/disable`, `/api/auth/mfa/recovery-codes/regenerate`) | 5 / user / 15 min |
+| MFA verify (`/api/auth/mfa/verify`) | 5 / 15 min per account (the challenge's `uid`) |
+| MFA enrolment (`/api/auth/mfa/enroll/init`) | 10 / IP / 1 h |
+| Setup wizard (mutating `/api/setup/*`) | 10 / IP / min |
+| Bank sync (`/api/sync/initiate`, `/complete`, `/{id}/reconnect`, `/countries`) | 10 / IP / min — each on its own bucket, keyed by `ip + endpoint` |
+| Institution search (`GET /api/sync/institutions`) | 60 / IP / min — typeahead budget on its own `ip:institutions` bucket |
+| Sync + upload (`/api/tr/sync`, `/api/tr/import`, `/api/degiro/sync`, `/api/bourse-direct/sync`, `/api/amundi/sync`, `/api/bourso/sync`, `/api/finary/preview`, `/api/accounts/{id}/transactions/import`) | 10 / IP / min, shared `syncBuckets` |
+| IBKR sync (`/api/ibkr/sync`) | 6 / IP / min |
+| TR auth (`/api/tr/auth/initiate`) | 3 / IP / 10 min (each attempt sends an SMS) |
+| TR TAN verify (`/api/tr/auth/complete`) | 5 / IP / 15 min, on its own bucket |
+| Broker auth (`/api/bourso/auth/*`, `/api/bourse-direct/auth/*`, `/api/degiro/auth/*`, `/api/amundi/auth/*`) | 5 / IP / 15 min per connector |
+| Finary auth (`/api/finary/check-totp`, `/api/finary/api-sync/preview`, `/api/finary/api-sync/auto`) | 5 / IP / 15 min |
+| Address autocomplete | 60 / member / min |
+| GDPR export (`POST /api/me/export`) | 5 / user / h |
+| Access-key creation (`POST /api/access-keys`) | 10 / member / h |
+| MCP (`/mcp/**`, per access key) | 120 / key / min |
 
 ## Shared Enums
 
 ### AccountType
 
-`LEP` · `PEA` · `COMPTE_TITRES` · `CRYPTO` · `CHECKING` · `SAVINGS` · `REAL_ESTATE` · `LOAN` · `EMPLOYEE_SAVINGS` · `OTHER`
+`LEP` · `LIVRET_A` · `LDDS` · `LIVRET_JEUNE` · `PEL` · `CEL` · `PEA` · `COMPTE_TITRES` · `CRYPTO` · `CHECKING` · `SAVINGS` · `REAL_ESTATE` · `LOAN` · `EMPLOYEE_SAVINGS` · `OTHER`
 
 ### Chain
 
-`SOLANA` · `ETHEREUM` · `BITCOIN`
+`SOLANA` · `EVM` · `BITCOIN`
+
+`EVM` replaced the former `ETHEREUM` value (migration V54): one `0x` address is used
+identically across Ethereum, BNB Chain, Polygon, Arbitrum, Optimism, Base and Avalanche
+C-Chain, and a single wallet fans out over every enabled network.
 
 ### ExchangeType
 
@@ -78,10 +114,14 @@ Validation errors (422) include an `errors` map:
 | 400 | `IllegalArgumentException` — bad request logic |
 | 401 | `BadCredentialsException` — invalid credentials or missing auth |
 | 404 | `ResourceNotFoundException` — entity not found |
-| 422 | Validation failure (`@Valid`) — includes `errors` map |
+| 403 | `TotpRequiredException` — a second factor is required, or an authorization refusal |
+| 422 | Validation failure (`@Valid`) — includes `errors` map — and `SyncException` / `WalletRpcException` / `InvalidKeyMaterialException` |
 | 429 | Rate limit exceeded |
-| 502 | `SyncException` — upstream provider error |
+| 502 | `FinaryServiceUnavailableException` — Clerk/Finary unreachable |
 | 500 | Unexpected server error (message is always `"An unexpected error occurred"`) |
+
+`SyncException` (an upstream provider error) is **422**, not 502; it carries a machine-readable
+`code` property when the connector sets one.
 
 ---
 
@@ -348,7 +388,7 @@ priced — a manually entered position, or one whose ticker no provider resolves
 
 ---
 
-#### `POST /api/accounts/{id}/snapshot`
+#### `POST /api/accounts/{id}/history`
 
 - **Auth:** Required
 
@@ -368,7 +408,7 @@ priced — a manually entered position, or one whose ticker no provider resolves
 
 - **Auth:** Required
 
-**Response `200` — `TransactionDto[]`:**
+**Response `200` — `TransactionResponse[]`:**
 ```json
 [
   {
@@ -623,6 +663,7 @@ exceeding it returns `429`.
 #### `GET /api/sync/institutions`
 
 - **Auth:** Required
+- **Rate limit:** 60 / IP / min (typeahead budget, own `ip:institutions` bucket)
 
 **Query params:**
 | Param | Type | Default | Description |
@@ -776,12 +817,13 @@ Countries the active bank-sync provider supports, for the "which country" search
 **Request body:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `processId` | `string` | From initiate step |
-| `tan` | `string` | 2FA code from SMS |
+| `processId` | `string` | From initiate step. @NotBlank, @Size(max = 100) |
+| `tan` | `string` | 2FA code from SMS. @NotBlank, @Size(max = 100) |
 
-**Response `200` — `AccountResponse[]`.**
+**Response `200` — `SessionStatusResponse`** (`{ isActive, expiresAt }`); the portfolio sync
+runs in the background afterwards.
 
-**Errors:** 401, 502
+**Errors:** 401, 422, 429
 
 ---
 
@@ -789,6 +831,7 @@ Countries the active bank-sync provider supports, for the "which country" search
 
 - **Auth:** Required
 - **Body:** none
+- **Rate limit:** 10 / IP / min (shared `syncBuckets`)
 
 **Response `200` — `AccountResponse[]`.**
 
@@ -873,6 +916,7 @@ first portfolio import is queued.
 
 - **Auth:** Required
 - **Body:** none
+- **Rate limit:** 10 / IP / min (shared `syncBuckets`)
 
 **Response `202` — `BourseDirectSessionStatus`.** An already queued or running
 job is not duplicated; its current status is returned.
@@ -922,9 +966,9 @@ rate limiting returns `429`.
 **Request body:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `chain` | `Chain` | `SOLANA` · `ETHEREUM` · `BITCOIN` |
-| `address` | `string` | Wallet address |
-| `label` | `string` | Display label |
+| `chain` | `Chain` | `SOLANA` · `EVM` · `BITCOIN`. @NotNull |
+| `address` | `string` | Wallet address. Required and length/format-checked by the service (400 with the reason) |
+| `label` | `string` | Display label, optional. @Size(max = 100) |
 
 **Response `200` — `AccountResponse`.**
 
@@ -948,7 +992,7 @@ rate limiting returns `429`.
 [
   {
     "id": 1,
-    "chain": "ETHEREUM",
+    "chain": "EVM",
     "address": "0x...",
     "label": "My Wallet",
     "lastSyncedAt": "2025-03-15T10:00:00Z"
@@ -1096,6 +1140,7 @@ Two import modes: **file-based** (XLSX upload) and **API-based** (direct sync). 
 #### `POST /api/finary/preview` (file-based)
 
 - **Auth:** Required
+- **Rate limit:** 10 / IP / min (shared `syncBuckets`)
 - **Content-Type:** `multipart/form-data`
 - **Field:** `file` (XLSX)
 
@@ -1178,29 +1223,34 @@ Two import modes: **file-based** (XLSX upload) and **API-based** (direct sync). 
 
 ---
 
-#### `GET /api/finary/configured` (API-based)
+#### `GET /api/finary/status` (API-based)
 
 - **Auth:** Required
 
-**Response `200`:**
-```json
-true
-```
+**Response `200` — `FinaryConnectionStatusResponse`.**
 
-Returns whether the Finary API credentials (`FINARY_EMAIL`, `FINARY_PASSWORD`) are configured.
+Reports whether Finary credentials are stored for the current member, and the state of the
+stored session. Credentials are stored per member through `POST /api/finary/login`, not read
+from environment variables.
 
 ---
 
 #### `POST /api/finary/api-sync/preview` (API-based)
 
 - **Auth:** Required
+- **Rate limit:** 5 / IP / 15 min (shared with `/check-totp` and `/api-sync/auto`)
 
-**Query params:**
-| Param | Type | Description |
-|-------|------|-------------|
-| `totp` | `string` | TOTP 2FA code (if enabled) |
+**Request body — `FinaryApiSyncPreviewRequest`** (optional; the first attempt sends `{}`):
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| `totp` | `string` | @Pattern(`\d{6}`), optional | Second factor, only on the retry after a 403 |
+
+The code travels in the body, never as `?totp=` — a query parameter would put a live second
+factor into reverse-proxy access logs and browser history.
 
 **Response `200` — `FinaryPreviewResponse`** (same shape as file-based preview, but with `syncToken` instead of `fileToken`).
+
+**Errors:** 403 (TOTP required), 429, 502
 
 ---
 
@@ -1354,6 +1404,7 @@ first portfolio import has run.
 
 - **Auth:** Required
 - **Body:** none
+- **Rate limit:** 10 / IP / min (shared `syncBuckets`)
 
 **Response `200` — `AccountResponse`.** Synchronous: the portfolio is fetched
 with the stored session and the account is returned. Fails with `422` when the

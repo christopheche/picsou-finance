@@ -68,6 +68,20 @@ public class RateLimitConfig {
     }
 
     /**
+     * Per-IP TR TAN verification limiter: 5 attempts per 15 minutes.
+     *
+     * <p>Separate from {@code trAuthBuckets} on purpose. That budget is 3 per 10 minutes
+     * because every {@code /auth/initiate} sends an SMS; verifying the TAN sends nothing, and
+     * sharing the SMS budget would lock a member out of their own login after one mistyped
+     * code. The TAN space is only 10,000, so the verify endpoint still needs a throttle of its
+     * own — same shape as the DEGIRO/MFA 6-digit verifiers.
+     */
+    @Bean("trTanBuckets")
+    public Map<String, Bucket> trTanBuckets() {
+        return boundedBucketStore();
+    }
+
+    /**
      * Per-IP BoursoBank auth rate limiter: 5 attempts per 15 minutes.
      */
     @Bean("boursoAuthBuckets")
@@ -96,6 +110,19 @@ public class RateLimitConfig {
      */
     @Bean("amundiAuthBuckets")
     public Map<String, Bucket> amundiAuthBuckets() {
+        return boundedBucketStore();
+    }
+
+    /**
+     * Per-IP Finary auth rate limiter: 5 attempts per 15 minutes.
+     *
+     * <p>{@code /check-totp}, {@code /api-sync/preview} and {@code /api-sync/auto} each run a
+     * full Clerk sign-in with the stored credentials (and, on preview, a caller-supplied TOTP).
+     * Without a bucket the 6-digit TOTP is brute-forceable and Clerk sees an unbounded stream of
+     * sign-ins from the instance's single IP, which is exactly what gets that IP blocked.
+     */
+    @Bean("finaryAuthBuckets")
+    public Map<String, Bucket> finaryAuthBuckets() {
         return boundedBucketStore();
     }
 
@@ -228,11 +255,39 @@ public class RateLimitConfig {
             .build();
     }
 
+    /**
+     * Institution typeahead: 60 lookups/minute, on the {@code syncBuckets} store under its own
+     * {@code ip:institutions} key.
+     *
+     * <p>Deliberately not {@link #createSyncBucket()}'s 10/minute: the search box fires a
+     * request per keystroke with no debounce, so a 10/minute budget would 429 someone typing a
+     * bank name. It still needs a ceiling — every call is an uncached authenticated fetch from
+     * the provider (Germany alone is ~1.4 MB of ASPSPs) charged against the instance's quota —
+     * so it gets the same shape as the address autocomplete above.
+     */
+    public static Bucket createInstitutionSearchBucket() {
+        return Bucket.builder()
+            .addLimit(Bandwidth.builder()
+                .capacity(60)
+                .refillIntervally(60, Duration.ofMinutes(1))
+                .build())
+            .build();
+    }
+
     public static Bucket createTrAuthBucket() {
         return Bucket.builder()
             .addLimit(Bandwidth.builder()
                 .capacity(3)
                 .refillIntervally(3, Duration.ofMinutes(10))
+                .build())
+            .build();
+    }
+
+    public static Bucket createTrTanBucket() {
+        return Bucket.builder()
+            .addLimit(Bandwidth.builder()
+                .capacity(5)
+                .refillIntervally(5, Duration.ofMinutes(15))
                 .build())
             .build();
     }
@@ -265,6 +320,15 @@ public class RateLimitConfig {
     }
 
     public static Bucket createAmundiAuthBucket() {
+        return Bucket.builder()
+            .addLimit(Bandwidth.builder()
+                .capacity(5)
+                .refillIntervally(5, Duration.ofMinutes(15))
+                .build())
+            .build();
+    }
+
+    public static Bucket createFinaryAuthBucket() {
         return Bucket.builder()
             .addLimit(Bandwidth.builder()
                 .capacity(5)

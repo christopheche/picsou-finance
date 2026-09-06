@@ -22,7 +22,7 @@ The user exports their Finary data as an xlsx file and uploads it via the API. T
 Authenticates directly with Finary via Clerk (their auth provider) and fetches accounts + transactions through the Finary API.
 
 - **Authentication**: `FinaryApiClient.authenticate()` performs a 6-step Clerk OAuth flow: GET environment, GET client, POST sign_ins, (optionally POST TOTP), POST session touch, POST tokens. Returns a JWT for API calls.
-- **TOTP/2FA handling**: When Clerk returns `needs_second_factor`, the backend throws `TotpRequiredException` → HTTP 403. The frontend detects 403 on the preview mutation, shows a TOTP input field, then retries with `?totp={code}` as query parameter.
+- **TOTP/2FA handling**: When Clerk returns `needs_second_factor`, the backend throws `TotpRequiredException` → HTTP 403. The frontend detects 403 on the preview mutation, shows a TOTP input field, then retries with `{"totp": "{code}"}` in the JSON body of the same POST.
 - **Preview**: `preview(totp)` authenticates, fetches accounts from all 10 portfolio categories **plus the dedicated `/loans` endpoint** (loans are not exposed as a portfolio category), fetches transactions (paginated, 200 per page), caches everything with a `syncToken`, returns previews.
 - **Execute**: `execute(syncToken, mappings)` retrieves cached data, applies user mappings, creates/updates accounts, imports transactions.
 
@@ -123,7 +123,7 @@ Frontend receives 403 → shows TOTP input
 User enters 6-digit TOTP code
         |
         v
-POST /api/finary/api-sync/preview?totp={code}
+POST /api/finary/api-sync/preview   body: {"totp": "{code}"}
         |
         +-- Clerk completes second factor with TOTP
         +-- Fetch accounts from all 10 categories
@@ -180,7 +180,8 @@ POST /api/finary/api-sync/auto
 
 - **TOTP must be disabled for background auto-sync**: `autoSync()` passes `null` for TOTP. If 2FA is enabled on the Finary account, auto-sync returns `TOTP_REQUIRED` and the session is flagged. The user must re-authenticate interactively (via the preview endpoint with TOTP). For interactive sync via the frontend button, the TOTP input is shown and the user retries through the preview flow.
 - **Manual transactions survive Finary re-syncs**: `FinaryPersistenceHelper.importTransactions()` calls `deleteByAccountIdAndIsManualFalse()` instead of `deleteByAccountId()`. Manually-added transactions are preserved across any number of re-syncs.
-- **TOTP is a query parameter**: The TOTP code is sent as `?totp={code}` on the POST preview request. This avoids body parsing complexity but means the code is visible in server access logs.
+- **TOTP travels in the request body, not the query string**: the preview endpoint reads `totp` from the JSON body (`FinaryApiSyncPreviewRequest`), validated as six digits and optional -- the first attempt sends `{}`. It used to be `?totp={code}`, which put a live second factor into nginx/Caddy access logs, browser history and any log-shipping pipeline. Every other connector (DEGIRO, Bourse Direct, Amundi) and the app's own MFA already sent codes in the body.
+- **Every Clerk sign-in is throttled**: `/check-totp`, `/api-sync/preview` and `/api-sync/auto` each run the full 6-step Clerk login with the stored credentials, so they share one per-IP bucket (`finaryAuthBuckets`, 5 attempts / 15 min) and answer 429 with a ProblemDetail past it. Without it the 6-digit second factor is brute-forceable through `preview`, and Clerk sees an unbounded stream of sign-ins from the instance's single IP -- which is what gets that IP blocked for the whole family. `/api-sync/execute` works off the cached preview and authenticates nothing, so it is not on the bucket. The xlsx `/preview` upload shares the sync buckets instead, like every other multipart endpoint.
 - **Preview tokens expire quickly**: XLSX tokens expire after 30 minutes, API sync tokens after 10 minutes. Users must complete the mapping within that window or re-upload.
 - **Clerk API version is hardcoded**: The `__clerk_api_version` and `_clerk_js_version` query parameters are hardcoded in `FinaryApiClient`. If Clerk updates, these may need to be updated.
 - **Account name matching is case-insensitive but exact**: Auto-mapping matches Finary account name to Picsou account name. If the user renamed an account in Picsou, it won't match.

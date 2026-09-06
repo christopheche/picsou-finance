@@ -60,15 +60,25 @@ Only for auth and app-wide UI state (e.g., demo mode toggle).
 
 ```typescript
 // stores/auth-store.ts
-export const useAuthStore = create<AuthState>((set) => ({
-  username: sessionStorage.getItem('picsou_user'),
-  isAuthenticated: !!sessionStorage.getItem('picsou_user'),
-  login: (username) => { sessionStorage.setItem('picsou_user', username); set(...) },
-  logout: () => { sessionStorage.removeItem('picsou_user'); set(...) },
+interface UserData { username: string; role: 'ADMIN' | 'MEMBER'; memberId: number; displayName: string }
+
+const storedUser = readStoredUser()        // guarded JSON.parse of sessionStorage 'picsou_user'; null if absent/invalid
+
+export const useAuthStore = create<AuthState>((set, get) => ({
+  user: storedUser,
+  isAuthenticated: storedUser !== null,
+  login: (data: UserData) => { sessionStorage.setItem('picsou_user', JSON.stringify(data)); set({ user: data, isAuthenticated: true }) },
+  logout: () => { sessionStorage.removeItem('picsou_user'); set({ user: null, isAuthenticated: false }) },
+  setUsername: (username) => { /* rewrites user.username in state + storage */ },
 }))
 ```
 
-Auth cookies are HttpOnly — the Zustand store is the JS-readable signal, persisted in `sessionStorage`.
+Auth cookies are HttpOnly — the Zustand store is the JS-readable signal, persisted in `sessionStorage`
+as a JSON `UserData` object (`user.role` drives `RequireAdmin` and the admin `?memberId` interceptor).
+The read at module load is wrapped so a malformed value can never crash the bundle. **Log out only
+through `useLogout()`** (`features/auth/hooks.ts`) — never the raw `logout` action — it is the only
+path that also revokes the session server-side and clears the query cache; see
+[`docs/features/mfa-and-remember-me.md`](../features/mfa-and-remember-me.md).
 
 ## Hooks and React Compiler rules
 

@@ -154,6 +154,30 @@ class HistoryServiceTest {
     }
 
     @Test
+    void buildHistory_livePoint_foreignCurrencyCashAccount_hasZeroPnl() {
+        // valuation() hands back the EUR value as the cost basis of a holdings-less account,
+        // whatever unit its balance is kept in (AccountServiceTest pins that). The live point
+        // takes both halves from that one record, so a 1000 USD account prints a zero P&L --
+        // not the FX delta, which is what pairing an EUR value with the raw balance produced.
+        Account usdCash = Account.builder()
+            .id(2L).name("USD Cash").type(AccountType.CHECKING).currency("USD")
+            .currentBalance(new BigDecimal("1000")).color("#3b82f6").member(MEMBER).build();
+
+        when(accountRepository.findAllById(List.of(2L))).thenReturn(List.of(usdCash));
+        when(snapshotRepository.findForwardFillDataByAccountIds(any(LocalDate.class), eq(List.of(2L))))
+            .thenReturn(List.of());
+        stubValuation(usdCash, "920", "920");
+
+        List<NetWorthPoint> result = historyService.buildHistory(List.of(2L), 1, true, MEMBER_ID);
+
+        NetWorthPoint todayPoint = result.get(result.size() - 1);
+        assertThat(todayPoint.total()).isEqualByComparingTo("920");
+        assertThat(todayPoint.invested()).isEqualByComparingTo("920");
+        assertThat(todayPoint.pnl()).isEqualByComparingTo("0");
+        assertThat(todayPoint.accounts().get(2L).pnl()).isEqualByComparingTo("0");
+    }
+
+    @Test
     void buildHistory_loan_contributesZeroToInvested_negativeToTotal() {
         LocalDate today = LocalDate.now();
         LocalDate date = today.minusDays(2);

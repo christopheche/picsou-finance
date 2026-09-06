@@ -17,6 +17,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Plus, Wallet, Pencil, Trash2, TrendingUp, TrendingDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { sumWeightedBalances } from './totals'
 import type { Account, AccountRequest, AccountType } from '@/types/api'
 
 type AssetFilter = 'ALL' | 'STOCKS' | 'METALS' | 'SAVINGS' | 'CHECKING' | 'CRYPTO' | 'REAL_ESTATE' | 'DEBTS'
@@ -120,9 +121,10 @@ export function AccountsPage() {
   // Whether current filter contains investment accounts (for PnL display)
   const hasHoldings = filteredAccounts.some(a => HOLDING_ACCOUNT_TYPES.includes(a.type))
 
-  // Summary card values
-  const totalBalance = filteredAccounts.reduce((sum, a) =>
-    a.type === 'LOAN' ? sum - a.currentBalanceEur : sum + a.currentBalanceEur, 0)
+  // Summary card values. Share-weighted: the balances the API returns are the accounts' full
+  // value, so a co-owned property would otherwise be counted whole here and halved on the
+  // dashboard (see `sumWeightedBalances`).
+  const totalBalance = sumWeightedBalances(filteredAccounts)
 
   // PnL from the latest history point for filtered accounts
   const { pnl, pnlPct, totalInvested } = useMemo(() => {

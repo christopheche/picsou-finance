@@ -39,6 +39,7 @@ import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
 import { TrendingUp, TrendingDown, Plus, RefreshCw, ChevronDown } from 'lucide-react'
 import { GoalDetailModal } from '@/pages/goals/GoalDetailModal'
+import { toLocalIsoDate } from '@/lib/utils'
 
 type WealthMode = 'net' | 'gross' | 'financial'
 
@@ -51,7 +52,11 @@ export function DashboardPage() {
   const [wealthMode, setWealthMode] = useState<WealthMode>('net')
   const [detailGoalId, setDetailGoalId] = useState<number | null>(null)
 
-  const { data, isLoading } = useDashboard(range)
+  // No range in the key: totals, distribution, liabilities and goals do not depend on it, and
+  // the chart gets its own range-specific series from `useHistory` below. Keying the dashboard
+  // by range made every first click on a range button refetch the whole payload -- and blank
+  // the page behind the loading skeleton while it landed.
+  const { data, isLoading } = useDashboard()
 
   // Account IDs filtered by the selected wealth mode — drives both the headline value
   // and the history chart so the curve never includes categories the mode excludes.
@@ -104,7 +109,9 @@ export function DashboardPage() {
       case '1Y': from = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate()); break
       default: return undefined // ALL → live PnL only
     }
-    return from.toISOString().slice(0, 10)
+    // Local calendar day, not the UTC one: `toISOString()` on a local midnight is the previous
+    // day everywhere east of UTC, so "YTD" asked the backend for 31 December.
+    return toLocalIsoDate(from)
   }, [range])
 
   const { data: pnlData } = usePnl(investmentAccountIds, pnlFromDate)
@@ -322,8 +329,10 @@ export function DashboardPage() {
       {/* Holdings overview */}
       <HoldingsCard />
 
-      {/* Sync all modal */}
-      <SyncAllModal open={showSyncModal} onOpenChange={setShowSyncModal} />
+      {/* Sync all modal -- mounted only while open: its ten status queries poll on their own
+          intervals, so a permanently mounted modal kept the dashboard fetching sync statuses
+          for a dialog the user may never open. */}
+      {showSyncModal && <SyncAllModal open onOpenChange={setShowSyncModal} />}
 
       {/* Goal detail modal */}
       <GoalDetailModal goalId={detailGoalId} onClose={() => setDetailGoalId(null)} />

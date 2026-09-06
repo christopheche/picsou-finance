@@ -7,10 +7,10 @@ import {
   useRevokeAllSessionsExceptCurrent,
 } from '@/features/mfa/hooks'
 import type { SessionItem } from '@/features/mfa/api'
-import { resolveLocale } from '@/i18n/locales'
+import { formatDateTime } from '@/lib/utils'
 
 export function SessionsList() {
-  const { t, i18n } = useTranslation()
+  const { t } = useTranslation()
   const { data: sessions, isLoading } = useSessions()
   const revoke = useRevokeSession()
   const revokeOthers = useRevokeAllSessionsExceptCurrent()
@@ -38,7 +38,6 @@ export function SessionsList() {
           <SessionRow
             key={s.id}
             session={s}
-            locale={resolveLocale(i18n.language).intlLocale}
             onRevoke={() => revoke.mutate(s.id)}
             disabled={revoke.isPending && revoke.variables === s.id}
           />
@@ -64,12 +63,10 @@ export function SessionsList() {
 
 function SessionRow({
   session,
-  locale,
   onRevoke,
   disabled,
 }: {
   session: SessionItem
-  locale: string
   onRevoke: () => void
   disabled: boolean
 }) {
@@ -83,7 +80,7 @@ function SessionRow({
       <div className="flex-1 min-w-0 space-y-0.5">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-medium truncate">
-            {prettyUserAgent(session.userAgent) || 'Unknown device'}
+            {prettyUserAgent(session.userAgent) || t('settings.sessionsUnknownDevice')}
           </span>
           {session.current && (
             <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
@@ -100,7 +97,7 @@ function SessionRow({
         <p className="text-xs text-muted-foreground">
           {session.ipPrefix && <span className="font-mono">{session.ipPrefix}*</span>}
           {session.ipPrefix && ' · '}
-          {t('settings.sessionsLastUsed')}: {formatDate(session.lastUsedAt, locale)}
+          {t('settings.sessionsLastUsed')}: {formatDateTime(session.lastUsedAt)}
         </p>
       </div>
       {!session.current && (
@@ -153,16 +150,3 @@ function prettyUserAgent(ua: string | null): string {
   return os ? `${browser} · ${os}` : browser
 }
 
-function formatDate(iso: string, locale: string): string {
-  try {
-    return new Date(iso).toLocaleString(locale, {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  } catch {
-    return iso
-  }
-}

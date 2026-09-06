@@ -92,16 +92,33 @@ Used by:
 - `frontend/src/pages/sync/BoursoTab.tsx` — `formatError` fallback.
 - `frontend/src/pages/sync/FinaryTab.tsx` — replaces `err instanceof Error ? err.message : ...`.
 - `frontend/src/pages/sync/CryptoExchangeTab.tsx`,
-  `frontend/src/pages/sync/CryptoWalletTab.tsx` — error states show
-  `extractErrorMessage(error)`.
+  `frontend/src/pages/sync/CryptoWalletTab.tsx` — list-level error states use
+  `formatApiError(error, t)`; the exchange connect form keeps
+  `extractErrorMessage(err, t(…))` because its fallback key depends on whether the
+  exchange takes a secret.
 - `frontend/src/pages/admin/sections/{Security,EnableBanking}Section.tsx` — TanStack
-  Query mutation `error` rendered through the helper.
+  Query mutation `error` rendered through `formatApiError(err, t)`. A translator is
+  in scope here, so bare `extractErrorMessage` (whose default fallback is the French
+  *"Une erreur est survenue"*) is **not** used: a German admin hitting a 500 would
+  otherwise get a French sentence.
 - `frontend/src/pages/admin/sections/MembersSection.tsx` and
   `frontend/src/pages/settings/FamilySettingsPage.tsx` — member-delete failure shown
-  **inside** `ConfirmDialog` via `formatApiError(deleteMember.error, t)`.
-- `frontend/src/pages/settings/security/{ExportDataDialog,RecoveryCodesDialog,MfaEnrollDialog}.tsx`
+  **inside** `ConfirmDialog` via `formatApiError(deleteMember.error, t)`; the admin
+  section additionally renders create-user, activation-link, password-reset and
+  2FA-reset failures in `role="alert"` blocks.
+- `frontend/src/pages/settings/security/{ExportDataDialog,RecoveryCodesDialog,MfaEnrollDialog,MfaDisableDialog}.tsx`
   — replaced raw `err.message` / `` `${status} — …` `` displays with
-  `formatApiError(err, t)` (keeping their existing 401/429-specific branches).
+  `formatApiError(err, t)` (keeping their existing 400/401/429-specific branches).
+  `MfaDisableDialog`'s 400 branch goes through `safeBackendMessage`, never the raw
+  `getErrorDetail`, so a `ProblemDetail` carrying a class name can't reach the user.
+- `frontend/src/pages/activation/ActivationPage.tsx` —
+  `formatApiError(err, t, 'auth.activation.failed')`; the call itself moved to
+  `useActivateAccount()` in `features/auth/hooks.ts`.
+- `frontend/src/pages/setup/integrations/enablebanking/{EBStep2Credentials,EBStep3Keypair}.tsx`
+  — replaced `response.data.detail ?? String(err)` with
+  `formatApiError(err, t, 'setup.enablebanking.…')`.
+- `frontend/src/pages/family/FamilyDashboardPage.tsx` — renders `ErrorState` with
+  `formatApiError(error, t)` and a retry instead of dereferencing `data!`.
 
 ## Technical choices
 

@@ -60,6 +60,26 @@
     "admin.desc": "Réglages de l'instance"
   },
   "auth": {
+    "activation": {
+      "title": "Activez votre compte",
+      "description": "Choisissez un mot de passe pour finaliser la création de votre compte.",
+      "warningTitle": "Avertissement sur l'accès aux données",
+      "warningBody": "L'administrateur de cette instance Picsou a un accès technique à toutes les données qui y sont stockées, y compris les informations bancaires et les identifiants d'API. En activant votre compte, vous en prenez acte.",
+      "acknowledgeLabel": "Je comprends et j'accepte que l'administrateur ait accès à toutes les données de cette instance.",
+      "passwordLabel": "Mot de passe",
+      "passwordPlaceholder": "8 caractères minimum",
+      "confirmPasswordLabel": "Confirmez le mot de passe",
+      "confirmPasswordPlaceholder": "Répétez votre mot de passe",
+      "submit": "Activer le compte",
+      "submitting": "Activation...",
+      "successTitle": "Compte activé !",
+      "successDescription": "Redirection vers la connexion...",
+      "acknowledgeRequired": "Vous devez prendre acte de l'avertissement sur l'accès aux données.",
+      "passwordTooShort": "Le mot de passe doit contenir au moins 8 caractères.",
+      "passwordMismatch": "Les mots de passe ne correspondent pas.",
+      "invalidLink": "Ce lien d'activation est invalide.",
+      "failed": "L'activation a échoué. Le lien a peut-être expiré."
+    },
     "login": "Connexion",
     "loginTagline": "Picsou",
     "username": "Nom d'utilisateur",
@@ -830,6 +850,7 @@
     "sessions": "Appareils connectés",
     "sessionsDescription": "Sessions persistantes \"Se souvenir de moi\" actives",
     "sessionsEmpty": "Aucun appareil de confiance — tu devras te reconnecter à chaque visite.",
+    "sessionsUnknownDevice": "Appareil inconnu",
     "sessionsCurrent": "Cet appareil",
     "sessionsTrusted": "2FA approuvée",
     "sessionsLastUsed": "Dernière utilisation",
@@ -1197,7 +1218,8 @@
         "body": "Dans votre tableau de bord Enable Banking, créez une application nommée \"Picsou\", puis copiez son Application ID ici.",
         "applicationId": "Application ID",
         "applicationIdHint": "C'est l'UUID de votre application Enable Banking — il sert aussi de Key ID pour signer les requêtes.",
-        "prodAcknowledge": "Je confirme que mon application Enable Banking est bien en mode PRODUCTION (pas SANDBOX)."
+        "prodAcknowledge": "Je confirme que mon application Enable Banking est bien en mode PRODUCTION (pas SANDBOX).",
+        "submitError": "L'enregistrement de la configuration Enable Banking a échoué. Vérifiez l'identifiant d'application et réessayez."
       },
       "keypair": {
         "modeGenerate": "Générer une paire de clés",
@@ -1208,6 +1230,7 @@
         "copy": "Copier la clé publique",
         "copied": "Copié !",
         "download": "Télécharger public.pem",
+        "generate": "Générer la paire de clés",
         "uploadInstruction": "Maintenant dans votre tableau de bord EB → votre app → Public key → collez ce bloc.",
         "uploadedCta": "C'est chargé — continuer",
         "error": "La génération de la paire de clés a échoué. Réessayez.",

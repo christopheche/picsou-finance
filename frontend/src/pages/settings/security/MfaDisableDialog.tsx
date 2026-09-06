@@ -13,7 +13,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Loader2 } from 'lucide-react'
 import { useMfaDisable } from '@/features/mfa/hooks'
-import { getErrorStatus, getErrorDetail } from '@/lib/errors'
+import { formatApiError, safeBackendMessage, getErrorStatus } from '@/lib/errors'
 
 export function MfaDisableDialog({
   open,
@@ -50,8 +50,10 @@ export function MfaDisableDialog({
       close()
     } catch (err: unknown) {
       const status = getErrorStatus(err)
-      if (status === 400) setError(getErrorDetail(err) ?? t('auth.mfaInvalidCode'))
-      else setError(`${status ?? ''} — ${(err as { message?: string })?.message ?? 'Error'}`)
+      // 400 is the wrong-password / wrong-code case: keep the backend's specific
+      // reason when it is user-safe, never the raw detail (it may embed a JSON blob).
+      if (status === 400) setError(safeBackendMessage(err) ?? t('auth.mfaInvalidCode'))
+      else setError(formatApiError(err, t))
     }
   }
 

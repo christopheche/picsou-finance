@@ -15,7 +15,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { extractErrorMessage } from '@/lib/errors'
+import { formatApiError } from '@/lib/errors'
 import { useUpdateSecurity, useReloadCorsFromEnv } from '@/features/admin/hooks'
 import type { AdminSecuritySettings } from '@/features/admin/api'
 
@@ -36,15 +36,27 @@ export function SecuritySection({ settings }: { settings: AdminSecuritySettings 
     defaultValues: settings,
   })
 
-  useEffect(() => { reset(settings) }, [settings, reset])
+  // Adopt the server's values only while the form is pristine. Every admin
+  // mutation invalidates `adminKeys.settings()`, so an unconditional reset()
+  // wiped origins the admin had typed here but not yet saved.
+  const { isDirty } = formState
+  useEffect(() => {
+    if (isDirty) return
+    reset(settings)
+  }, [settings, reset, isDirty])
 
   const { fields, append, remove } = useFieldArray({ control, name: 'allowedOrigins' as never })
 
   const onSubmit = handleSubmit(async (values) => {
-    await update.mutateAsync({
+    const body = {
       allowedOrigins: values.allowedOrigins.filter((o) => o.trim().length > 0),
       secureCookies: values.secureCookies,
-    })
+    }
+    await update.mutateAsync(body)
+    // Re-baseline on what the server accepted: the form goes pristine, the Save
+    // button disables and the "Saved" note appears (and the effect above can
+    // resume tracking the refetched settings).
+    reset(body)
   })
 
   return (
@@ -99,7 +111,7 @@ export function SecuritySection({ settings }: { settings: AdminSecuritySettings 
             </div>
             {reloadCors.error && (
               <p role="alert" className="text-sm text-destructive">
-                {extractErrorMessage(reloadCors.error)}
+                {formatApiError(reloadCors.error, t)}
               </p>
             )}
             {reloadCors.isSuccess && (
@@ -123,7 +135,7 @@ export function SecuritySection({ settings }: { settings: AdminSecuritySettings 
 
           {update.error && (
             <p role="alert" className="text-sm text-destructive">
-              {extractErrorMessage(update.error)}
+              {formatApiError(update.error, t)}
             </p>
           )}
 

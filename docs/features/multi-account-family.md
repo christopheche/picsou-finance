@@ -231,9 +231,17 @@ Step 3 is critical: without it, the next request would fail because the old JWT 
 - `frontend/src/features/auth/hooks.ts` — `useLogout` calls `resetClientState` (logout side)
 - `frontend/src/features/mfa/hooks.ts` — `useLoginWithRememberMe` / `useVerifyMfa` call `resetClientState` before writing the new identity (login side)
 - `frontend/src/pages/settings/FamilySettingsPage.tsx` — member management + sharing config UI
-- `frontend/src/pages/family/FamilyDashboardPage.tsx` — shared overview
-- `frontend/src/pages/activation/ActivationPage.tsx` — activation flow for new members
-- `frontend/src/pages/settings/SettingsPage.tsx` — username edit inline (pencil → input → save)
+- `frontend/src/pages/family/FamilyDashboardPage.tsx` — shared overview. Renders
+  `ErrorState` + retry when the query fails (a network error has no response, so the
+  global 5xx redirect never fires and `data` is simply undefined); a non-EUR shared
+  account is formatted in its own currency via `formatCurrency(balance, currency)`
+  and its type through `t(accountTypeLabelKey(type))`, never the raw enum.
+- `frontend/src/pages/activation/ActivationPage.tsx` — activation flow for new
+  members. Fully translated under `auth.activation.*`; the call goes through
+  `useActivateAccount()` and failures through `formatApiError`.
+- `frontend/src/pages/settings/SettingsPage.tsx` — username edit inline (pencil →
+  input → save), driven by `useUpdateUsername()` (`features/auth/hooks.ts`). The
+  validation copy lives under `auth.username*`, not `settings.*`.
 
 **Migrations:**
 - `V20__create_family_system.sql` — creates family_member, sharing_settings, shared_resource, goal_contributor tables; adds member_id to all owner tables

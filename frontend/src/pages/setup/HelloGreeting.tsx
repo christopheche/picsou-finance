@@ -72,6 +72,11 @@ export function HelloGreeting({
       window.clearTimeout(t1)
       window.clearTimeout(t2)
     }
+    // Documented disable (docs/conventions/frontend.md): the cycle is driven by
+    // `index` alone. `greetings` is re-derived from t() on every render and
+    // `skip` is a fresh closure each time, so listing them would clear and
+    // restart the two timers mid-word and the animation would never advance.
+    // The cadence props are read once per step by design.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index])
 
@@ -89,6 +94,10 @@ export function HelloGreeting({
       window.removeEventListener('click', onClick)
       window.clearTimeout(watchdog)
     }
+    // Documented disable (docs/conventions/frontend.md): the listeners and the
+    // watchdog are a mount-once subscription. `skip` guards itself with
+    // `finishedRef`, so the stale closure is harmless; re-subscribing on every
+    // render would restart the 5 s watchdog and it could never fire.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

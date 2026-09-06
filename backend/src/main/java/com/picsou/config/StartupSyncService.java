@@ -11,9 +11,13 @@ import org.springframework.stereotype.Component;
 /**
  * Triggers initial sync of all accounts at application startup.
  * Runs after DataSeeder to ensure user exists before syncing.
+ *
+ * <p>The ordering only holds because {@link DataSeeder} carries an explicit {@code @Order(0)}:
+ * a runner without the annotation sorts at {@code Ordered.LOWEST_PRECEDENCE}, i.e. <em>after</em>
+ * every annotated one, not at 0. A runner that must precede the sync needs an order below 1.
  */
 @Component
-@Order(1) // Run after DataSeeder (which has default order 0)
+@Order(1) // After DataSeeder (@Order(0)); before IsinTickerRepairRunner (@Order(2))
 public class StartupSyncService implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(StartupSyncService.class);

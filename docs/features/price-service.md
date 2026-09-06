@@ -45,7 +45,7 @@ Anything still unresolved returns nothing.
 
 ### Scheduler
 
-`SchedulerService.refreshPrices()` runs every hour (`fixedDelay = 3600000`). It builds **one** global set — `account.ticker` for accounts that are themselves one asset, **union** `AccountHoldingRepository.findDistinctTickers()` for everything held inside brokerage/exchange/wallet accounts — and calls `PriceService.refreshPrices()` once. Prices are global (no member scoping anywhere in the cache, the table or the providers), so iterating members would only re-fetch shared tickers once per member.
+`SchedulerService.refreshPrices()` runs every hour (`fixedDelay = 3600000`), starting **five minutes after boot** (`initialDelay = 300000`): a `fixedDelay` task otherwise fires at context refresh, before Spring Boot calls the application runners, so its first tick ran on the scheduler thread while `StartupSyncService` and `PriceBackfillRunner` were already hitting the same providers from the main thread against an empty cache — the boot-time burst behind the [2026-08-01 incident](../decisions/2026-08-01-last-known-price-fallback.md). It builds **one** global set — `account.ticker` for accounts that are themselves one asset, **union** `AccountHoldingRepository.findDistinctTickers()` for everything held inside brokerage/exchange/wallet accounts — and calls `PriceService.refreshPrices()` once. Prices are global (no member scoping anywhere in the cache, the table or the providers), so iterating members would only re-fetch shared tickers once per member.
 
 Both halves are split by account type before the call: `AccountRepository.findDistinctTickersByType(CRYPTO)` joins the crypto holding tickers, and `findDistinctTickersExcludingType(CRYPTO)` feeds the rest. A manual crypto account tracking one coin carries its symbol on the account row and has no holdings at all, so reading only holdings sent it down the Yahoo Finance branch — the exact contamination the split below exists to prevent. Both are repository projections rather than `findAll()`: one column is read, and loading every account entity hourly to reach it is waste.
 
@@ -146,6 +146,7 @@ Update cache + upsert today's price_snapshot rows
 - `CoinGeckoPriceProviderTest` -- ticker mapping, failure grading, and the post-429 cooldown (including `Retry-After` handling)
 - `AccountServiceTest` -- an unpriced holding leaves the cost basis as well as the value; a recorded price still values the account and is reported as stale
 - `YahooFinancePriceProviderTest` -- unit tests for response parsing
+- `SchedulerServiceTest` -- the hourly refresh keeps crypto tickers on the CoinGecko branch and is deferred past the startup runners; `dailySnapshots` writes live and invested EUR, skips an existing row and an unpriced account, and one account's failure (a valuation bug or a concurrent snapshot write) does not cost the others their snapshot
 
 ## Links
 

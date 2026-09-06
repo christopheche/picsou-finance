@@ -1,6 +1,6 @@
 # Feature: Accounts Overview (PnL chart + summary card + asset type filters)
 
-> Last updated: 2026-08-13
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -167,7 +167,9 @@ AccountsPage
 - **`currentBalanceEur` is the account's full value, not the viewer's share.** Co-owned accounts carry `sharePercent` alongside it (see [account-ownership-shares.md](account-ownership-shares.md)); anything summing balances on this page must apply it, because the server only weights its own aggregates.
 - **`Account.id` cast to `number`** — virtual group accounts use string keys (`'STOCKS'`, `'CRYPTO'`) cast as `number` via `as unknown as number`. This works because Recharts uses `dataKey` as a string lookup, but it's fragile.
 - **`totalInvested` relies on the last invested point** — if an account has no snapshots at all, its invested amount is 0 and PnL equals its full balance. This is correct for newly created accounts where balance = invested.
-- **Cash accounts have `investedAmount = balance`** — set by `AccountService.calculateInvestedAmount()` which returns `currentBalance` for accounts without holdings. This means their PnL = 0.
+- **Cash accounts have `investedAmount = balance`, in EUR** — `AccountService.valuation()` returns the EUR-converted value as the cost basis of any account without holdings (and of a loan), so their PnL = 0 whatever currency or ticker the balance is kept in. It used to return the raw `currentBalance` — 2500 USD, 0.5 BTC — against an EUR value, which stamped a phantom PnL the size of the conversion into every daily snapshot of such an account. `DashboardService` had always used `invested = value` for them; the hero card and the chart now agree.
+- **Every write of `balance_snapshot` is in EUR, on every path.** The daily job and the connectors always stored EUR; `create()`, `update()` and `addManualSnapshot()` stored the native figure, so a USD or single-asset manual account alternated between the two units in its history. All three now take both `balance` and `invested_amount` from one `Valuation` (or `PriceService.toEur` for a hand-entered balance). A backdated manual snapshot is converted at today's rate — the same trade-off the [FX-conversion ADR](../decisions/2026-05-19-yahoo-fx-conversion.md) accepts for the chart. Rows written before 2026-09-06 by those three paths cannot be repaired: a row does not record its unit and the historical rate is unknown.
+- **A backdated manual snapshot derives `invested_amount` from its own date, not from today.** `addManualSnapshot` used to call the 3-arg `upsertSnapshot`, whose cost basis is the account's *current* state — a row backfilled six months ago (the `MonthEndBalanceModal` flow) carried today's balance as its invested amount and the chart printed a loss the size of everything saved since. For a holdings-less account the row's invested is its own balance; for an account with holdings it is the live cost basis when the date is current and the nearest row on or before the date when it is not (re-saving an existing backdated row therefore keeps that row's cost basis).
 - **`useAllAccountsHistory` returns `AccountsHistoryData`** — not a flat array. Consumers must destructure `{ balances, invested }`.
 - **Demo mock history** — `generateHistory()` in `frontend/src/demo/index.ts` creates 12 monthly points. The last point should match the account's `currentBalance` to stay consistent.
 

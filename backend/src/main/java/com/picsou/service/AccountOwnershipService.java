@@ -38,6 +38,15 @@ public class AccountOwnershipService {
     /** Types a split is meaningful for today. */
     private static final Set<AccountType> SPLITTABLE = Set.of(AccountType.REAL_ESTATE, AccountType.LOAN);
 
+    /**
+     * Whether a split may exist on an account of this type. The one definition, so
+     * {@code AccountService.update} refuses a retype on the same terms {@link #replace} refuses
+     * a write.
+     */
+    public static boolean isSplittable(AccountType type) {
+        return type != null && SPLITTABLE.contains(type);
+    }
+
     private final AccountOwnershipRepository ownershipRepository;
     private final FamilyMemberRepository memberRepository;
     private final AccountAccessResolver accessResolver;

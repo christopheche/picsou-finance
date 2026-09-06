@@ -111,7 +111,7 @@ Used by:
 
 ### Historical net-worth chart (`HistoryService.buildHistory`)
 
-For each past date, both `total` and `invested` are read from `balance_snapshot` and forward-filled per account from the latest row on or before that date. Loans contribute their negative balance to `total` and zero to `invested`. Today's point is replaced with live values from `liveBalanceEur()` and `calculateInvestedAmount()` so intraday changes are visible immediately. The `invested_amount` column (added in V18, `NOT NULL`) is written by both the daily scheduler and every sync path via `AccountService.upsertSnapshot`.
+For each past date, both `total` and `invested` are read from `balance_snapshot` and forward-filled per account from the latest row on or before that date. Loans contribute their negative balance to `total` and zero to `invested`. Today's point is replaced with live values from `liveBalanceEur()` and `calculateInvestedAmount()` so intraday changes are visible immediately. The `invested_amount` column (added in V18, `NOT NULL`) is written by both the daily scheduler and every sync path via `AccountService.upsertSnapshot`. Both columns are EUR on every write path — the manual ones (`create`, `update`, `addManualSnapshot`) included since 2026-09-06; see the gotchas in [accounts-overview.md](./accounts-overview.md) for the cost basis of a hand-entered or backdated row.
 
 ### Key files
 

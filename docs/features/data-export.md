@@ -1,6 +1,6 @@
 # Feature: GDPR-friendly data export (JSON + CSV)
 
-> Last updated: 2026-07-20
+> Last updated: 2026-09-06
 > Status: ✅ Implemented
 
 ## Context
@@ -115,7 +115,9 @@ Pretty-printed (2-space indent), camelCase, ISO-8601 UTC timestamps, decimal str
 
 ### Data shape — `csv/` directory
 
-RFC 4180: UTF-8 (no BOM), comma-separated, CRLF line endings, fields containing comma/quote/newline are double-quoted with internal quotes doubled.
+RFC 4180: UTF-8 with a BOM (so Excel detects the encoding), comma-separated, CRLF line endings, fields containing comma/quote/newline are double-quoted with internal quotes doubled.
+
+**Formula injection is neutralised** (OWASP CSV injection): a field starting with `=`, `@`, tab or CR — or with `+`/`-` when it is not a plain signed number — is prefixed with a single quote and quoted, e.g. a transaction label `=HYPERLINK("http://evil";"x")` is written as `"'=HYPERLINK(""http://evil"";""x"")"`. Labels and holding names come from third parties (a counterparty controls a SEPA transfer label), and Excel/LibreOffice would otherwise evaluate them on open. Amounts are `BigDecimal.toPlainString()` so negative numbers keep their sign. This is asymmetric with the importer's `CsvReader`, which does not strip the quote: it is a display escape for spreadsheet apps, not part of the data model, and `data.json` carries the raw value.
 
 | File                           | Source entity                          | Notable columns                                        |
 | ------------------------------ | -------------------------------------- | ------------------------------------------------------ |
@@ -203,6 +205,7 @@ Frontend:
 
 Backend:
 
+- `CsvWriterTest` — RFC 4180 quoting, BOM, and formula-injection neutralisation (`=`/`@`/tab/CR, signed formulas vs signed plain numbers).
 - `*ExporterTest` (one per `EntityExporter`) — fixtures → expected JSON node + CSV rows. Each includes a *negative* assertion: the produced bytes do not contain known-secret tokens.
 - `DataExportServiceTest` — verifies ZIP file list given options, presence/absence of `balance_snapshots.csv` based on toggle, presence of `README.txt`. Wires **all** `EntityExporter` beans (matching production Spring injection, not a subset) with one fixture per entity carrying a unique tripwire literal in every sensitive, non-exported field (e.g. `Requisition.authLink`); asserts none of the tripwires appear anywhere in the archive bytes. **New exporter ⇒ new wiring + new tripwire(s) in this test** — the net only protects what it exercises, and a partial exporter list (as this test shipped with for a while) silently blinds it to whichever exporters are missing.
 - `BalanceSnapshotsExporterTest` — drives the exporter directly (2 accounts × 3 snapshots): asserts CSV/JSON row order (account, then date) and, via `Mockito.verify`, exactly one `balanceSnapshotRepository.findByAccountIdOrderByDateAsc` call per account per pass (2 passes) — never a whole-member collecting call.

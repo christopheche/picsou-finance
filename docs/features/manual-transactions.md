@@ -72,7 +72,7 @@ A user-supplied "Nom" always wins over the resolved name. The same logic runs fo
 
 ### Balance derivation (cash accounts)
 
-When a manual transaction is added, edited, or deleted on a **manual** cash account (`account.isManual = true`), `ManualTransactionService` recomputes `account.currentBalance` as the sum of all transaction amounts via a single aggregate query (`sumAmountByAccountId`). It then calls `FinaryPersistenceHelper.reconstructSnapshotsFromDb()` to rebuild the balance history from scratch.
+When a manual transaction is added, edited, or deleted on a **manual** cash account (`account.isManual = true`), `ManualTransactionService` recomputes `account.currentBalance` as the sum of all transaction amounts via a single aggregate query (`sumAmountByAccountId`). It then calls `FinaryPersistenceHelper.reconstructSnapshotsFromDb()` to rebuild the balance history from scratch (each snapshot dated D holds the end-of-day balance, i.e. after D's own transactions — see [finary-import.md](finary-import.md)).
 
 ### Synced accounts
 

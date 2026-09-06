@@ -100,6 +100,7 @@ Picsou publishes pre-built, multi-arch (amd64/arm64) images to the GitHub Contai
 | `ghcr.io/zoeille/picsou-finance/bourse-direct-auth` | Bourse Direct login/2FA sidecar |
 | `ghcr.io/zoeille/picsou-finance/amundi-auth` | Amundi Épargne Salariale login/2FA sidecar |
 | `ghcr.io/zoeille/picsou-finance/bourso-auth` | BoursoBank login/2FA sidecar |
+| `ghcr.io/zoeille/picsou-finance/degiro-auth` | DEGIRO login/2FA + portfolio sidecar |
 
 ```bash
 docker compose -f docker/docker-compose.yml pull    # fetch the published images from GHCR
@@ -110,7 +111,7 @@ docker compose -f docker/docker-compose.yml up -d
 >
 > Building from source instead of pulling? Run `docker compose -f docker/docker-compose.yml up --build` — the `build:` sections are kept for contributors.
 
-On first launch the entrypoint auto-generates `JWT_SECRET`, `CRYPTO_ENCRYPTION_KEY`, and `POSTGRES_PASSWORD` (persisted to the `picsou_data` volume under `/data/.secrets/`).
+On first launch the entrypoint auto-generates `JWT_SECRET` and `CRYPTO_ENCRYPTION_KEY` (persisted to the `picsou_data` volume under `/data/.secrets/`). The PostgreSQL password defaults to `picsou` on the internal Compose network (the port is not published); set `POSTGRES_PASSWORD` in `docker/.env` **before the first launch** to choose your own — both the database and the app read that one value.
 
 > [!IMPORTANT]
 > **Planning to sync bank accounts? Set up HTTPS now, before opening the wizard — jump to
@@ -330,7 +331,7 @@ cp docker/.env.example docker/.env
 
 | Variable | When to set | Description |
 |----------|-------------|-------------|
-| `POSTGRES_PASSWORD` | Override auto-gen | Strong random password |
+| `POSTGRES_PASSWORD` | Before first launch | Strong random password — Postgres only initialises the role on a fresh volume |
 | `JWT_SECRET` | Override auto-gen | `openssl rand -base64 48` |
 | `CRYPTO_ENCRYPTION_KEY` | Override auto-gen | `openssl rand -base64 32` |
 | `APP_USERNAME` / `APP_PASSWORD_HASH` | Skip wizard | `htpasswd -bnBC 12 "" YOUR_PASSWORD \| tr -d ':\r\n'` |
@@ -339,6 +340,8 @@ cp docker/.env.example docker/.env
 | `ENABLEBANKING_*` | Skip wizard | From your [Enable Banking dashboard](https://enablebanking.com/). The redirect URI must be `https://` |
 | `BOURSO_AUTH_URL` | Custom sidecar | Defaults to `http://bourso-auth:8001` |
 | `BOURSE_DIRECT_AUTH_URL` | Custom sidecar | Defaults to `http://bourse-direct-auth:8001` |
+| `DEGIRO_AUTH_URL` | Custom sidecar | Defaults to `http://degiro-auth:8001` |
+| `TZ` | Non-UTC household | IANA zone for the app container (scheduled syncs, day boundaries), e.g. `Europe/Paris`; default `UTC` |
 | `PICSOU_DOMAIN` | TLS profile | Hostname Caddy serves — see [step 3](#3-https-decide-before-the-first-launch) |
 | `HSTS_ENABLED` | Trusted cert | `true` only with a publicly-trusted certificate |
 
@@ -350,13 +353,14 @@ cp docker/.env.example docker/.env
 
 ### 5. Enable Banking key setup (optional)
 
-```bash
-mkdir -p docker/secrets
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out docker/secrets/enablebanking.pem
-openssl rsa -pubout -in docker/secrets/enablebanking.pem -out enablebanking_public.pem
-```
+The setup wizard generates the RSA key pair for you (stored under `/data/keys` on the
+`picsou_data` volume) and shows the public key to upload to your Enable Banking dashboard —
+nothing to do by hand.
 
-Upload `enablebanking_public.pem` to your Enable Banking dashboard.
+To bring your own key instead, put the PEM in `docker/.env` as `ENABLEBANKING_PRIVATE_KEY`
+(single line, `\n` for newlines) alongside `ENABLEBANKING_APPLICATION_ID` / `ENABLEBANKING_KEY_ID`.
+The backend reads the wizard's file first, then `ENABLEBANKING_PRIVATE_KEY_PATH`, then that inline
+value; there is no bind-mounted `docker/secrets/enablebanking.pem` in the release compose file.
 
 ## Development
 

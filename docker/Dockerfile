@@ -4,7 +4,10 @@
 # ============================================================
 
 # ---------- Stage 1: Build frontend ----------
-FROM oven/bun:alpine AS frontend-build
+# Major-pinned: an unversioned `oven/bun:alpine` would let a bun 2.x release
+# change bun.lock semantics and break --frozen-lockfile on a rebuild of the
+# same git revision.
+FROM oven/bun:1-alpine AS frontend-build
 
 WORKDIR /build/frontend
 
@@ -36,11 +39,13 @@ FROM eclipse-temurin:21-jre-jammy
 ARG APP_VERSION=dev
 ENV APP_VERSION=$APP_VERSION
 
-# Install Nginx + supervisor + openssl (entrypoint auto-generates secrets on first boot)
+# Install Nginx + supervisor + openssl (entrypoint auto-generates secrets on
+# first boot) + curl (HEALTHCHECK probe below)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         nginx \
         supervisor \
         openssl \
+        curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -70,5 +75,13 @@ COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
+
+# Probe through nginx so a failing backend (crash-looping under supervisord
+# while nginx keeps answering 502) flips the container to `unhealthy` instead
+# of staying `Up` forever. /actuator/health is permitAll in SecurityConfig.
+# The start period covers Spring's boot on a slow NAS; docker-compose.yml
+# repeats the same probe so `depends_on: condition: service_healthy` works.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/actuator/health > /dev/null || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

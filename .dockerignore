@@ -1,19 +1,29 @@
+# Build context of docker/Dockerfile (context: project root).
+# A pattern without a leading `**/` only matches at the context root, so the
+# env/e2e/node_modules entries are anchored with `**/` to also catch
+# frontend/.env.local (Vite would inline its VITE_* values into the bundle),
+# docker/.env, frontend/e2e/ and a host node_modules/.
 .git/
 .idea/
 *.iml
 *.log
-.env
-.env.*
+**/.env
+**/.env.*
+**/.local/
+**/node_modules/
+**/__pycache__/
 backend/target/
 backend/.mvn/
 backend/mvnw*
-frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/CLAUDE.md
 docs/
-e2e/
+**/e2e/
+**/test-results/
 secrets/
+.scratch/
+TODO.txt
 docker/Dockerfile
 docker-compose*.yml
 *.md

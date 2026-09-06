@@ -1,11 +1,14 @@
 # Feature: DEGIRO sync
 
-> Last updated: 2026-08-05
+> Last updated: 2026-09-06
 > Status: ✅ **Active — validated end-to-end against a live DEGIRO account**
 > (login incl. TOTP, portfolio sync, holdings resolution). Wired into both
 > the DEGIRO tab in `SyncPage` and the unified "Add account" modal
 > (`AddAccountModal` → `DegiroPanel`, mirroring `BourseDirectPanel`).
-> `degiro-auth` must be enabled in `docker-compose.yml` (uncommented) to run.
+> `degiro-auth` ships enabled in both compose files (root `docker-compose.yml`
+> and the GHCR release stack `docker/docker-compose.yml`), is published as
+> `ghcr.io/zoeille/picsou-finance/degiro-auth`, and its parser tests run in CI
+> (`degiro-sidecar` job).
 > See "Known limitations" below for the couple of things still worth
 > double-checking, and "Fixed during live testing" for what a first real
 > account run actually caught.

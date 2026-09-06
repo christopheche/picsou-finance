@@ -2,12 +2,18 @@
 # ─────────────────────────────────────────────────────────────────────────
 # Picsou container entrypoint — "zero-config" secrets bootstrap.
 #
-# On first boot, generates the three secrets the app needs before Spring
+# On first boot, generates the two secrets the app needs before Spring
 # can even start (they're read at bean-construction time, so they cannot
 # live in the DB):
 #   • JWT_SECRET              → /data/.secrets/jwt_secret
 #   • CRYPTO_ENCRYPTION_KEY   → /data/.secrets/crypto_key
-#   • POSTGRES_PASSWORD       → /data/.secrets/postgres_password
+#
+# The database password is deliberately NOT generated here. Postgres
+# initialises its role from the db service's own POSTGRES_PASSWORD before
+# this container starts, so a value minted here could never reach it; the
+# compose file derives SPRING_DATASOURCE_PASSWORD from the same
+# ${POSTGRES_PASSWORD:-picsou} expression as the db service instead. (Older
+# images wrote an unused /data/.secrets/postgres_password; it is ignored.)
 #
 # On subsequent boots, the files already exist on the /data volume, so we
 # just re-export. A secret is **never** regenerated once created — doing
@@ -74,7 +80,6 @@ bootstrap_secret() {
 
 bootstrap_secret "jwt_secret"        "JWT_SECRET"            "rand -base64 48"
 bootstrap_secret "crypto_key"        "CRYPTO_ENCRYPTION_KEY" "rand -base64 32"
-bootstrap_secret "postgres_password" "POSTGRES_PASSWORD"     "rand -base64 24"
 
 # ── HSTS (opt-in) ────────────────────────────────────────────────────────
 # nginx.conf includes this snippet; empty means the header is never sent.

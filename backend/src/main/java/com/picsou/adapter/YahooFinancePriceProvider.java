@@ -7,6 +7,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -18,6 +20,7 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 /**
@@ -49,6 +52,16 @@ public class YahooFinancePriceProvider implements PriceProviderPort, SymbolCatal
 
     private static final Duration FX_CACHE_TTL = Duration.ofMinutes(15);
 
+    /** Applied when a 429 arrives without a usable {@code Retry-After}. */
+    private static final Duration DEFAULT_COOLDOWN = Duration.ofSeconds(60);
+
+    /**
+     * Ceiling on a server-supplied {@code Retry-After}, for the same reason
+     * {@code CoinGeckoPriceProvider} caps its own: a "86400" would otherwise leave the instance
+     * unable to price a single equity for a day, long after the real limit lifted.
+     */
+    private static final Duration MAX_COOLDOWN = Duration.ofMinutes(15);
+
     private static final java.util.regex.Pattern SYMBOL_PATTERN =
         java.util.regex.Pattern.compile("(?:\\^[A-Z0-9][A-Z0-9.=-]{0,18}|[A-Z0-9][A-Z0-9.=-]{0,19})");
 
@@ -59,6 +72,18 @@ public class YahooFinancePriceProvider implements PriceProviderPort, SymbolCatal
 
     private final WebClient webClient;
     private final Map<String, CachedFx> fxCache = new ConcurrentHashMap<>();
+
+    /**
+     * When a 429 stops being in force. Prices are read per ticker, so without this a portfolio
+     * that trips Yahoo's limit at ticker 20 still fires the remaining 40 requests (plus one FX
+     * request each), and the 15-minute scheduler repeats that every cycle -- answering a rate
+     * limit with more traffic is what turns a one-minute limit into a morning of missing prices.
+     * Same pause, same reasoning as {@code CoinGeckoPriceProvider.rateLimitedUntil}.
+     *
+     * <p>Volatile, not a lock: concurrent readers racing on the boundary either skip one call
+     * they could have made or make one they could have skipped, and neither matters.
+     */
+    private volatile Instant rateLimitedUntil = Instant.EPOCH;
 
     public YahooFinancePriceProvider() {
         this(WebClient.builder()
@@ -113,15 +138,97 @@ public class YahooFinancePriceProvider implements PriceProviderPort, SymbolCatal
 
         // Yahoo Finance is fetched per-ticker (no batch endpoint for EUR conversion)
         for (String ticker : supported) {
+            // A 429 applies to the whole endpoint, not to one symbol: once it is in force the
+            // remaining tickers of this batch have nothing to gain from being asked.
+            if (coolingDown(ticker)) break;
             try {
                 BigDecimal price = fetchSinglePrice(ticker);
                 if (price != null) result.put(ticker, price);
-            } catch (Exception ex) {
-                log.warn("Yahoo Finance price fetch failed for {}: {}", ticker, ex.getMessage());
+            } catch (RuntimeException ex) {
+                handleFetchFailure(ticker, ex);
             }
         }
 
         return result;
+    }
+
+    /**
+     * Classifies a failed price read, and decides whether it is ours to swallow.
+     *
+     * <p><b>Expected upstream failures</b> (HTTP error, unreachable API, timeout) are logged and
+     * the ticker stays unpriced this cycle -- the contract {@code SchedulerService} and
+     * {@code PriceService} rely on, where a missing price means "not valued now", never "not
+     * held", and the last recorded price is kept.
+     *
+     * <p><b>Anything else</b> -- an NPE, a {@link ClassCastException}, a parse defect against a
+     * changed Yahoo payload -- is <em>rethrown</em>. Swallowing a bug into "no price" makes it
+     * indistinguishable from an outage, which is exactly how a parser defect survives for days.
+     * Same contract as {@code CoinGeckoPriceProvider.handleFetchFailure}, documented in
+     * docs/features/price-service.md; the batch callers guard their own loops, so one bad ticker
+     * cannot abort a run.
+     *
+     * <p>It unwraps first: {@code Mono.timeout()} signals a <em>checked</em>
+     * {@link TimeoutException}, which {@code block()} wraps in a reactor {@code ReactiveException}.
+     *
+     * <p>A 429 additionally arms {@link #rateLimitedUntil}.
+     */
+    private void handleFetchFailure(String ticker, RuntimeException ex) {
+        Throwable cause = reactor.core.Exceptions.unwrap(ex);
+        if (cause instanceof WebClientResponseException http) {
+            int status = http.getStatusCode().value();
+            if (status == 429) {
+                Duration cooldown = retryAfter(http);
+                rateLimitedUntil = Instant.now().plus(cooldown);
+                log.warn("Yahoo Finance rate-limited (429) fetching {} -- skipping the rest of the "
+                    + "batch and pausing calls for {}s", ticker, cooldown.toSeconds());
+            } else {
+                // 404 is the ordinary "Yahoo does not carry this symbol"; 5xx is their outage.
+                // Both leave the holding on its last known price, so neither is an alert.
+                log.warn("Yahoo Finance answered HTTP {} for {} -- no price this cycle", status, ticker);
+            }
+        } else if (cause instanceof TimeoutException) {
+            log.warn("Yahoo Finance request for {} timed out after {} -- no price this cycle",
+                ticker, TIMEOUT);
+        } else if (cause instanceof WebClientRequestException) {
+            log.warn("Yahoo Finance request for {} could not reach the API ({}) -- no price this cycle",
+                ticker, cause.getMessage());
+        } else {
+            throw ex;
+        }
+    }
+
+    /**
+     * True when a recent 429 is still in force, in which case the caller must return no prices
+     * without touching the network.
+     *
+     * <p>DEBUG, not WARN: the 429 that armed the pause was already logged once at WARN, and this
+     * runs on every read for as long as the pause lasts.
+     */
+    private boolean coolingDown(String ticker) {
+        Instant until = rateLimitedUntil;
+        if (Instant.now().isBefore(until)) {
+            log.debug("Yahoo Finance still rate-limited until {} -- skipping the price request for {}",
+                until, ticker);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * The pause a 429 buys us: the server's {@code Retry-After} when it sends a sane one,
+     * {@link #DEFAULT_COOLDOWN} otherwise. Only the delta-seconds form is read -- an HTTP-date
+     * would need clock-skew handling for no practical gain.
+     */
+    private static Duration retryAfter(WebClientResponseException http) {
+        String header = http.getHeaders().getFirst("Retry-After");
+        if (header == null || header.isBlank()) return DEFAULT_COOLDOWN;
+        try {
+            long seconds = Long.parseLong(header.trim());
+            if (seconds <= 0) return DEFAULT_COOLDOWN;
+            return Duration.ofSeconds(Math.min(seconds, MAX_COOLDOWN.toSeconds()));
+        } catch (NumberFormatException ex) {
+            return DEFAULT_COOLDOWN;
+        }
     }
 
     private BigDecimal fetchSinglePrice(String ticker) {
@@ -381,8 +488,12 @@ public class YahooFinancePriceProvider implements PriceProviderPort, SymbolCatal
             for (int i = 0; i < timestamps.size() && i < closes.size(); i++) {
                 Double close = closes.get(i);
                 if (close == null) continue;
+                // UTC, like CoinGecko's intraday series: HistoryService merges both onto one
+                // LocalDateTime axis against a UTC grid, and keying these bars in Europe/Paris
+                // put every stock point one or two hours ahead of that axis -- valuing the hour
+                // at a stale close and dropping the freshest bars of the day as "after `to`".
                 LocalDateTime dt = Instant.ofEpochSecond(timestamps.get(i))
-                    .atZone(ZoneId.of("Europe/Paris")).toLocalDateTime();
+                    .atZone(ZoneOffset.UTC).toLocalDateTime();
                 if (!dt.isBefore(from) && !dt.isAfter(to) && close > 0) {
                     prices.put(dt, BigDecimal.valueOf(close).multiply(fx).setScale(8, RoundingMode.HALF_UP));
                 }

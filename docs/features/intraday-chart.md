@@ -1,6 +1,6 @@
 # Feature: 24H Intraday Net Worth Chart
 
-> Last updated: 2026-04-18
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -28,7 +28,7 @@ HistoryService.buildIntradayHistory()
         |       PriceService.getIntradayPricesEur(ticker, from, to)
         |         -> CoinGecko.getIntradayPricesEur() for crypto
         |         -> YahooFinance.getIntradayPricesEur() for stocks
-        |       Portfolio value at hour H = qty × price_at_H (forward-filled)
+        |       Portfolio value at hour H = cashBalance + Σ qty × price_at_H (forward-filled)
         |
         v
 List<NetWorthIntradayPoint> — ~24 hourly points
@@ -58,7 +58,7 @@ DashboardPage renders NetWorthChart with intraday prop
 - `backend/src/main/java/com/picsou/service/PriceService.java` — `getIntradayPricesEur()`: routes to CoinGecko or Yahoo based on ticker
 - `backend/src/main/java/com/picsou/service/HistoryService.java` — `buildIntradayHistory()`: assembles hourly net worth points
 - `backend/src/main/java/com/picsou/controller/HistoryController.java` — `GET /api/history/net-worth/intraday`
-- `backend/src/main/java/com/picsou/dto/DashboardResponse.java` — `NetWorthIntradayPoint(timestamp, total, invested)`
+- `backend/src/main/java/com/picsou/dto/DashboardResponse.java` — `NetWorthIntradayPoint(timestamp, total, invested)`; `timestamp` is an `Instant`, serialised with its `Z`
 
 **Frontend:**
 - `frontend/src/components/shared/TimeRangeSelector.tsx` — `1D` replaced with `24H`
@@ -85,13 +85,18 @@ DashboardPage renders NetWorthChart with intraday prop
 - **Bank account balances are constant intraday**: Only the daily `BalanceSnapshot` is used for non-investment accounts. Real-time bank balance changes won't appear until the next sync.
 - **Loans are negated**: Same logic as the daily history — loan balances are subtracted from total net worth.
 - **`intraday` prop is optional on NetWorthChart**: Other pages (AccountDetail, GoalDetail) use NetWorthChart without intraday data. When `intraday` is not provided, the 24H range still works but shows empty data.
-- **Yahoo timezone**: Yahoo Finance timestamps are parsed as `Europe/Paris` (not UTC) since the app targets French users. CoinGecko uses UTC.
+- **One zone, UTC, end to end**: the grid (`HistoryService.INTRADAY_ZONE`) and both providers key their hourly bars in UTC wall-clock, and the API returns each point as an `Instant` (`...Z`) so the browser labels it in the viewer's own zone. Yahoo used to key its bars in `Europe/Paris` "since the app targets French users" while CoinGecko keyed its own in UTC and the grid came from `LocalDateTime.now()` (the JVM default, UTC in the container). Nothing lined up: every stock point was valued at a close one or two hours older than the crypto point beside it, and the freshest bars of the trading day were dropped by the provider's own `!dt.isAfter(to)` filter. `HistoryServiceTest.buildIntradayHistory_stockAndCryptoBarsForTheSameInstant_landOnTheSameHourlyPoint` and `YahooFinancePriceProviderTest.getIntradayPricesEur_keysBarsInUtc_notEuropeParis` pin it.
+- **Brokerage cash is part of the series**: an account's hourly value is `cashBalance + Σ qty × price`, and its cost basis is `cashBalance + Σ costBasis`, the same shape as `AccountService.valuation`. Omitting the cash sat the whole 24H curve below the daily chart's today point by that amount, so switching 24H ↔ 7D jumped by the cash. A holding's cost basis prefers the connector's own figure (`providerValueEur − providerPnlEur`) — Trade Republic and Bourse Direct populate those and leave `averageBuyIn` empty.
+- **The grid comes from an injected `Clock`**: `HistoryService` takes the `Clock` bean, so tests pin the 24 hourly points instead of depending on the machine's clock and default zone.
 
 ## Tests
 
 - Manual: select "24H" → chart shows ~24 hourly points with "HH:mm" on X-axis
 - Manual: select "7D" → chart shows "dd MMM" labels with dots on data points
 - Manual: select "1M"+ → chart shows month abbreviations (unchanged behavior)
+- `HistoryServiceTest.buildIntradayHistory_stockAndCryptoBarsForTheSameInstant_landOnTheSameHourlyPoint` — one Yahoo-style and one CoinGecko-style bar for the same instant reach the same grid point, and the point is `16:00Z`
+- `HistoryServiceTest.buildIntradayHistory_brokerageCash_countsInEveryPointAndInInvested` and `..._providerCostBasis_usedWhenAverageBuyInIsAbsent`
+- `YahooFinancePriceProviderTest.getIntradayPricesEur_keysBarsInUtc_notEuropeParis`
 - `GoalServiceTest` — existing backend test still passes
 
 ## Links

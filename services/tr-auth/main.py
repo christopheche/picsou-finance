@@ -9,18 +9,20 @@ Flow:
   POST /complete  { processId, tan }    → { sessionToken }
 """
 
-import asyncio
 import base64
 import hashlib
 import json
 import uuid
 import logging
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tr-auth")
@@ -31,8 +33,10 @@ app = FastAPI()
 TR_API = "https://api.traderepublic.com"
 TR_APP = "https://app.traderepublic.com"
 
-# In-memory store: processId → waf_token (cleared after /complete)
-pending_sessions: dict[str, str] = {}
+# No pending-state store: the process id round-trips through Java and Trade
+# Republic validates it, and /complete always fetches a fresh WAF token (the one
+# from /initiate may have expired by the time the user types the code). A store
+# keyed by process id with no TTL only ever grew with abandoned logins.
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -131,16 +135,64 @@ def cookie_names(headers: httpx.Headers) -> list[str]:
     return names
 
 
+def cookie_value(resp: httpx.Response, name: str) -> Optional[str]:
+    """Reads a cookie TR set on this response.
+
+    httpx's parsed jar first; then the raw Set-Cookie headers, in case the jar
+    dropped the cookie for Secure/domain reasons. The name is matched
+    case-insensitively on the first `name=value` pair of each header only.
+    """
+    value = resp.cookies.get(name)
+    if value:
+        return value
+    prefix = name.lower() + "="
+    for cookie_str in resp.headers.get_list("set-cookie"):
+        first = cookie_str.split(";", 1)[0].strip()
+        if first.lower().startswith(prefix):
+            return first[len(prefix):]
+    return None
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 class InitiateRequest(BaseModel):
-    phoneNumber: str
-    pin: str
+    model_config = ConfigDict(extra="forbid")
+
+    phoneNumber: str = Field(min_length=1, max_length=30)
+    pin: str = Field(min_length=1, max_length=20)
 
 
 class CompleteRequest(BaseModel):
-    processId: str
-    tan: str
+    model_config = ConfigDict(extra="forbid")
+
+    # Both are interpolated into the Trade Republic path: bound them to what a
+    # process id and a TAN look like so a caller cannot steer the authenticated
+    # request elsewhere under the TR host. TANs are 4 digits today; 6 stays
+    # accepted for the older flow.
+    processId: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,100}$")
+    tan: str = Field(pattern=r"^\d{4,6}$")
+
+
+class RefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    refreshToken: str = Field(min_length=1, max_length=10_000)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    _: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    fields = {
+        str(error["loc"][-1])
+        for error in exc.errors()
+        if error.get("loc")
+    }
+    # VALIDATION_CODE_INVALID is the code TradeRepublicAdapter.mapAuthError and
+    # the frontend already understand for a bad TAN.
+    detail = "VALIDATION_CODE_INVALID" if "tan" in fields else "INVALID_DATA"
+    return JSONResponse(status_code=400, content={"detail": detail})
 
 
 @app.post("/initiate")
@@ -167,7 +219,6 @@ async def initiate(req: InitiateRequest):
     if not process_id:
         raise HTTPException(status_code=502, detail=f"TR did not return processId: {data}")
 
-    pending_sessions[process_id] = waf_token or ""
     return {"processId": process_id}
 
 
@@ -176,12 +227,11 @@ async def complete(req: CompleteRequest):
     # Always fetch a fresh WAF token — the one from /initiate may have expired
     # by the time the user reads and types the 2FA code.
     waf_token = await get_waf_token()
-    pending_sessions.pop(req.processId, None)  # clean up
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             resp = await client.post(
-                f"{TR_API}/api/v1/auth/web/login/{req.processId}/{req.tan}",
+                f"{TR_API}/api/v1/auth/web/login/{quote(req.processId, safe='')}/{quote(req.tan, safe='')}",
                 headers=tr_headers(waf_token),
             )
             log.info("TR /login/complete → %d  set-cookie names: %s",
@@ -194,16 +244,7 @@ async def complete(req: CompleteRequest):
     # Session token is in Set-Cookie: tr_session=<value>
     # Use resp.cookies (httpx parses all Set-Cookie headers correctly).
     # Fallback: manual parse in case httpx misses it due to Secure/domain filtering.
-    session_token = resp.cookies.get("tr_session")
-    if not session_token:
-        for cookie_str in resp.headers.get_list("set-cookie"):
-            for part in cookie_str.split(";"):
-                part = part.strip()
-                if part.lower().startswith("tr_session="):
-                    session_token = part[len("tr_session="):]
-                    break
-            if session_token:
-                break
+    session_token = cookie_value(resp, "tr_session")
     log.info("TR set-cookie names: %s", cookie_names(resp.headers))
 
     if not session_token:
@@ -211,35 +252,22 @@ async def complete(req: CompleteRequest):
                             detail="No tr_session cookie in TR response. "
                                    "The 2FA code may be invalid or expired.")
 
-    refresh_token = resp.cookies.get("tr_refresh")
-    if not refresh_token:
-        for cookie_str in resp.headers.get_list("set-cookie"):
-            for part in cookie_str.split(";"):
-                part = part.strip()
-                if part.lower().startswith("tr_refresh="):
-                    refresh_token = part[len("tr_refresh="):]
-                    break
-            if refresh_token:
-                break
+    refresh_token = cookie_value(resp, "tr_refresh")
 
     log.info("TR auth complete — session token obtained (refresh token: %s)",
              "yes" if refresh_token else "no")
     return {"sessionToken": session_token, "refreshToken": refresh_token}
 
 
-class RefreshRequest(BaseModel):
-    refreshToken: str
-
-
 @app.post("/refresh")
 async def refresh_session(req: RefreshRequest):
     """Refresh the TR session using the stored refresh token (no 2FA needed)."""
     log.info("Refreshing TR session via tr_refresh token")
-    async with httpx.AsyncClient(timeout=15) as client:
+    # On the client, not per request: httpx deprecated per-request cookies.
+    async with httpx.AsyncClient(timeout=15, cookies={"tr_refresh": req.refreshToken}) as client:
         try:
             resp = await client.post(
                 f"{TR_API}/api/v1/auth/web/refresh",
-                cookies={"tr_refresh": req.refreshToken},
                 headers={
                     "Accept": "*/*",
                     "Content-Type": "application/json",

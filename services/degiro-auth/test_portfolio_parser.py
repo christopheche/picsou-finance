@@ -1,8 +1,10 @@
 import unittest
 
 from portfolio_parser import (
+    PortfolioFormatError,
     build_positions,
     build_product_info_map,
+    describe_product_info,
     is_real_product_id,
     parse_cash_eur,
     parse_raw_positions,
@@ -88,13 +90,29 @@ class ParseCashEurTest(unittest.TestCase):
         ]
         self.assertEqual(parse_cash_eur(rows), 250.5)
 
-    def test_no_eur_row_returns_zero(self):
-        rows = [{"value": [{"name": "currencyCode", "value": "USD"}, {"name": "value", "value": 100.0}]}]
+    def test_zero_eur_balance_is_a_real_zero(self):
+        rows = [{"value": [{"name": "currencyCode", "value": "EUR"}, {"name": "value", "value": 0}]}]
         self.assertEqual(parse_cash_eur(rows), 0.0)
 
-    def test_empty_input_returns_zero(self):
-        self.assertEqual(parse_cash_eur([]), 0.0)
-        self.assertEqual(parse_cash_eur(None), 0.0)
+    def test_no_eur_row_is_a_format_change_not_an_empty_account(self):
+        # A French DEGIRO account always carries its EUR base-currency row; its absence
+        # means DEGIRO reshaped the block. Returning 0.0 here would let Java book the
+        # account at cash=0 and write that as today's snapshot.
+        rows = [{"value": [{"name": "currencyCode", "value": "USD"}, {"name": "value", "value": 100.0}]}]
+        with self.assertRaises(PortfolioFormatError):
+            parse_cash_eur(rows)
+
+    def test_missing_cash_funds_block_is_refused(self):
+        with self.assertRaises(PortfolioFormatError):
+            parse_cash_eur([])
+        with self.assertRaises(PortfolioFormatError):
+            parse_cash_eur(None)
+
+    def test_eur_row_without_a_numeric_value_is_refused(self):
+        for broken in (None, "", "NULL", True):
+            rows = [{"value": [{"name": "currencyCode", "value": "EUR"}, {"name": "value", "value": broken}]}]
+            with self.subTest(value=broken), self.assertRaises(PortfolioFormatError):
+                parse_cash_eur(rows)
 
 
 class ParseRawPositionsTest(unittest.TestCase):
@@ -110,13 +128,51 @@ class ParseRawPositionsTest(unittest.TestCase):
         self.assertEqual(result[0]["price"], 20.0)
 
     def test_id_falls_back_to_row_level_id(self):
-        rows = [{"id": "12345", "value": [{"name": "size", "value": 3}]}]
+        rows = [{"id": "12345", "value": [{"name": "size", "value": 3}, {"name": "price", "value": 7.5}]}]
         result = parse_raw_positions(rows)
         self.assertEqual(result[0]["productId"], "12345")
 
-    def test_empty_input_returns_empty_list(self):
+    def test_empty_portfolio_block_is_an_empty_list(self):
+        # An empty `portfolio.value` is a legitimate (all sold) state; only a missing
+        # block is a format change.
         self.assertEqual(parse_raw_positions([]), [])
-        self.assertEqual(parse_raw_positions(None), [])
+
+    def test_missing_portfolio_block_is_refused(self):
+        with self.assertRaises(PortfolioFormatError):
+            parse_raw_positions(None)
+
+    def test_real_row_without_size_is_refused_rather_than_dropped(self):
+        rows = [{"id": "2", "value": [{"name": "price", "value": 20}]}]
+        with self.assertRaises(PortfolioFormatError):
+            parse_raw_positions(rows)
+
+    def test_real_row_without_price_is_refused_rather_than_priced_at_zero(self):
+        rows = [{"id": "2", "value": [{"name": "size", "value": 5}]}]
+        with self.assertRaises(PortfolioFormatError):
+            parse_raw_positions(rows)
+
+    def test_non_numeric_size_or_price_is_refused(self):
+        for field in ("size", "price"):
+            rows = [{"id": "2", "value": [{"name": "size", "value": 5}, {"name": "price", "value": 20}]}]
+            rows[0]["value"] = [pair if pair["name"] != field else {"name": field, "value": "NULL"}
+                                for pair in rows[0]["value"]]
+            with self.subTest(field=field), self.assertRaises(PortfolioFormatError):
+                parse_raw_positions(rows)
+
+    def test_pseudo_position_without_size_or_price_is_still_skipped(self):
+        # The FLATEX_EUR cash row is not a priceable holding; it must be skipped
+        # before its fields are required, or a cash row shaped differently from a
+        # security row would fail every sync.
+        rows = [
+            {"id": "FLATEX_EUR", "value": [{"name": "value", "value": 250.0}]},
+            {"id": "2", "value": [{"name": "size", "value": 5}, {"name": "price", "value": 20}]},
+        ]
+        result = parse_raw_positions(rows)
+        self.assertEqual([p["productId"] for p in result], ["2"])
+
+    def test_missing_break_even_price_falls_back_to_price(self):
+        rows = [{"id": "2", "value": [{"name": "size", "value": 5}, {"name": "price", "value": 20}]}]
+        self.assertEqual(parse_raw_positions(rows)[0]["breakEvenPrice"], 20.0)
 
     def test_flatex_cash_pseudo_position_is_excluded(self):
         rows = [
@@ -185,6 +241,23 @@ class BuildPositionsTest(unittest.TestCase):
         result = build_positions(raw, {})
 
         self.assertEqual(result[0]["symbol"], "None")
+
+
+class DescribeProductInfoTest(unittest.TestCase):
+    def test_describes_shape_without_any_value(self):
+        data = {
+            "15690087": {"isin": "IE00BGSF1X88", "symbol": "IB01", "name": "iShares Treasury", "closePrice": 121.36},
+            "65147": {"isin": "FR0000131104", "symbol": "BNP", "name": "BNP Paribas SA", "closePrice": 111.88},
+        }
+
+        described = describe_product_info(data)
+
+        self.assertEqual(described, "products=2; fields=['closePrice', 'isin', 'name', 'symbol']")
+        for secret in ("IE00BGSF1X88", "IB01", "BNP Paribas", "121.36"):
+            self.assertNotIn(secret, described)
+
+    def test_non_object_payload_is_described_by_type(self):
+        self.assertEqual(describe_product_info([]), "type=list")
 
 
 class BuildProductInfoMapTest(unittest.TestCase):

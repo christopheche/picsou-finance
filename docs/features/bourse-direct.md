@@ -34,7 +34,9 @@ replaces the last valid portfolio.
    encrypts it through `CryptoEncryption` before writing
    `bourse_direct_session`.
 
-The login, password and one-time code are never stored or logged. Pending
+The login, password and one-time code are never stored or logged, and request
+paths are sanitised before they reach the log (control characters stripped,
+length bounded — `_log_safe`, as in the Bourso and Amundi sidecars). Pending
 browser contexts are closed after completion, failure, expiry, sidecar shutdown
 and by a periodic expiry sweep. Concurrent attempts to complete the same
 `processId` cannot reuse a browser context.

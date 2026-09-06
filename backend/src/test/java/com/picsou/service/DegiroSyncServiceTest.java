@@ -83,6 +83,8 @@ class DegiroSyncServiceTest {
         when(port.fetchPortfolio("plain-blob")).thenReturn(new DegiroPortfolioData(BigDecimal.TEN, List.of()));
         when(accountRepository.findByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
             .thenReturn(Optional.empty());
+        when(accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
+            .thenReturn(false);
         when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(accountService.toResponse(any())).thenReturn(mockResponse());
 
@@ -119,6 +121,8 @@ class DegiroSyncServiceTest {
         when(port.fetchPortfolio("plain-blob")).thenReturn(new DegiroPortfolioData(BigDecimal.TEN, List.of()));
         when(accountRepository.findByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
             .thenReturn(Optional.empty());
+        when(accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
+            .thenReturn(false);
         when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(accountService.toResponse(any())).thenReturn(mockResponse());
 
@@ -166,6 +170,8 @@ class DegiroSyncServiceTest {
             .thenReturn(new OpenFigiIsinConverter.TickerResult("IWDA.AS", "iShares Core MSCI World"));
         when(accountRepository.findByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
             .thenReturn(Optional.empty());
+        when(accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
+            .thenReturn(false);
         when(memberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(member()));
         when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(accountService.toResponse(any())).thenReturn(mockResponse());
@@ -214,6 +220,108 @@ class DegiroSyncServiceTest {
         assertThatThrownBy(() -> service.sync(MEMBER_ID)).isInstanceOf(SyncException.class);
 
         verify(statusWriter, never()).markReauthRequired(any());
+    }
+
+    @Test
+    void sync_skipsPositionsWithNeitherIsinNorSymbol_butKeepsTheirValueInTheBalance() {
+        // Two instruments whose product info carries no ISIN and no symbol (the sidecar sends
+        // null for both). They used to merge under one empty ticker into a single VWAP-blended
+        // holding; now neither is persisted, while DEGIRO's own valuation of them still counts
+        // — that money is real, and the balance is stamped into today's snapshot.
+        DegiroSession session = DegiroSession.builder().status(DegiroSessionStatus.ACTIVE).sessionBlob("enc").build();
+        when(sessionRepository.findByMemberId(MEMBER_ID)).thenReturn(Optional.of(session));
+        when(encryption.decrypt("enc")).thenReturn("plain");
+        DegiroPosition resolvable = new DegiroPosition(
+            "IE00B4L5Y983", "IWDA", "iShares Core MSCI World",
+            BigDecimal.TEN, BigDecimal.valueOf(70), BigDecimal.valueOf(80));
+        DegiroPosition nameless1 = new DegiroPosition(
+            null, null, "Mystery fund A", BigDecimal.valueOf(2), BigDecimal.valueOf(40), BigDecimal.valueOf(50));
+        DegiroPosition nameless2 = new DegiroPosition(
+            null, null, "Mystery fund B", BigDecimal.valueOf(3), BigDecimal.valueOf(9), BigDecimal.valueOf(10));
+        when(port.fetchPortfolio("plain")).thenReturn(
+            new DegiroPortfolioData(BigDecimal.valueOf(500), List.of(resolvable, nameless1, nameless2)));
+        when(isinConverter.resolve("IE00B4L5Y983"))
+            .thenReturn(new OpenFigiIsinConverter.TickerResult("IWDA.AS", "iShares Core MSCI World"));
+        when(accountRepository.findByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
+            .thenReturn(Optional.empty());
+        when(accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
+            .thenReturn(false);
+        when(memberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(member()));
+        when(accountRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(accountService.toResponse(any())).thenReturn(mockResponse());
+
+        service.sync(MEMBER_ID);
+
+        // Exactly one holding, the resolvable one — no "" / "null" row.
+        verify(holdingRepository, times(1)).save(holdingCaptor.capture());
+        assertThat(holdingCaptor.getValue().getTicker()).isEqualTo("IWDA.AS");
+        assertThat(holdingCaptor.getValue().getQuantity()).isEqualByComparingTo(BigDecimal.TEN);
+        // 500 cash + 10×80 + 2×50 + 3×10 = 1430: the nameless lines are still money.
+        verify(accountService).upsertSnapshot(any(), eq(BigDecimal.valueOf(1430)), any());
+    }
+
+    @Test
+    void sync_refusesToRebuildAnAccountTheUserDeleted() {
+        // Same guard as every other connector (account-deletion ADR): a sync racing the
+        // deletion must not insert a live duplicate of the soft-deleted row.
+        DegiroSession session = DegiroSession.builder().status(DegiroSessionStatus.ACTIVE).sessionBlob("enc").build();
+        when(sessionRepository.findByMemberId(MEMBER_ID)).thenReturn(Optional.of(session));
+        when(encryption.decrypt("enc")).thenReturn("plain");
+        when(port.fetchPortfolio("plain")).thenReturn(new DegiroPortfolioData(BigDecimal.TEN, List.of()));
+        when(accountRepository.findByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
+            .thenReturn(Optional.empty());
+        when(accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId("degiro-portfolio", MEMBER_ID))
+            .thenReturn(true);
+
+        assertThatThrownBy(() -> service.sync(MEMBER_ID))
+            .isInstanceOf(SyncException.class)
+            .hasMessageContaining("deleted");
+
+        verify(accountRepository, never()).save(any());
+        verify(accountService, never()).upsertSnapshot(any(), any(), any());
+        // Not an expiry: the session status is left alone.
+        verify(statusWriter, never()).markReauthRequired(any());
+    }
+
+    @Test
+    void completeAuth_recordsAFailedInitialSync_andKeepsTheSessionActive() {
+        // The session itself is valid; a sidecar hiccup on the first portfolio fetch must not
+        // send the user back through TOTP. But it must not vanish either: the row carries the
+        // failure marker, and the real message resurfaces on the next manual sync.
+        when(port.completeAuth("proc-1", "123456")).thenReturn("plain-blob");
+        when(memberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(member()));
+        when(encryption.encrypt("plain-blob")).thenReturn("enc-blob");
+        DegiroSession stored = DegiroSession.builder().build();
+        when(sessionRepository.findByMemberId(MEMBER_ID))
+            .thenReturn(Optional.of(stored))
+            .thenReturn(Optional.of(stored));
+        when(port.fetchPortfolio("plain-blob"))
+            .thenThrow(new SyncException("Could not fetch your DEGIRO portfolio. Please try again later."));
+
+        DegiroSyncService.SessionStatusResponse status = service.completeAuth("proc-1", "123456", MEMBER_ID);
+
+        assertThat(status.isActive()).isTrue();
+        assertThat(stored.getStatus()).isEqualTo(DegiroSessionStatus.ACTIVE);
+        assertThat(stored.getLastError()).isEqualTo("INITIAL_SYNC_FAILED");
+    }
+
+    @Test
+    void completeAuth_survivesAnUnexpectedInitialSyncFailure_andRecordsIt() {
+        // A bug in the sync (an NPE on a malformed sidecar row) is logged with its trace and
+        // recorded on the row; the auth itself still completes.
+        when(port.completeAuth("proc-1", "123456")).thenReturn("plain-blob");
+        when(memberRepository.findById(MEMBER_ID)).thenReturn(Optional.of(member()));
+        when(encryption.encrypt("plain-blob")).thenReturn("enc-blob");
+        DegiroSession stored = DegiroSession.builder().build();
+        when(sessionRepository.findByMemberId(MEMBER_ID))
+            .thenReturn(Optional.of(stored))
+            .thenReturn(Optional.of(stored));
+        when(port.fetchPortfolio("plain-blob")).thenThrow(new NullPointerException("value"));
+
+        DegiroSyncService.SessionStatusResponse status = service.completeAuth("proc-1", "123456", MEMBER_ID);
+
+        assertThat(status.isActive()).isTrue();
+        assertThat(stored.getLastError()).isEqualTo("INITIAL_SYNC_FAILED");
     }
 
     // ─── Status / clear ────────────────────────────────────────────────────────

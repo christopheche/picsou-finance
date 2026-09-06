@@ -146,9 +146,9 @@ public class DegiroAdapter implements DegiroPort {
         List<DegiroPosition> positions = new ArrayList<>();
         for (JsonNode p : response.path("positions")) {
             positions.add(new DegiroPosition(
-                nullIfBlank(p.path("isin").asText()),
-                p.path("symbol").asText(),
-                p.path("name").asText(),
+                textOrNull(p.path("isin")),
+                textOrNull(p.path("symbol")),
+                textOrNull(p.path("name")),
                 decimal(p.path("quantity")),
                 decimal(p.path("buyingPrice")),
                 decimal(p.path("currentPrice"))
@@ -159,8 +159,18 @@ public class DegiroAdapter implements DegiroPort {
         return new DegiroPortfolioData(cashEur, positions);
     }
 
-    private String nullIfBlank(String s) {
-        return (s == null || s.isBlank()) ? null : s;
+    /**
+     * A text field as {@code null} when it is absent, JSON {@code null} or blank. Not
+     * {@code asText()} alone: that returns the <em>string</em> {@code "null"} for a JSON null —
+     * which is exactly what the sidecar sends for a symbol it sanitised away — and {@code ""}
+     * for a missing key, and both used to travel on as a ticker.
+     */
+    static String textOrNull(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        String text = node.asText();
+        return text.isBlank() ? null : text;
     }
 
     /**

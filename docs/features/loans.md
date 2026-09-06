@@ -120,6 +120,14 @@ BalanceSnapshot persisted  →  historical balance chart steps down monthly
 - **`paidInstallments` is computed from "today", not from a count of payments.** No transaction
   is required against the LOAN account — the formula assumes payments occur on schedule. If a
   user pays late or makes prepayments, the model does not capture that (out of scope).
+- **Installments are counted on the schedule's own dates, not on calendar months.** Installment
+  `i` is dated `startDate.plusMonths(i)`, so a loan starting on the 20th has nothing due on the
+  1st of the next month. Counting `YearMonth`s marked installment #1 as paid nineteen days
+  before its own date, and `remainingBalance` — which `AccountService.valuation` and therefore
+  every LOAN account's daily snapshot read — stepped down on that wrong day. `monthsElapsed`
+  counts monthly anniversaries instead, and adds the one `ChronoUnit.MONTHS.between` misses
+  when `plusMonths` had to clamp the day (31 January + 1 month = 28 February).
+  `computeTotalInstallments` uses the same rule, so the schedule never runs past `endDate`.
 - **`monthlyPayment` is optional** in the form. If null, the service computes it from the
   standard formula `M = P · r / (1 − (1 + r)^-n)`.
 - **Holdings, transactions, and the manual snapshot history dialog are hidden** for LOAN
@@ -158,6 +166,8 @@ BalanceSnapshot persisted  →  historical balance chart steps down monthly
 
 - `LoanAmortizationServiceTest` — zero rate, computed monthly payment, paid installments from
   asOf date, capitalRepaidPct, insurance split, totalCost includes fileFees, finished loan,
-  not-yet-started loan, `computeRemainingBalance`
+  not-yet-started loan, `computeRemainingBalance`, mid-month and month-end start dates
+  (`paidInstallments_countedOnTheSchedulesOwnDates_notOnCalendarMonths`,
+  `paidInstallments_monthEndStart_countsTheInstallmentDatedOnTheClampedDay`)
 - `AccountControllerLoanTest` — endpoint delegates correctly, propagates 404 (no Debt) and 400
   (account is not LOAN)

@@ -1,6 +1,6 @@
 # Feature: Accounts Overview (PnL chart + summary card + asset type filters)
 
-> Last updated: 2026-09-06
+> Last updated: 2026-09-06 (share-weighted summary total; account detail reports a failed fetch)
 
 ## Context
 
@@ -76,6 +76,13 @@ A `Card` at the top of the page shows the total balance for the filtered account
 
 PnL values come from the `invested` dataset in `useAllAccountsHistory` — the last point's invested amounts are summed for all filtered accounts.
 
+The total is **share-weighted**: `sumWeightedBalances()` (`frontend/src/pages/accounts/totals.ts`)
+multiplies each `currentBalanceEur` by `sharePercent / 100` (a missing share means sole
+ownership) and subtracts loans. The API returns the account's full value on purpose, so
+summing the raw balances counted a 50 %-owned house at 100 % here while the dashboard hero —
+weighted server-side — counted half of it, and the card mixed that unweighted total with a
+share-weighted PnL from the split history endpoint.
+
 ### PnL line chart
 
 The `AccountsStackedChart` renders a Recharts `LineChart` (not stacked — PnL can be negative). Each line represents one category or account's PnL (`balance - invested`) over time.
@@ -111,6 +118,8 @@ It also injects each account's current balance at today's date if no snapshot ex
 ### Key files
 
 - `frontend/src/pages/accounts/AccountsPage.tsx` — page with summary card, PnL chart, and grid
+- `frontend/src/pages/accounts/totals.ts` — `sumWeightedBalances()`, the share-weighted summary total
+- `frontend/src/pages/accounts/AccountDetailPage.tsx` — one account; renders `ErrorState` when the account can't be loaded
 - `frontend/src/components/shared/AccountCard.tsx` — one card; `AccountAvatar` / `PropertyAvatar`
 - `frontend/src/lib/property-icons.ts` — `PROPERTY_KIND_ICONS`, shared with `AddPropertyModal`
 - `frontend/src/components/shared/AccountsStackedChart.tsx` — PnL line chart component
@@ -164,7 +173,8 @@ AccountsPage
   barely visible in light mode.
 - **Never derive an account type's label key from its name.** `accountTypeLabelKey()` in `lib/constants.ts` is the only mapping; a local `type.toLowerCase()` renders the raw key (`accountTypes.livret_a`) for any type whose key isn't simply its lowercased value. See [add-account-modal.md](./add-account-modal.md#account-type-labels).
 - **`TYPE_TO_GROUP` must cover every `AccountType`** — if a new type is added to the enum but not to this map, those accounts silently disappear from the ALL chart.
-- **`currentBalanceEur` is the account's full value, not the viewer's share.** Co-owned accounts carry `sharePercent` alongside it (see [account-ownership-shares.md](account-ownership-shares.md)); anything summing balances on this page must apply it, because the server only weights its own aggregates.
+- **`currentBalanceEur` is the account's full value, not the viewer's share.** Co-owned accounts carry `sharePercent` alongside it (see [account-ownership-shares.md](account-ownership-shares.md)); anything summing balances on this page must apply it, because the server only weights its own aggregates. The summary card goes through `sumWeightedBalances()` for exactly this reason — a new total must reuse it rather than re-`reduce` the raw balances.
+- **The account detail page never renders blank.** A 404 (the account was deleted in another tab), a failed request or a non-numeric `:id` now render `ErrorState` plus the back button, instead of `return null`. The id is normalised to `0` when it does not parse, so the hooks guarded by `enabled: !!id` stay off rather than requesting `/accounts/NaN/...`; `useAccountPositions` / `useHoldingsWithLivePrices` carry no such guard and still fire once against id `0`.
 - **`Account.id` cast to `number`** — virtual group accounts use string keys (`'STOCKS'`, `'CRYPTO'`) cast as `number` via `as unknown as number`. This works because Recharts uses `dataKey` as a string lookup, but it's fragile.
 - **`totalInvested` relies on the last invested point** — if an account has no snapshots at all, its invested amount is 0 and PnL equals its full balance. This is correct for newly created accounts where balance = invested.
 - **Cash accounts have `investedAmount = balance`, in EUR** — `AccountService.valuation()` returns the EUR-converted value as the cost basis of any account without holdings (and of a loan), so their PnL = 0 whatever currency or ticker the balance is kept in. It used to return the raw `currentBalance` — 2500 USD, 0.5 BTC — against an EUR value, which stamped a phantom PnL the size of the conversion into every daily snapshot of such an account. `DashboardService` had always used `invested = value` for them; the hero card and the chart now agree.
@@ -181,7 +191,13 @@ AccountsPage
   may be missing), the valuation date replaces the sync date, and the unrealized gain is
   gone. Glyph assertions match lucide's own `lucide-<icon>` class. A second block covers the
   stale badge: flagged past 48h, the plain last-sync line below it, never on a manual account.
-- Nothing covers the PnL chart, the summary card or the filters yet.
+- `frontend/src/pages/accounts/totals.test.ts` — the summary total: full value with no share,
+  a null share read as sole ownership, a 50 % co-owned property counted at half, and a
+  share-weighted loan subtracted.
+- `frontend/src/pages/accounts/AccountDetailPage.test.tsx` — a 404 shows the backend reason
+  with a back and a retry button; a non-numeric id shows `error.notFound`, issues no
+  `/accounts/NaN/...` request and offers no retry.
+- Nothing covers the PnL chart or the filters yet.
 
 ## Links
 

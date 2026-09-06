@@ -1,6 +1,6 @@
 # Feature: Goals
 
-> Last updated: 2026-09-06 (override = objective in the calendar; multi-account pace is summed; injected Clock)
+> Last updated: 2026-09-06 (calendar panel keyed per month; "achieved" counts strictly-past months; goal form surfaces save failures)
 
 ## Context
 
@@ -34,6 +34,11 @@ A `Goal` has a M:N relationship with `Account` via the `goal_account` join table
 - **effective**: `manualActual` if set, otherwise `actual`. Never the override: the same rule applies in every entry writer (`setMonthOverride`, `setManualContribution`, `deleteManualContribution`, `deleteMonthOverride`).
 
 The calendar page measures each month against `override ?? objective` (`frontend/src/features/goals/objective.ts`, `monthObjective`) — the same denominator `isOnTrack` uses — so an override moves the target of the donut/bar/"achieved" count while `effective` stays what was actually saved.
+
+The "achieved x/y" badge counts **strictly past** months (`isStrictlyPast`), the same window
+`isOnTrack` uses: the month in progress still appears in every view (as an ongoing month) but
+never in the badge's denominator, where it would have read as a miss from the 1st of the month
+and contradicted the "on track" badge on the goal card.
 
 ### Overrides and manual contributions
 
@@ -126,18 +131,22 @@ GoalService.setMonthOverride(goalId, yearMonth, amount)
 - **Override does not recalculate monthlyNeeded**: Setting a month override changes that month's *objective* (the denominator in the calendar and in `isOnTrack`), not the displayed savings and not the computed `monthlyNeeded`. The auto-computed objective (`objective` in the entry) is always based on `(target - current) / monthsLeft`.
 - **Effective-start to deadline range**: `getMonthlyEntries()` iterates from the effective start month (`min(createdAt, historyStartMonth)`) to the deadline month. If the goal was created mid-month, the first month's actual may be partial. Backfilled months (before `createdAt`) never have snapshot data.
 - **`findAllWithAccounts()` uses a custom query**: Goals are fetched with their accounts eagerly loaded to avoid N+1 queries during progress calculation.
+- **The month detail panel is keyed by `yearMonth`.** Its two inputs are seeded by lazy `useState` initializers (the [key-remount pattern](../conventions/frontend.md)), which only run at mount. Without `key={selectedEntry.yearMonth}` the desktop side panel is one long-lived instance, so selecting another month kept the previously typed amounts on screen and "Save override" / "Save manual" wrote them against the newly selected month.
 - **Account membership is member-scoped (IDOR guard)**: `create`/`update` resolve `accountIds` via `accountRepository.findByIdInAndMemberId(...)`, never the inherited `findAllById`. A caller can only attach accounts they own; a foreign/nonexistent id fails the size check with a generic 400. Do **not** revert this to `findAllById` — that re-opens a cross-member balance-disclosure IDOR (security audit 2026-06-27, CWE-639).
 
 ## Tests
 
 - `GoalServiceTest` -- unit tests for progress calculation, monthly entries, override/manual-contribution writers (member scoping, upsert, override-vs-effective semantics), multi-account pace, months without snapshots, edge cases (deadline passed, no history). Runs on a fixed `Clock`.
 - `frontend/src/features/goals/objective.test.ts` -- `monthObjective` (override as denominator)
+- `frontend/src/pages/goals/GoalCalendarPage.test.tsx` -- selecting another month reloads the panel inputs from that month (the key-remount above), and the "achieved" badge counts only strictly-past months
+- `frontend/src/pages/goals/GoalsPage.test.tsx` -- a rejected create keeps the dialog open and shows the backend reason; a successful one closes it
 
 ## Frontend notes
 
 - **Account chips** use `<Badge variant="secondary">` — theme-aware, no per-account color. The `ACCOUNT_COLORS` palette is still used elsewhere (ColorPicker, DistributionPie, AccountCard, FinaryTab) but not in goal cards.
 - **Status badges**: achieved/on track use `variant="default"` (primary), behind uses `variant="destructive"`, waiting uses `variant="secondary"`.
-- **Calendar badges**: "manu." uses `variant="secondary"`, "modif." uses `variant="outline"` — no raw Tailwind color overrides.
+- **Calendar badges**: the "manual" badge uses `variant="secondary"`, the "modified" one `variant="outline"` — no raw Tailwind color overrides. Their labels, and the objective caption in the year grid and calendar grid, are translated (`goals.manualShort`, `goals.modifiedShort`, `goals.objectiveShort`); they used to be the hardcoded French `manu.` / `modif.` / `obj.`. The `€` adornment on the panel inputs stays literal: every goal figure is in EUR (`CurrencyDisplay` defaults to it), and a currency symbol is not a translatable string.
+- **Save failures are shown, never swallowed**: the goal dialog wraps `mutateAsync` in a `try/catch` and renders `formatApiError(err, t)` in a `role="alert"` line above the footer, keeping the dialog open. The calendar's not-found state goes through `formatApiError` too and retries with the query's `refetch` — never `error.message` (raw axios text) and never the non-existent `common.notFound` key.
 - **Icons**: `TrendingUp`/`TrendingDown` come from `lucide-react` (not HugeIcons) in the goals pages.
 - **Goal detail chart**: `GoalDetailModal` reuses the shared `NetWorthChart` with the optional `target`, `projection`, and `todayMs` props. The chart draws:
   - A dashed `var(--chart-3)` ideal trajectory from `(goal.createdAt, balanceAtCreation)` to `(goal.deadline, goal.targetAmount)`, where `balanceAtCreation` is the first history point at or after `goal.createdAt`. Using the baseline (not zero) keeps the trajectory in the same reference frame as the live area, so the visual matches the "behind/on track" badge.

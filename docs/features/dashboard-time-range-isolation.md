@@ -101,9 +101,11 @@ locale rather than a bare `` `${percentage}%` ``.
 
 ## Gotchas / Pitfalls
 
-- **Each range click is a full dashboard refetch**: `useDashboard(range)` keys on `range`, so switching 1M → 3M → 1Y issues three `GET /dashboard` (each recomputing live balances server-side) on top of the history and P&L calls. Only `netWorthHistory` in that payload depends on the range, and nothing reads it — dropping `range` from `useDashboard` would be a pure win if the payload's history is never wired up.
+- **Never key the dashboard query by range again**: `useDashboard(range)` used to put `range` in the query key, so every first click on a range button issued a `GET /dashboard` that recomputed live balances, distribution and goals — none of which depend on the range — and, having no cache for the new key, dropped the whole page to `<LoadingSkeleton/>` until it landed. `DashboardPage` calls `useDashboard()`; the chart and the hero P&L get their range-specific data from `/history` and `/history/pnl`.
 
-- **`range` is a real backend parameter**: `DashboardController.getDashboard(@RequestParam String range)` → `TimeRange.fromString(range).fromDate()`. It is not ignored, and removing it from the frontend call silently narrows every range to the `1Y` fallback.
+- **`range` is still a real backend parameter**: `DashboardController.getDashboard(@RequestParam String range)` → `TimeRange.fromString(range).fromDate()` sizes `DashboardResponse.netWorthHistory`. Nothing on the frontend reads that field (the chart uses `useHistory`), so the call omits `range` and takes the `1Y` fallback window. Wiring `netWorthHistory` up again means passing the range back — and dropping the separate `useHistory` call, not adding to it.
+
+- **`SyncAllModal` is mounted only while open**: its ten status queries poll on their own intervals (30 s for banks and the broker sessions, 60 s for exchanges/wallets/Finary, 1.5 s while a sync runs) and none is gated on `open`, so a permanently mounted modal kept the dashboard issuing about a dozen requests a minute for a dialog the user may never open. `{showSyncModal && <SyncAllModal open … />}` — the same pattern as `AddPropertyModal` on the accounts page.
 
 - **`TimeRange.fromString` is the only parser**: it accepts both spellings (`1D`/`YTD`) and falls back to `_1Y`. Its old `valueOf("_" + value)` threw on `YTD` and `ALL` — the two alphabetic ranges the UI actually sends — and answered both with a one-year window.
 
@@ -126,7 +128,7 @@ locale rather than a bare `` `${percentage}%` ``.
 Manual verification:
 
 1. Open Dashboard
-2. Click range buttons in the chart → chart, hero P&L and the dashboard payload all refetch
+2. Click range buttons in the chart → chart and hero P&L refetch; the dashboard payload does not, and the page never flashes the skeleton
 3. Toggle Distribution / Allocation → chart row card heights stay fixed
 4. Verify range buttons are usable on mobile viewport (no overflow)
 5. Refresh page → chart defaults to 1Y

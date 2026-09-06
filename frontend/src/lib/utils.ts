@@ -69,9 +69,27 @@ export function formatCountryName(code: string, locale = getLocale()): string {
  * day rather than an instant — which is exactly why the backend sends `LocalDate` for `priceAsOf`,
  * transaction dates and goal deadlines. Values that do carry a time are left to `Date` untouched:
  * there the offset is real information.
+ *
+ * Exported for the chart components, which need the instant (for a time-scale axis or a range
+ * filter) rather than a formatted label — every `new Date(p.date)` on a backend `LocalDate` must
+ * go through here, or the point lands on the previous day west of UTC.
  */
-function toDate(dateStr: string): Date {
+export function parseApiDate(dateStr: string): Date {
   return /^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? new Date(`${dateStr}T00:00:00`) : new Date(dateStr)
+}
+
+const toDate = parseApiDate
+
+/**
+ * `yyyy-MM-dd` of a `Date` in the *local* calendar, for values sent to the API as a `LocalDate`.
+ *
+ * `toISOString().slice(0, 10)` is the UTC day: in Paris it is still yesterday until 01:00/02:00,
+ * and west of UTC an evening entry is dated tomorrow. Calendar days are local by definition.
+ */
+export function toLocalIsoDate(date = new Date()): string {
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
 }
 
 export function formatDate(dateStr: string | null | undefined, locale = getLocale(), format?: DateFormat): string {
@@ -139,6 +157,21 @@ export function formatDateTime(dateStr: string | null | undefined, locale = getL
 
 export function formatPercent(value: number, locale = getLocale()): string {
   return new Intl.NumberFormat(locale, { style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(value)
+}
+
+/**
+ * Plain number in the app locale — the twin of `formatCurrency` for quantities, unit prices and
+ * axis ticks. `value.toLocaleString()` / `toFixed()` read the *browser* locale, so a French UI in
+ * an en-US browser showed "1,234.5 parts" next to "1 234,50 €" on the same row.
+ *
+ * With no `fractionDigits` it keeps `toLocaleString()`'s default (up to 3 decimals); with one it
+ * pins both bounds, like `toFixed(n)`.
+ */
+export function formatNumber(value: number, locale = getLocale(), fractionDigits?: number): string {
+  const digits = fractionDigits == null
+    ? {}
+    : { minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits }
+  return new Intl.NumberFormat(normalizeIntlLocale(locale), digits).format(value)
 }
 
 function capitalizeFirstCharacter(value: string, locale = getLocale()): string {

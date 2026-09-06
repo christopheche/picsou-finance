@@ -1,7 +1,7 @@
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from 'recharts'
 import { useTranslation } from 'react-i18next'
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from '@/components/ui/chart'
-import { formatCurrency, localeFromLanguage } from '@/lib/utils'
+import { formatCurrency, formatNumber, localeFromLanguage, parseApiDate } from '@/lib/utils'
 
 interface BalanceHistoryChartProps {
   data: { date: string; balance: number }[]
@@ -34,13 +34,13 @@ export function BalanceHistoryChart({ data }: BalanceHistoryChartProps) {
           tickLine={false}
           axisLine={false}
           tickMargin={8}
-          tickFormatter={(value) => new Date(value).toLocaleDateString(locale, { month: 'short', day: 'numeric' })}
+          tickFormatter={(value) => parseApiDate(String(value)).toLocaleDateString(locale, { month: 'short', day: 'numeric' })}
         />
         <YAxis
           tickLine={false}
           axisLine={false}
           tickMargin={8}
-          tickFormatter={(value) => `${(value / 1000).toFixed(0)}k`}
+          tickFormatter={(value) => `${formatNumber(value / 1000, locale, 0)}k`}
           width={45}
         />
         <ChartTooltip

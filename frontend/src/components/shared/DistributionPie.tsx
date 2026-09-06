@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { useTranslation } from 'react-i18next'
 import { accountTypeLabelKey } from '@/lib/constants'
+import { formatPercent, localeFromLanguage } from '@/lib/utils'
 import {
   disambiguateDistributionNames,
   type DistributionItem,
@@ -97,7 +98,7 @@ function squarify(items: DistributionItem[]): Rect[] {
   return rects
 }
 
-function TooltipAnchor({ rect }: { rect: Rect }) {
+function TooltipAnchor({ rect, locale }: { rect: Rect; locale: string }) {
   const ref = useRef<HTMLDivElement>(null)
 
   const cx = rect.x + rect.w / 2
@@ -126,13 +127,13 @@ function TooltipAnchor({ rect }: { rect: Rect }) {
         {rect.item.name}
       </span>
       <span className="text-white/80 text-xs bg-black/60 backdrop-blur-sm px-2 py-0.5 rounded mt-0.5">
-        {rect.item.percentage}%
+        {formatPercent(rect.item.percentage / 100, locale)}
       </span>
     </div>
   )
 }
 
-function AllocationTreemap({ data }: { data: DistributionItem[] }) {
+function AllocationTreemap({ data, locale }: { data: DistributionItem[]; locale: string }) {
   const rects = useMemo(() => squarify(data), [data])
   const [hoveredId, setHoveredId] = useState<number | null>(null)
 
@@ -145,10 +146,16 @@ function AllocationTreemap({ data }: { data: DistributionItem[] }) {
       {rects.map(({ x, y, w, h, item }) => {
         const isSmall = w < 12 || h < 18
         const isHovered = hoveredId === item.accountId
+        const percentLabel = formatPercent(item.percentage / 100, locale)
         return (
-          <div
+          // A button rather than a div: the per-account share is otherwise reachable only by
+          // hovering, so keyboard and screen-reader users could never get at it. Focus drives
+          // the same highlight/tooltip as the mouse.
+          <button
             key={item.accountId}
-            className={`absolute flex flex-col items-center justify-center rounded-md cursor-default ${isHovered ? 'z-10' : ''}`}
+            type="button"
+            aria-label={`${item.name} ${percentLabel}`}
+            className={`absolute flex flex-col items-center justify-center rounded-md cursor-default border-0 p-0 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${isHovered ? 'z-10' : ''}`}
             style={{
               left: `calc(${x}% + 2px)`,
               top: `calc(${y}% + 2px)`,
@@ -157,6 +164,8 @@ function AllocationTreemap({ data }: { data: DistributionItem[] }) {
               backgroundColor: item.color,
             }}
             onMouseEnter={() => setHoveredId(item.accountId)}
+            onFocus={() => setHoveredId(item.accountId)}
+            onBlur={() => setHoveredId(current => (current === item.accountId ? null : current))}
           >
             {/* Invisible larger hitbox to prevent flickering in gaps */}
             <div className="absolute -inset-1 z-20" onMouseEnter={() => setHoveredId(item.accountId)} />
@@ -167,24 +176,25 @@ function AllocationTreemap({ data }: { data: DistributionItem[] }) {
                   {item.name}
                 </span>
                 <span className="text-white/80 text-xs mt-0.5">
-                  {item.percentage}%
+                  {percentLabel}
                 </span>
               </div>
             )}
-          </div>
+          </button>
         )
       })}
 
       {/* Tooltip anchored near the block, clamped to stay inside container */}
       {hoveredRect && (hoveredRect.w < 12 || hoveredRect.h < 18) && (
-        <TooltipAnchor rect={hoveredRect} />
+        <TooltipAnchor rect={hoveredRect} locale={locale} />
       )}
     </div>
   )
 }
 
 export function DistributionPie({ data }: DistributionPieProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
   const displayData = useMemo(
     () => disambiguateDistributionNames(data, type => t(accountTypeLabelKey(type))),
     [data, t],
@@ -256,7 +266,7 @@ export function DistributionPie({ data }: DistributionPieProps) {
                   <div key={item.accountId} className="flex items-center gap-2 text-sm">
                     <div className="size-2.5 rounded-full" style={{ backgroundColor: item.color }} />
                     <span className="truncate">{item.name}</span>
-                    <span className="ml-auto text-muted-foreground">{item.percentage}%</span>
+                    <span className="ml-auto text-muted-foreground">{formatPercent(item.percentage / 100, locale)}</span>
                   </div>
                 ))}
               </div>
@@ -264,7 +274,7 @@ export function DistributionPie({ data }: DistributionPieProps) {
           </TabsContent>
 
           <TabsContent value="allocation" className="h-full">
-            <AllocationTreemap data={displayData} />
+            <AllocationTreemap data={displayData} locale={locale} />
           </TabsContent>
         </CardContent>
       </Tabs>

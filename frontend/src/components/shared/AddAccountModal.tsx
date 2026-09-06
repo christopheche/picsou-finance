@@ -69,6 +69,7 @@ import {
   BriefcaseBusiness,
   TrendingUp,
   PiggyBank,
+  X,
 } from 'lucide-react'
 import type { ExchangeType, ChainType, AccountRequest, FinaryPreviewResponse, FinaryAccountMapping, FinaryMappingAction, FinaryImportResultResponse, AccountType } from '@/types/api'
 import { SUPPORTED_CHAINS, SUPPORTED_EXCHANGES, exchangeRequiresApiSecret } from '@/types/api'
@@ -405,7 +406,7 @@ function BankWizard({ onBack }: { onDone: () => void; onBack: () => void }) {
         {error && (
           <div className="flex items-center gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
             <span className="flex-1">{error}</span>
-            <Button variant="ghost" size="sm" onClick={() => setError(null)}>x</Button>
+            <Button variant="ghost" size="sm" aria-label={t('common.close')} onClick={() => setError(null)}><X className="size-4" /></Button>
           </div>
         )}
         <div className="flex items-start gap-2">
@@ -532,7 +533,7 @@ function ExchangeWizard({ onBack }: { onDone: () => void; onBack: () => void }) 
       {error && (
         <div className="flex items-center gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
           <span className="flex-1">{error}</span>
-          <Button variant="ghost" size="sm" onClick={() => setError(null)}>x</Button>
+          <Button variant="ghost" size="sm" aria-label={t('common.close')} onClick={() => setError(null)}><X className="size-4" /></Button>
         </div>
       )}
       <form onSubmit={handleSubmit} className="space-y-4">
@@ -648,7 +649,7 @@ function WalletWizard({ onBack }: { onDone: () => void; onBack: () => void }) {
       {error && (
         <div className="flex items-center gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
           <span className="flex-1">{error}</span>
-          <Button variant="ghost" size="sm" onClick={() => setError(null)}>x</Button>
+          <Button variant="ghost" size="sm" aria-label={t('common.close')} onClick={() => setError(null)}><X className="size-4" /></Button>
         </div>
       )}
       <form onSubmit={handleSubmit} className="space-y-4">
@@ -1130,7 +1131,7 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
       {error && (
         <div className="flex items-center gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive mb-4">
           <span className="flex-1">{error}</span>
-          <Button variant="ghost" size="sm" onClick={() => setError(null)}>x</Button>
+          <Button variant="ghost" size="sm" aria-label={t('common.close')} onClick={() => setError(null)}><X className="size-4" /></Button>
         </div>
       )}
 
@@ -1343,6 +1344,9 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
                           <button
                             key={color}
                             type="button"
+                            aria-label={color}
+                            aria-pressed={mappings[index].newAccount?.color === color}
+                            title={color}
                             className={`size-8 rounded-full border-2 transition-[border-color,box-shadow] ${
                               mappings[index].newAccount?.color === color
                                 ? 'border-background ring-2 ring-foreground'

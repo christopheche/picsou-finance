@@ -45,6 +45,25 @@ describe('RealizedPnlSection', () => {
     expect(container.querySelector('.text-red-500')).toBeFalsy()
   })
 
+  it('dates a lot on its own day in a time zone behind UTC', () => {
+    // `lot.date` is a LocalDate. The section used to parse it with `new Date(iso)`, i.e. UTC
+    // midnight, so west of UTC a sale on the 14th was listed on the 13th.
+    vi.stubEnv('TZ', 'America/New_York')
+    try {
+      realizedData = withData({
+        realizedTotal: 512,
+        lots: [{ ticker: 'AAPL', name: 'Apple', date: '2024-05-14', quantity: 8, avgCost: 125, proceeds: 1512, realized: 512 }],
+      })
+      render(<RealizedPnlSection accountId={2} />)
+
+      const cell = screen.getByText(/2024/)
+      expect(cell.textContent).toMatch(/(^|\D)14(\D|$)/)
+      expect(cell.textContent).not.toMatch(/(^|\D)13(\D|$)/)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   it('shows a red total when realized P&L is negative', () => {
     realizedData = withData({
       realizedTotal: -90,

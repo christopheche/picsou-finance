@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { NumericInput } from '@/components/shared/NumericInput'
 import { DateInput } from '@/components/shared/DateInput'
 import { Label } from '@/components/ui/label'
-import { formatCurrency, localeFromLanguage, parseAmount } from '@/lib/utils'
+import { formatCurrency, localeFromLanguage, parseAmount, toLocalIsoDate } from '@/lib/utils'
 import { extractErrorMessage } from '@/lib/errors'
 import { Loader2 } from 'lucide-react'
 import type { AccountType, TransactionRequest } from '@/types/api'
@@ -17,8 +17,6 @@ import { QUERY_STALE_TIMES } from '@/lib/constants'
 const INVESTMENT_TYPES: AccountType[] = ['PEA', 'COMPTE_TITRES', 'CRYPTO']
 
 type InitialValues = TransactionRequest & { id?: number }
-
-const today = () => new Date().toISOString().split('T')[0]
 
 interface AddTransactionModalProps {
   open: boolean
@@ -78,7 +76,7 @@ function TransactionForm({ onOpenChange, accountId, accountType, onSubmit, isLoa
   })
 
   // Shared state — initialized from initialValues (edit) or sensible defaults (add)
-  const [date, setDate] = useState(() => (initialValues?.date ? String(initialValues.date) : today()))
+  const [date, setDate] = useState(() => (initialValues?.date ? String(initialValues.date) : toLocalIsoDate()))
   const [description, setDescription] = useState(() => (!isInvestmentTx ? (initialValues?.description ?? '') : ''))
   const [error, setError] = useState<string | null>(null)
 

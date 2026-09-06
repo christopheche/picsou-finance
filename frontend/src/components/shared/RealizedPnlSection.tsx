@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { cn, localeFromLanguage } from '@/lib/utils'
+import { cn, formatDate, localeFromLanguage } from '@/lib/utils'
 import { TrendingDown, TrendingUp } from 'lucide-react'
 import {
   Table,
@@ -35,11 +35,6 @@ export function RealizedPnlSection({ accountId, enabled = true }: RealizedPnlSec
   const { currency, realizedTotal, lots } = data
   const positive = realizedTotal >= 0
 
-  const formatDate = (iso: string) => {
-    const d = new Date(iso)
-    return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString(locale)
-  }
-
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between space-y-0">
@@ -68,7 +63,7 @@ export function RealizedPnlSection({ accountId, enabled = true }: RealizedPnlSec
                 <TableRow key={`${lot.ticker}-${lot.date}-${i}`}>
                   <TableCell className="font-mono font-medium">{lot.ticker}</TableCell>
                   <TableCell>{lot.name ?? lot.ticker}</TableCell>
-                  <TableCell>{formatDate(lot.date)}</TableCell>
+                  <TableCell>{formatDate(lot.date, locale)}</TableCell>
                   <TableCell className="text-right">{lot.quantity}</TableCell>
                   <TableCell className="text-right">
                     <CurrencyDisplay value={lot.avgCost} currency={currency} className="text-sm" />

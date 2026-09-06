@@ -60,6 +60,26 @@
     "admin.desc": "Instance settings"
   },
   "auth": {
+    "activation": {
+      "title": "Activate your account",
+      "description": "Choose a password to complete your account setup.",
+      "warningTitle": "Data access notice",
+      "warningBody": "The administrator of this Picsou instance has technical access to all data stored here, including bank account details and API credentials. By activating your account, you acknowledge this.",
+      "acknowledgeLabel": "I understand and acknowledge that the admin has access to all data on this instance.",
+      "passwordLabel": "Password",
+      "passwordPlaceholder": "Min. 8 characters",
+      "confirmPasswordLabel": "Confirm password",
+      "confirmPasswordPlaceholder": "Repeat your password",
+      "submit": "Activate account",
+      "submitting": "Activating...",
+      "successTitle": "Account activated!",
+      "successDescription": "Redirecting to sign-in...",
+      "acknowledgeRequired": "You must acknowledge the data access notice.",
+      "passwordTooShort": "The password must contain at least 8 characters.",
+      "passwordMismatch": "The passwords do not match.",
+      "invalidLink": "This activation link is invalid.",
+      "failed": "Activation failed. The link may have expired."
+    },
     "login": "Sign in",
     "loginTagline": "Picsou",
     "username": "Username",
@@ -830,6 +850,7 @@
     "sessions": "Connected devices",
     "sessionsDescription": "Active \"Remember me\" persistent sessions",
     "sessionsEmpty": "No trusted devices — you'll need to sign in on every visit.",
+    "sessionsUnknownDevice": "Unknown device",
     "sessionsCurrent": "This device",
     "sessionsTrusted": "2FA-trusted",
     "sessionsLastUsed": "Last used",
@@ -1197,7 +1218,8 @@
         "body": "In your Enable Banking dashboard, create an application named \"Picsou\", then copy its Application ID here.",
         "applicationId": "Application ID",
         "applicationIdHint": "This is your Enable Banking application UUID — it's also used as the Key ID when signing requests.",
-        "prodAcknowledge": "I confirm my Enable Banking application is in PRODUCTION mode (not SANDBOX)."
+        "prodAcknowledge": "I confirm my Enable Banking application is in PRODUCTION mode (not SANDBOX).",
+        "submitError": "Saving the Enable Banking configuration failed. Check the application ID and try again."
       },
       "keypair": {
         "modeGenerate": "Generate a key pair",
@@ -1208,6 +1230,7 @@
         "copy": "Copy public key",
         "copied": "Copied!",
         "download": "Download public.pem",
+        "generate": "Generate the key pair",
         "uploadInstruction": "Now in your EB dashboard → your app → Public key → paste this block.",
         "uploadedCta": "I've uploaded it — continue",
         "error": "We couldn't generate a key pair. Please retry.",

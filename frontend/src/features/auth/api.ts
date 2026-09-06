@@ -14,4 +14,6 @@ export const authApi = {
     })),
   activate: (token: string, password: string, acknowledgedWarning: boolean) =>
     api.post(`/auth/activate/${token}`, { password, acknowledgedWarning }),
+  updateUsername: (newUsername: string) =>
+    api.patch('/auth/username', { newUsername }),
 }

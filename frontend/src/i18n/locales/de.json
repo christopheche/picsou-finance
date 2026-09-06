@@ -60,6 +60,26 @@
     "admin.desc": "Instanz-Einstellungen"
   },
   "auth": {
+    "activation": {
+      "title": "Konto aktivieren",
+      "description": "Wählen Sie ein Passwort, um die Einrichtung Ihres Kontos abzuschließen.",
+      "warningTitle": "Hinweis zum Datenzugriff",
+      "warningBody": "Der Administrator dieser Picsou-Instanz hat technischen Zugriff auf alle hier gespeicherten Daten, einschließlich Bankverbindungen und API-Zugangsdaten. Mit der Aktivierung Ihres Kontos nehmen Sie dies zur Kenntnis.",
+      "acknowledgeLabel": "Ich verstehe und akzeptiere, dass der Administrator Zugriff auf alle Daten dieser Instanz hat.",
+      "passwordLabel": "Passwort",
+      "passwordPlaceholder": "Mindestens 8 Zeichen",
+      "confirmPasswordLabel": "Passwort bestätigen",
+      "confirmPasswordPlaceholder": "Passwort wiederholen",
+      "submit": "Konto aktivieren",
+      "submitting": "Wird aktiviert...",
+      "successTitle": "Konto aktiviert!",
+      "successDescription": "Weiterleitung zur Anmeldung...",
+      "acknowledgeRequired": "Sie müssen den Hinweis zum Datenzugriff zur Kenntnis nehmen.",
+      "passwordTooShort": "Das Passwort muss mindestens 8 Zeichen enthalten.",
+      "passwordMismatch": "Die Passwörter stimmen nicht überein.",
+      "invalidLink": "Dieser Aktivierungslink ist ungültig.",
+      "failed": "Die Aktivierung ist fehlgeschlagen. Der Link ist möglicherweise abgelaufen."
+    },
     "login": "Anmelden",
     "loginTagline": "Picsou",
     "username": "Benutzername",
@@ -830,6 +850,7 @@
     "sessions": "Verbundene Geräte",
     "sessionsDescription": "Aktive dauerhafte „Angemeldet bleiben“-Sitzungen",
     "sessionsEmpty": "Keine vertrauenswürdigen Geräte — du musst dich bei jedem Besuch neu anmelden.",
+    "sessionsUnknownDevice": "Unbekanntes Gerät",
     "sessionsCurrent": "Dieses Gerät",
     "sessionsTrusted": "2FA-vertraut",
     "sessionsLastUsed": "Zuletzt verwendet",
@@ -1197,7 +1218,8 @@
         "body": "Erstelle in deinem Enable-Banking-Dashboard eine Anwendung namens „Picsou“ und kopiere ihre Application ID hierher.",
         "applicationId": "Application ID",
         "applicationIdHint": "Das ist die UUID deiner Enable-Banking-Anwendung — sie dient auch als Key ID beim Signieren von Anfragen.",
-        "prodAcknowledge": "Ich bestätige, dass meine Enable-Banking-Anwendung im PRODUCTION-Modus ist (nicht SANDBOX)."
+        "prodAcknowledge": "Ich bestätige, dass meine Enable-Banking-Anwendung im PRODUCTION-Modus ist (nicht SANDBOX).",
+        "submitError": "Die Enable-Banking-Konfiguration konnte nicht gespeichert werden. Prüfen Sie die Anwendungs-ID und versuchen Sie es erneut."
       },
       "keypair": {
         "modeGenerate": "Schlüsselpaar generieren",
@@ -1208,6 +1230,7 @@
         "copy": "Öffentlichen Schlüssel kopieren",
         "copied": "Kopiert!",
         "download": "public.pem herunterladen",
+        "generate": "Schlüsselpaar erzeugen",
         "uploadInstruction": "Jetzt in deinem EB-Dashboard → deine App → Public key → füge diesen Block ein.",
         "uploadedCta": "Hochgeladen — weiter",
         "error": "Wir konnten kein Schlüsselpaar generieren. Bitte versuche es erneut.",

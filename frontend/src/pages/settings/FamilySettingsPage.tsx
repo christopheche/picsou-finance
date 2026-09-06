@@ -51,6 +51,14 @@ function MemberManagement() {
     { id: number; displayName: string; independent: boolean } | null
   >(null)
 
+  // Clear the input only once the member exists -- wiping it on a failed call
+  // loses what the admin typed and hides that nothing was created.
+  function addMember() {
+    const displayName = newName.trim()
+    if (!displayName) return
+    createMember.mutate({ displayName }, { onSuccess: () => setNewName('') })
+  }
+
   if (isLoading) return <div>{t('common.loading')}</div>
 
   return (
@@ -154,21 +162,11 @@ function MemberManagement() {
             placeholder={t('family.settings.memberName')}
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && newName.trim()) {
-                createMember.mutate({ displayName: newName.trim() })
-                setNewName('')
-              }
-            }}
+            onKeyDown={(e) => { if (e.key === 'Enter') addMember() }}
           />
           <Button
-            onClick={() => {
-              if (newName.trim()) {
-                createMember.mutate({ displayName: newName.trim() })
-                setNewName('')
-              }
-            }}
-            disabled={!newName.trim()}
+            onClick={addMember}
+            disabled={!newName.trim() || createMember.isPending}
           >
             <Plus className="mr-1 size-4" />
             {t('common.add')}

@@ -23,7 +23,7 @@ import {
 } from 'lucide-react'
 import type { ChainType } from '@/types/api'
 import { SUPPORTED_CHAINS } from '@/types/api'
-import { extractErrorMessage, formatApiError } from '@/lib/errors'
+import { formatApiError } from '@/lib/errors'
 
 const CHAIN_COLORS: Record<ChainType, string> = {
   BITCOIN: 'bg-orange-500/15 text-orange-600 dark:text-orange-400',
@@ -109,7 +109,7 @@ export function CryptoWalletTab() {
   if (error) {
     return (
       <div className="flex flex-col items-center justify-center py-12 text-center">
-        <p className="text-sm text-muted-foreground">{extractErrorMessage(error)}</p>
+        <p className="text-sm text-muted-foreground">{formatApiError(error, t)}</p>
         <Button variant="outline" onClick={() => refetch()} className="mt-4">
           {t('common.retry')}
         </Button>

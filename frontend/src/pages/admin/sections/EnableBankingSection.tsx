@@ -25,7 +25,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { extractErrorMessage } from '@/lib/errors'
+import { formatApiError } from '@/lib/errors'
 import {
   useGenerateEnableBankingKeyPair,
   useImportEnableBankingPrivateKey,
@@ -49,10 +49,19 @@ export function EnableBankingSection({ settings }: { settings: AdminEnableBankin
     defaultValues: settings,
   })
 
-  useEffect(() => { reset(settings) }, [settings, reset])
+  // Adopt the server's values only while the form is pristine: generating or
+  // importing a key pair invalidates `adminKeys.settings()`, and an
+  // unconditional reset() wiped the credentials being typed right above it.
+  const { isDirty } = formState
+  useEffect(() => {
+    if (isDirty) return
+    reset(settings)
+  }, [settings, reset, isDirty])
 
   const onSubmit = handleSubmit(async (values) => {
     await update.mutateAsync(values)
+    // Re-baseline on the accepted values so the form goes pristine again.
+    reset(values)
   })
 
   const FIELDS: { name: keyof FormValues; labelKey: string; placeholder?: string; hintKey?: string }[] = [
@@ -111,7 +120,7 @@ export function EnableBankingSection({ settings }: { settings: AdminEnableBankin
 
           {update.error && (
             <p role="alert" className="text-sm text-destructive">
-              {extractErrorMessage(update.error)}
+              {formatApiError(update.error, t)}
             </p>
           )}
 
@@ -194,7 +203,7 @@ function KeypairPanel({ privateKeyPresent }: { privateKeyPresent: boolean }) {
     setImportError(null)
     importKey.mutate(privatePem.trim(), {
       onSuccess: (data) => { setPublicPem(data.publicKeyPem); setPrivatePem('') },
-      onError: (err) => setImportError(extractErrorMessage(err) || t('admin.enableBanking.keypair.importError')),
+      onError: (err) => setImportError(formatApiError(err, t, 'admin.enableBanking.keypair.importError')),
     })
   }
 
@@ -243,7 +252,7 @@ function KeypairPanel({ privateKeyPresent }: { privateKeyPresent: boolean }) {
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">{t('admin.enableBanking.keypair.body')}</p>
           {generate.isError && (
-            <p role="alert" className="text-sm text-destructive">{extractErrorMessage(generate.error)}</p>
+            <p role="alert" className="text-sm text-destructive">{formatApiError(generate.error, t)}</p>
           )}
           {!publicPem && (
             <Button type="button" onClick={handleGenerate} disabled={generate.isPending} className="w-full sm:w-auto">

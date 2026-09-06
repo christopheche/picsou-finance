@@ -145,6 +145,13 @@ Done → POST /api/setup/complete → auto-login → /
   the wizard will hand the user a new public PEM and invalidate what they uploaded to
   Enable Banking. A proper key-rotation flow is explicitly out of scope for this
   wizard.
+- **The keypair substep auto-generates on the draft, not on the mutation status.**
+  `EBStep3Keypair` fires the generation when the mode is `generate` and
+  `ebDraft.publicKeyPem` is empty. Guarding on `generate.isSuccess` instead made the
+  Generate → Import → Generate path a dead end: the draft key was cleared but the
+  mutation still reported success, so nothing rendered and "Continue" stayed
+  disabled. `handleSwitchMode` also resets both mutations, and an explicit
+  "Generate" button is rendered whenever there is no PEM and nothing in flight.
 - **Auto-login at the Done screen is best-effort.** If the user refreshes mid-wizard,
   the in-memory credentials are lost and the Done CTA falls back to the login page.
   setup.state is COMPLETE either way; no data is lost.

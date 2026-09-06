@@ -112,6 +112,17 @@ export function AccessKeysSection() {
     return d.toISOString().slice(0, 10)
   }, [])
 
+  // The one-time secret must not outlive the dialog: clearing it on close (after
+  // the fade-out, so the panel doesn't flicker) keeps it out of component state
+  // -- and out of React DevTools / a heap dump -- once the user is done with it.
+  function closeCreate() {
+    setCreateOpen(false)
+    window.setTimeout(() => {
+      setCreated(null)
+      createKey.reset()
+    }, 250)
+  }
+
   function openCreate() {
     setName('')
     setSelectedScopes([])
@@ -271,7 +282,7 @@ export function AccessKeysSection() {
       </div>
 
       {/* Create / secret dialog --------------------------------------------- */}
-      <Dialog open={createOpen} onOpenChange={(o) => { if (!o) setCreateOpen(false) }}>
+      <Dialog open={createOpen} onOpenChange={(o) => { if (!o) closeCreate() }}>
         <DialogContent className="flex! max-h-[calc(100dvh-2rem)]! w-[calc(100vw-2rem)]! max-w-none! flex-col gap-0 overflow-hidden p-0 text-sm sm:w-[42rem]!">
           {created ? (
             <>
@@ -297,7 +308,7 @@ export function AccessKeysSection() {
                 </div>
               </div>
               <DialogFooter className="shrink-0 px-5 pb-5">
-                <Button onClick={() => setCreateOpen(false)}>{t('accessKeys.done')}</Button>
+                <Button onClick={closeCreate}>{t('accessKeys.done')}</Button>
               </DialogFooter>
             </>
           ) : (
@@ -373,7 +384,7 @@ export function AccessKeysSection() {
                 </div>
               </div>
               <DialogFooter className="shrink-0 px-5 pb-5">
-                <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
+                <Button variant="outline" onClick={closeCreate} disabled={createKey.isPending}>
                   {t('accessKeys.cancel')}
                 </Button>
                 <Button onClick={handleCreate} disabled={!canSubmit}>

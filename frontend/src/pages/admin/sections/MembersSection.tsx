@@ -112,6 +112,15 @@ export function MembersSection() {
           </Button>
         </div>
 
+        {/* Creation is a two-step chain (profile, then activation link): a failure
+            on either step used to leave the admin with no link and no message, so
+            they re-submitted and created a duplicate profile. */}
+        {createUser.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {formatApiError(createUser.error, t)}
+          </p>
+        )}
+
         {isLoading ? (
           <p className="text-sm text-muted-foreground">{t('admin.members.loading')}</p>
         ) : !members || members.length === 0 ? (
@@ -237,6 +246,18 @@ export function MembersSection() {
           </ul>
         )}
 
+        {generateActivation.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {formatApiError(generateActivation.error, t)}
+          </p>
+        )}
+
+        {resetPassword.isError && (
+          <p role="alert" className="text-sm text-destructive">
+            {formatApiError(resetPassword.error, t)}
+          </p>
+        )}
+
         {link && (
           <div className="rounded-lg border bg-muted p-3 space-y-2">
             <p className="text-sm font-medium">{t('admin.members.linkLabel')}</p>
@@ -272,11 +293,12 @@ export function MembersSection() {
 
       <ConfirmDialog
         open={resetMfaId !== null}
-        onOpenChange={(o) => { if (!o) setResetMfaId(null) }}
+        onOpenChange={(o) => { if (!o) { setResetMfaId(null); forceDisableMfa.reset() } }}
         title={t('admin.members.resetMfaConfirmTitle')}
         description={t('admin.members.resetMfaConfirmDesc')}
         onConfirm={handleConfirmResetMfa}
         loading={forceDisableMfa.isPending}
+        error={forceDisableMfa.isError ? formatApiError(forceDisableMfa.error, t) : undefined}
         variant="destructive"
       />
     </Card>

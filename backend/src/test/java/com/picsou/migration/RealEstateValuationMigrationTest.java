@@ -1,7 +1,11 @@
 package com.picsou.migration;
 
 import org.flywaydb.core.Flyway;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.condition.EnabledIf;
 import org.testcontainers.DockerClientFactory;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -26,9 +30,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * still read back identically afterwards. Second, that the constraints actually bite —
  * they are the last line of defence for the ownership arithmetic, and H2 would not
  * reproduce the enum-typed schema this chain builds.
+ *
+ * <p>The seed runs once in {@code @BeforeAll} and the tests are explicitly ordered, per
+ * {@code docs/conventions/testing.md}. Both matter here: the container is shared and Flyway never
+ * migrates backwards, so a second method calling {@code migrateTo} with its own target would
+ * decide, by JUnit's unspecified default method order, whether the "pre-existing property"
+ * actually predates V66 — and the whole point of this class is that it does.
  */
 @Testcontainers
 @EnabledIf("dockerAvailable")
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class RealEstateValuationMigrationTest {
 
     static {
@@ -52,34 +63,49 @@ class RealEstateValuationMigrationTest {
         return available;
     }
 
-    @Test
-    void v66_preservesExistingPropertiesAndEnforcesShareBounds() throws SQLException {
-        // Bring the schema to the state a deployed instance is in before this change.
+    private static long seededMemberId;
+    private static long seededAccountId;
+
+    /**
+     * Brings the schema to the state a deployed instance is in before this change, seeds a property
+     * recorded under that schema, then applies V66 alone. Seeding here rather than inside a test
+     * method is what makes "pre-existing" true no matter which test runs first.
+     */
+    @BeforeAll
+    static void migrateAndSeed() throws SQLException {
         // The trailing "?" makes the target lenient: it means "everything up to 65, and do
         // not fail if that exact version is absent". It is, since the crypto branch's V65 was
         // renumbered to V72 when it merged around main's own V64 -- a hard "65" made this the
         // only test in the suite that a renumber elsewhere could break.
         migrateTo("65?");
 
-        long memberId;
-        long accountId;
         try (Connection conn = connect()) {
-            memberId = insertReturningId(conn,
+            seededMemberId = insertReturningId(conn,
                 "INSERT INTO family_member (display_name) VALUES ('Alice') RETURNING id");
-            accountId = insertReturningId(conn,
+            seededAccountId = insertReturningId(conn,
                 "INSERT INTO account (name, type, currency, current_balance, is_manual, member_id) "
                     + "VALUES ('Maison', 'REAL_ESTATE'::account_type, 'EUR', 400000, true, "
-                    + memberId + ") RETURNING id");
+                    + seededMemberId + ") RETURNING id");
             exec(conn,
                 "INSERT INTO real_estate_metadata (account_id, member_id, purchase_price, surface_area, "
-                    + "address, property_type) VALUES (" + accountId + ", " + memberId
+                    + "address, property_type) VALUES (" + seededAccountId + ", " + seededMemberId
                     + ", 300000, 120, '1 rue de la Paix', 'HOUSE')");
         }
 
         migrateTo("66");
+    }
+
+    /**
+     * Read-only, and first: the row it inspects was written before V66 ran, so the values below are
+     * the migration's backfill of existing rows, not the column defaults an INSERT would pick up.
+     */
+    @Test
+    @Order(1)
+    void v66_preservesExistingProperties() throws SQLException {
+        long accountId = seededAccountId;
 
         try (Connection conn = connect()) {
-            // The pre-existing property is intact, and the new columns took their defaults.
+            // The pre-existing property is intact, and V66 backfilled the new NOT NULL columns.
             try (PreparedStatement ps = conn.prepareStatement(
                 "SELECT purchase_price, surface_area, address, property_type, country, "
                     + "valuation_mode, garage_count, has_garden FROM real_estate_metadata WHERE account_id = ?")) {
@@ -102,7 +128,17 @@ class RealEstateValuationMigrationTest {
             // No backfill: absence of rows is what means "the owner holds 100%".
             assertThat(count(conn, "SELECT COUNT(*) FROM account_ownership")).isZero();
             assertThat(count(conn, "SELECT COUNT(*) FROM property_valuation")).isZero();
+        }
+    }
 
+    /** Writes rows, so it runs after the read-only check above. */
+    @Test
+    @Order(2)
+    void v66_enforcesShareAndValuationConstraints() throws SQLException {
+        long memberId = seededMemberId;
+        long accountId = seededAccountId;
+
+        try (Connection conn = connect()) {
             // A share must be a real fraction of something.
             assertThatThrownBy(() -> exec(conn,
                 "INSERT INTO account_ownership (account_id, member_id, share_percent) VALUES ("
@@ -143,10 +179,10 @@ class RealEstateValuationMigrationTest {
         }
     }
 
+    /** Deletes an account, so it runs last. It seeds its own, separate from the migrated one. */
     @Test
+    @Order(Integer.MAX_VALUE)
     void v66_cascadesOnAccountDeletion() throws SQLException {
-        migrateTo("66");
-
         try (Connection conn = connect()) {
             long memberId = insertReturningId(conn,
                 "INSERT INTO family_member (display_name) VALUES ('Bob') RETURNING id");

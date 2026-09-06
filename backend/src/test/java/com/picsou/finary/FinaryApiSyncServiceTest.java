@@ -188,6 +188,75 @@ class FinaryApiSyncServiceTest {
     }
 
     @Test
+    void execute_mapExisting_rejectsProviderSyncedAccount() {
+        FinaryAccountDto pea = new FinaryAccountDto(
+            "inv-1", "PEA", null, 1000.0, 1000.0, null,
+            new FinaryAccountCurrency("EUR", "€"), false);
+        FinaryLoanDto loan = new FinaryLoanDto(
+            "loan-1", "loan", "PRET", 1.0, 1.0, null, null, new FinaryAccountCurrency("EUR", "€"), null);
+        when(finaryApiClient.fetchCategoryAccounts(eq("jwt"), any(), anyString()))
+            .thenAnswer(inv -> "investments".equals(inv.getArgument(2)) ? List.of(pea) : List.of());
+        stubPreviewFlowCommon(loan);
+        when(familyMemberRepository.findById(1L))
+            .thenReturn(Optional.of(FamilyMember.builder().id(1L).build()));
+        Account trPea = Account.builder().id(9L).name("TR PEA").type(AccountType.PEA).currency("EUR")
+            .isManual(false).externalAccountId("tr_pea").build();
+        when(accountRepository.findByIdAndMemberId(9L, 1L)).thenReturn(Optional.of(trPea));
+
+        FinaryPreviewResponse preview = service.preview(null, 1L);
+        FinaryAccountMapping mapping = new FinaryAccountMapping(
+            "inv-1", "PEA", "investments", FinaryMappingAction.MAP_EXISTING, 9L, null);
+
+        // Rebinding tr_pea -> finary_investments_inv-1 would orphan the TR connector and wipe
+        // the PEA's transactions and snapshot history: refused, nothing written.
+        assertThatThrownBy(() -> service.execute(preview.fileToken(), List.of(mapping), 1L))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("manual");
+
+        assertThat(trPea.getExternalAccountId()).isEqualTo("tr_pea");
+        org.mockito.Mockito.verify(accountRepository, org.mockito.Mockito.never()).save(any());
+        org.mockito.Mockito.verify(persistenceHelper, org.mockito.Mockito.never()).importTransactions(any(), any(), any());
+        org.mockito.Mockito.verify(persistenceHelper, org.mockito.Mockito.never()).reconstructSnapshotsFromDb(any());
+    }
+
+    @Test
+    void preview_offersOnlyMappableAccountsAsTargets() {
+        FinaryAccountDto checking = new FinaryAccountDto(
+            "chk-1", "Checking", null, 1000.0, 1000.0, null,
+            new FinaryAccountCurrency("EUR", "€"), false);
+        FinaryLoanDto loan = new FinaryLoanDto(
+            "loan-1", "loan", "PRET", 1.0, 1.0, null, null, new FinaryAccountCurrency("EUR", "€"), null);
+        when(finaryApiClient.fetchCategoryAccounts(eq("jwt"), any(), anyString()))
+            .thenAnswer(inv -> "checkings".equals(inv.getArgument(2)) ? List.of(checking) : List.of());
+        stubPreviewFlowCommon(loan);
+        Account manual = Account.builder().id(1L).name("Livret").type(AccountType.SAVINGS).currency("EUR").isManual(true).build();
+        Account finaryBound = Account.builder().id(2L).name("Old Finary").type(AccountType.CHECKING).currency("EUR")
+            .isManual(true).externalAccountId("finary_checkings_old").build();
+        Account trPea = Account.builder().id(3L).name("TR PEA").type(AccountType.PEA).currency("EUR")
+            .isManual(false).externalAccountId("tr_pea").build();
+        when(accountRepository.findAllByMemberIdOrderByCreatedAtAsc(1L)).thenReturn(List.of(manual, finaryBound, trPea));
+
+        FinaryPreviewResponse response = service.preview(null, 1L);
+
+        assertThat(response.existingPicsouAccounts()).extracting(a -> a.id()).containsExactly(1L, 2L);
+    }
+
+    /** Preview stubs shared by the mapping tests; account categories are stubbed by the caller. */
+    private void stubPreviewFlowCommon(FinaryLoanDto loan) {
+        when(finarySessionRepository.findByMemberId(1L)).thenReturn(Optional.of(connectedSession()));
+        when(encryption.decrypt("enc-email")).thenReturn("user@example.com");
+        when(encryption.decrypt("enc-pass")).thenReturn("secret");
+        when(finaryApiClient.authenticate("user@example.com", "secret", null)).thenReturn("jwt");
+        when(finaryApiClient.fetchOrganizationContext("jwt"))
+            .thenReturn(new FinaryApiClient.OrgContext("org", "mem"));
+        when(finaryApiClient.fetchLoans("jwt")).thenReturn(List.of(loan));
+        when(finaryApiClient.fetchCategoryTransactions(any(), any(), anyString(), anyInt(), anyInt()))
+            .thenReturn(List.of());
+        when(accountRepository.findByExternalAccountIdAndMemberId(anyString(), eq(1L)))
+            .thenReturn(Optional.empty());
+    }
+
+    @Test
     void toLoanAccountDto_storesOutstandingAmountPositive() {
         FinaryLoanDto loan = new FinaryLoanDto(
             "loan-1", "loan", "PRET IMMO", 12000.0, 600.0,

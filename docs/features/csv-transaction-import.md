@@ -1,6 +1,6 @@
 # Feature: CSV transaction import (investment accounts)
 
-> Last updated: 2026-08-31
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -77,15 +77,28 @@ execute(token, mapping, dialect) ─► re-parse ─► map rows ─► saveAll(
   is member-scoped and throttled. Both nginx configs (`docker/nginx.conf`, `frontend/nginx.conf`)
   set `client_max_body_size 10m` on `/api` to match — nginx's 1 MB default would otherwise answer
   an HTML 413 before the upload reaches the backend.
+- **Re-importing is idempotent per trade**: `executeImport` loads the account's manual trades once and
+  skips any row whose (date, side, ticker, quantity, unit price, fees) already exists, reporting it
+  as a per-row error ("Already imported -- ...") so it shows in the wizard's skipped list. Matching is a
+  multiset: two identical fills inside one file are both kept, and a re-import of that file skips both.
+  Without this, importing an updated broker export that overlaps the previous one duplicated every
+  trade and `HoldingComputeService` doubled the position and cost basis.
+- **`sideValueMap` targets are validated once, before any row is parsed**: only `BUY`/`SELL`
+  (case-insensitive) are accepted; anything else (a localised typo such as `ACHAT`, or `DIVIDEND`) is a
+  400 for the whole request. The mapper enforces the same rule per row, with a user-safe message
+  rather than `Enum.valueOf`'s class-name error. Non-trade types would otherwise be saved with a
+  quantity that never reaches the position, since holdings only read BUY/SELL.
 - Demo mode returns `{}` for unhandled endpoints — UI consumers must guard accordingly.
 
 ## Tests
 
 - `CsvReaderTest`, `CsvDialectDetectorTest`, `CsvValueParserTest` — parsing / sniffing.
-- `TransactionRowMapperTest` — sign+fees, ISIN resolution, amount-derived price, bad rows.
+- `TransactionRowMapperTest` — sign+fees, ISIN resolution, amount-derived price, bad rows,
+  `sideValueMap` target outside BUY/SELL.
 - `TransactionImportServiceTest` — happy path, expired token, **token↔account binding**,
   non-investment or synced investment account rejection (400), foreign account (404), per-row
-  error reporting.
+  error reporting, invalid `sideValueMap` rejected up front, **duplicate rows skipped on re-import**
+  while identical rows within one file are kept.
 - `ImportTransactionsModal.test.tsx` — preview → mapping → import request → result.
 
 ## Links

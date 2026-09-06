@@ -148,7 +148,8 @@ public class FinaryApiClient {
             if (isNetworkError(e)) {
                 throw new FinaryServiceUnavailableException("Unable to reach Finary. Please check your connection and try again.", e);
             }
-            throw new SyncException("Finary auth check failed: " + e.getMessage(), e);
+            log.warn("Finary auth check failed: {}", e.getMessage());
+            throw new SyncException("Finary sign-in failed. Please try again later.", e);
         }
     }
 
@@ -205,7 +206,8 @@ public class FinaryApiClient {
             if (isNetworkError(e)) {
                 throw new FinaryServiceUnavailableException("Unable to reach Finary. Please check your connection and try again.", e);
             }
-            throw new SyncException("Finary TOTP authentication failed: " + e.getMessage(), e);
+            log.warn("Finary TOTP authentication failed: {}", e.getMessage());
+            throw new SyncException("Finary sign-in with the 2FA code failed. Please try again later.", e);
         }
     }
 
@@ -237,7 +239,6 @@ public class FinaryApiClient {
                     "&password=" + URLEncoder.encode(password, StandardCharsets.UTF_8);
             log.debug("Sign-in request: identifier=[REDACTED], password length={}", password.length());
             String signInResponse = clerkPost(httpClient, "/v1/client/sign_ins", signInBody);
-            log.debug("Sign-in response (first 500 chars): {}", signInResponse.substring(0, Math.min(500, signInResponse.length())));
             ClerkSignInApiResponse apiResp = objectMapper.readValue(signInResponse, ClerkSignInApiResponse.class);
             ClerkSignInResponse signIn = apiResp.response;
 
@@ -256,7 +257,6 @@ public class FinaryApiClient {
                 log.debug("Clerk step 4: POST /v1/client/sign_ins/{}/attempt_second_factor", signInId);
                 String totpBody = "strategy=totp&code=" + URLEncoder.encode(totp, StandardCharsets.UTF_8);
                 String totpResponse = clerkPost(httpClient, "/v1/client/sign_ins/" + signInId + "/attempt_second_factor", totpBody);
-                log.debug("TOTP response (first 500 chars): {}", totpResponse.substring(0, Math.min(500, totpResponse.length())));
                 // Extract sessionId from response wrapper
                 ClerkSessionApiResponse sessionResp = objectMapper.readValue(totpResponse, ClerkSessionApiResponse.class);
                 if (sessionResp.client.sessions != null && !sessionResp.client.sessions.isEmpty()) {
@@ -293,7 +293,8 @@ public class FinaryApiClient {
             if (isNetworkError(e)) {
                 throw new FinaryServiceUnavailableException("Unable to reach Finary. Please check your connection and try again.", e);
             }
-            throw new SyncException("Clerk authentication failed: " + e.getMessage(), e);
+            log.warn("Clerk authentication failed: {}", e.getMessage());
+            throw new SyncException("Finary sign-in failed. Please try again later.", e);
         }
     }
 
@@ -331,7 +332,8 @@ public class FinaryApiClient {
             if (isNetworkError(e)) {
                 throw new FinaryServiceUnavailableException("Unable to reach Finary. Please check your connection and try again.", e);
             }
-            throw new SyncException("Failed to fetch organization context: " + e.getMessage(), e);
+            log.warn("Failed to fetch Finary organization context: {}", e.getMessage());
+            throw new SyncException("Could not read your Finary profile. Please try again later.", e);
         }
     }
 
@@ -355,7 +357,8 @@ public class FinaryApiClient {
             if (isNetworkError(e)) {
                 throw new FinaryServiceUnavailableException("Unable to reach Finary. Please check your connection and try again.", e);
             }
-            throw new SyncException("Failed to fetch accounts for category " + category + ": " + e.getMessage(), e);
+            log.warn("Failed to fetch Finary accounts for category {}: {}", category, e.getMessage());
+            throw new SyncException("Could not fetch your Finary accounts (" + category + "). Please try again later.", e);
         }
     }
 
@@ -381,7 +384,8 @@ public class FinaryApiClient {
             if (isNetworkError(e)) {
                 throw new FinaryServiceUnavailableException("Unable to reach Finary. Please check your connection and try again.", e);
             }
-            throw new SyncException("Failed to fetch loans: " + e.getMessage(), e);
+            log.warn("Failed to fetch Finary loans: {}", e.getMessage());
+            throw new SyncException("Could not fetch your Finary loans. Please try again later.", e);
         }
     }
 
@@ -405,7 +409,8 @@ public class FinaryApiClient {
             if (isNetworkError(e)) {
                 throw new FinaryServiceUnavailableException("Unable to reach Finary. Please check your connection and try again.", e);
             }
-            throw new SyncException("Failed to fetch transactions for category " + category + ": " + e.getMessage(), e);
+            log.warn("Failed to fetch Finary transactions for category {}: {}", category, e.getMessage());
+            throw new SyncException("Could not fetch your Finary transactions (" + category + "). Please try again later.", e);
         }
     }
 

@@ -94,7 +94,7 @@ public class TransactionRowMapper {
             if (sideValueMap != null) {
                 for (Map.Entry<String, String> e : sideValueMap.entrySet()) {
                     if (e.getKey().equalsIgnoreCase(raw)) {
-                        return TransactionType.valueOf(e.getValue().trim().toUpperCase());
+                        return mappedSide(raw, e.getValue());
                     }
                 }
             }
@@ -114,6 +114,25 @@ public class TransactionRowMapper {
             return amount.signum() < 0 ? TransactionType.BUY : TransactionType.SELL;
         }
         throw new IllegalArgumentException("Cannot determine BUY/SELL");
+    }
+
+    /**
+     * The importer writes trades only: {@code HoldingComputeService} reads BUY/SELL and nothing
+     * else, so a mapping onto any other {@link TransactionType} would save a row that never
+     * reaches the position. Rejected here with a user-safe message rather than letting
+     * {@code Enum.valueOf} leak the enum's class name into the per-row error.
+     */
+    public static boolean isBuyOrSell(String value) {
+        if (value == null) return false;
+        String v = value.trim().toUpperCase();
+        return v.equals("BUY") || v.equals("SELL");
+    }
+
+    private static TransactionType mappedSide(String raw, String value) {
+        if (!isBuyOrSell(value)) {
+            throw new IllegalArgumentException("Side '" + raw + "' must be mapped to BUY or SELL");
+        }
+        return TransactionType.valueOf(value.trim().toUpperCase());
     }
 
     private BigDecimal resolvePrice(List<String> row, ColumnMappingDto mapping, CsvDialect dialect,

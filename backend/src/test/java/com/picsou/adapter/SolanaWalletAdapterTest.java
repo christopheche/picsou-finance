@@ -8,10 +8,12 @@ import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.ExchangeFunction;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -158,6 +160,42 @@ class SolanaWalletAdapterTest {
             assertThat(b.amount()).isEqualByComparingTo(new BigDecimal("50"));
         });
         assertThat(balances).noneSatisfy(b -> assertThat(b.symbol()).isEqualTo("USDT"));
+    }
+
+    @Test
+    void fetchBalances_rateLimitedRpc_isWrappedAsWalletRpcException() {
+        // The public mainnet RPC throttles aggressively. A raw WebClientResponseException
+        // would land in WalletSyncService's ERROR-as-genuine-bug branch; a 429 is an
+        // expected failure and must classify as WalletRpcException (never as 0 SOL).
+        ExchangeFunction exchange = request -> Mono.just(
+            ClientResponse.create(HttpStatus.TOO_MANY_REQUESTS).build());
+        var adapter = new SolanaWalletAdapter(WebClient.builder().exchangeFunction(exchange).build());
+
+        assertThatThrownBy(() -> adapter.fetchBalances(ADDRESS))
+            .isInstanceOf(WalletRpcException.class)
+            .hasMessageContaining("Solana getBalance")
+            .hasMessageContaining("429")
+            .hasCauseInstanceOf(WebClientResponseException.class);
+    }
+
+    @Test
+    void fetchBalances_transportTimeoutOnTokenCall_isWrappedAsWalletRpcException() {
+        // SOL succeeds, then the token call times out: the whole sync fails as an
+        // expected WalletRpcException, with the checked TimeoutException as its cause
+        // rather than reactor-wrapped.
+        AtomicInteger index = new AtomicInteger();
+        ExchangeFunction exchange = request -> index.getAndIncrement() == 0
+            ? Mono.just(ClientResponse.create(HttpStatus.OK)
+                .header("Content-Type", MediaType.APPLICATION_JSON_VALUE)
+                .body(SOL_1)
+                .build())
+            : Mono.error(new TimeoutException("simulated timeout"));
+        var adapter = new SolanaWalletAdapter(WebClient.builder().exchangeFunction(exchange).build());
+
+        assertThatThrownBy(() -> adapter.fetchBalances(ADDRESS))
+            .isInstanceOf(WalletRpcException.class)
+            .hasMessageContaining("Solana getTokenAccountsByOwner")
+            .hasCauseInstanceOf(TimeoutException.class);
     }
 
     @Test

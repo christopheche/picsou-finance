@@ -1,6 +1,6 @@
 # Feature: Loan accounts (LOAN type)
 
-> Last updated: 2026-07-08
+> Last updated: 2026-09-06
 
 ## Sign convention
 
@@ -120,6 +120,14 @@ BalanceSnapshot persisted  →  historical balance chart steps down monthly
 - **`paidInstallments` is computed from "today", not from a count of payments.** No transaction
   is required against the LOAN account — the formula assumes payments occur on schedule. If a
   user pays late or makes prepayments, the model does not capture that (out of scope).
+- **Installments are counted on the schedule's own dates, not on calendar months.** Installment
+  `i` is dated `startDate.plusMonths(i)`, so a loan starting on the 20th has nothing due on the
+  1st of the next month. Counting `YearMonth`s marked installment #1 as paid nineteen days
+  before its own date, and `remainingBalance` — which `AccountService.valuation` and therefore
+  every LOAN account's daily snapshot read — stepped down on that wrong day. `monthsElapsed`
+  counts monthly anniversaries instead, and adds the one `ChronoUnit.MONTHS.between` misses
+  when `plusMonths` had to clamp the day (31 January + 1 month = 28 February).
+  `computeTotalInstallments` uses the same rule, so the schedule never runs past `endDate`.
 - **`monthlyPayment` is optional** in the form. If null, the service computes it from the
   standard formula `M = P · r / (1 − (1 + r)^-n)`.
 - **Holdings, transactions, and the manual snapshot history dialog are hidden** for LOAN
@@ -131,11 +139,35 @@ BalanceSnapshot persisted  →  historical balance chart steps down monthly
   created — `liveBalanceEur` gracefully falls back to the stored balance when no `Debt` exists,
   and the rich amortization view only appears once the user fills in the loan parameters via
   `PUT /api/accounts/{id}/debt`.
+- **A `Debt` row without both dates falls back to the stored balance too.** Only
+  `borrowedAmount` is required on `DebtRequest` — the form is how a loan gets its lender name
+  or its linked property, and `AccountsPage` submits `startDate`/`endDate` as `undefined` when
+  left blank. With either missing, `LoanAmortizationService` builds a schedule of zero
+  installments whose "remaining balance" is the untouched principal, which used to replace the
+  synced or entered outstanding (a 120 000 € Finary mortgage jumped to its 250 000 € principal
+  on the dashboard and in the next daily snapshot). `AccountService.valuation()` now only uses
+  the amortized figure when the row can produce a schedule (`hasSchedule`: both dates set, end
+  after start); `getLoanSummary` still returns the schedule as-is.
+- **Co-owners can read a loan.** `getLoanSummary`, `getHistory`, `getHoldings` and
+  `getTransactions` guard with `AccountAccessResolver.requireReadable`, not the owner-only
+  `getOrThrow` — a member holding half of a mortgage opened the account and got the loan view
+  in error state, because `GET /accounts/{id}` answered and `/loan-summary` 404'd. Write paths
+  keep `getOrThrow`.
+- **Deleting an account severs its `debt` links.** Soft deletion never fires V19's
+  `ON DELETE SET NULL`, so `debt.linked_account_id` kept naming a deleted property (and a
+  deleted loan's own row kept pointing at its property). `Account`'s `@SQLRestriction` applies
+  when Hibernate loads a lazy proxy by id, so the first non-id read on that proxy —
+  `DebtResponse.from` on every accounts list, `RealEstateSummaryService.loansFor` — found no
+  row and 500'd the page until the loan was edited. `AccountService.delete` now nulls
+  `linkedAccount` on every debt pointing at the account, and on the loan's own debt when the
+  account is a `LOAN`.
 
 ## Tests
 
 - `LoanAmortizationServiceTest` — zero rate, computed monthly payment, paid installments from
   asOf date, capitalRepaidPct, insurance split, totalCost includes fileFees, finished loan,
-  not-yet-started loan, `computeRemainingBalance`
+  not-yet-started loan, `computeRemainingBalance`, mid-month and month-end start dates
+  (`paidInstallments_countedOnTheSchedulesOwnDates_notOnCalendarMonths`,
+  `paidInstallments_monthEndStart_countsTheInstallmentDatedOnTheClampedDay`)
 - `AccountControllerLoanTest` — endpoint delegates correctly, propagates 404 (no Debt) and 400
   (account is not LOAN)

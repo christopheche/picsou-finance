@@ -102,7 +102,14 @@ WebApp (Settings) ──cookie──▶ POST /api/access-keys {name, scopes, exp
 ## Tool catalogue
 
 Every tool acts only on the key owner's own data; writes are restricted to **manual** records and
-**refresh-existing-sync** triggers. `McpToolCatalogTest` pins this exact set.
+**refresh-existing-sync** triggers. `McpToolCatalogTest` pins this exact set. The manual-only rule
+is enforced, not just documented: `create_manual_account` forces `isManual=true`, and every other
+`accounts:write` tool (`update_account`, `delete_account`, `add_balance_snapshot`, `upsert_holding`,
+`delete_holding`) first resolves the account through the member-scoped service and refuses a synced
+one with `IllegalArgumentException` (`AccountTools.requireManual`) — a leaked key cannot rewrite the
+balance history, holdings or type of a bank/broker-synced account. `delete_account` then goes
+through `AccountConnectionService`, like `AccountController.delete`, so a deletion never leaves an
+orphan connection behind (see the account-deletion ADR).
 
 | Scope | Tools |
 |-------|-------|
@@ -158,6 +165,11 @@ and GDPR data export.
   best-effort — a failure there is logged and never breaks authentication.
 - **`MCP_ENABLED`** (default `true`) gates the whole server. `SetupFilter` still blocks `/mcp` until
   first-launch setup completes.
+- **Key management ignores admin impersonation.** `AccessKeyController` resolves
+  `UserContext.ownMemberId()` (never `currentMemberId()`) for list, create throttle and revoke: a key
+  is bound to the `AppUser` that creates it and a login-less managed profile cannot own one, so an
+  admin viewing a managed profile (`?memberId=X`) keeps managing their own keys. Otherwise the key
+  just created would be bound to the admin but listed — and revocable — under nobody.
 
 ## Tests
 
@@ -167,10 +179,10 @@ Backend (H2, `mvn test`):
 - `mcp/ScopesTest`, `mcp/ScopeSetConverterTest` — vocabulary + converter round-trip.
 - `mcp/ScopeEnforcementAspectTest` — **denial** when the required scope is absent.
 - `mcp/tools/McpToolCatalogTest` — **curation guard**: pins the exact advertised tool set (no auth/credential/admin tool).
-- `mcp/tools/{Account,Transaction,Goal,Insight,Sync}ToolsTest` — delegation + member-scoping per tool.
+- `mcp/tools/{Account,Transaction,Goal,Insight,Sync}ToolsTest` — delegation + member-scoping per tool; `AccountToolsTest` also pins the manual-only guard on every write tool and the `AccountConnectionService` delete path.
 - `config/AccessKeyAuthFilterTest` — Property A (key on `/api/**` ⇒ not authenticated; on `/mcp` ⇒ authenticated), Property C (scope authorities only), throttle 429.
 - `service/UserContextTest` — Property B (`AccessKeyAuthentication` ⇒ override returns `null`, even for an admin-owned key).
-- `controller/AccessKeyControllerTest` — create/list/revoke, one-time secret, unknown-scope 400, member isolation, create throttle.
+- `controller/AccessKeyControllerTest` — create/list/revoke, one-time secret, unknown-scope 400, member isolation, create throttle, and `ownMemberId()` (impersonation never applies to keys).
 - `model/AccessKeyTest` — `isUsable` (revoked / expired / live).
 
 Frontend (`bunx vitest run`):

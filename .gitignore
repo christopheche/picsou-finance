@@ -78,6 +78,7 @@ docs_template*.zip
 
 # Tooling caches / local-only
 .local/
+.scratch/
 .playwright-mcp/
 .superpowers/
 docs/superpowers/

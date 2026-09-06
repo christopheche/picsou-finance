@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom'
 import { describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen } from '@testing-library/react'
-import { TransactionsList } from './TransactionsList'
+import { TransactionsList, TRANSACTIONS_PAGE_SIZE } from './TransactionsList'
 import type { Transaction } from '@/types/api'
 
 vi.mock('react-i18next', () => ({
@@ -99,6 +99,43 @@ describe('TransactionsList', () => {
 
     expect(screen.getByText('Provider dividend payment')).toBeInTheDocument()
     expect(screen.queryByText('Dividende AAPL')).not.toBeInTheDocument()
+  })
+
+  it('keeps the stored description when a manual ticker row has no txType member at all', () => {
+    // The backend omits null members (`non_null`), so a null txType never arrives as `null` —
+    // it is simply absent. A strict `=== null` guard never matched and the row rendered as
+    // "undefined AAPL" through the label map.
+    const withoutTxType = Object.fromEntries(
+      Object.entries(transaction({ isManual: true, ticker: 'AAPL', description: 'Achat via API' }))
+        .filter(([key]) => key !== 'txType'),
+    ) as Transaction
+
+    render(<TransactionsList transactions={[withoutTxType]} />)
+
+    expect(screen.getByText('Achat via API')).toBeInTheDocument()
+  })
+
+  it('renders one page of rows and extends it on demand', () => {
+    const rows = Array.from({ length: 1000 }, (_, i) =>
+      transaction({ id: i + 1, date: `2026-01-${String((i % 28) + 1).padStart(2, '0')}`, description: `Row ${i}` }))
+
+    render(<TransactionsList transactions={rows} />)
+
+    expect(screen.getAllByText(/^Row \d+$/)).toHaveLength(TRANSACTIONS_PAGE_SIZE)
+    fireEvent.click(screen.getByRole('button', { name: 'common.showMore' }))
+    expect(screen.getAllByText(/^Row \d+$/)).toHaveLength(2 * TRANSACTIONS_PAGE_SIZE)
+  })
+
+  it('restarts from the first page when the search changes', () => {
+    const rows = Array.from({ length: 500 }, (_, i) => transaction({ id: i + 1, description: `Row ${i}` }))
+
+    render(<TransactionsList transactions={rows} />)
+    fireEvent.click(screen.getByRole('button', { name: 'common.showMore' }))
+    expect(screen.getAllByText(/^Row \d+$/)).toHaveLength(400)
+
+    fireEvent.change(screen.getByPlaceholderText('common.search'), { target: { value: 'Row' } })
+
+    expect(screen.getAllByText(/^Row \d+$/)).toHaveLength(TRANSACTIONS_PAGE_SIZE)
   })
 
   it('searches the localized fallback description', () => {

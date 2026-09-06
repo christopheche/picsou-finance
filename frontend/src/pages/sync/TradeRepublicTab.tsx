@@ -1,7 +1,5 @@
 import { useState, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { api } from '@/lib/api-client'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -16,16 +14,22 @@ import {
   ShieldCheck,
   AlertTriangle,
 } from 'lucide-react'
-import type { TrSessionStatus } from '@/types/api'
 import { formatTrAuthError } from '@/lib/errors'
 import { formatDateTime } from '@/lib/utils'
 import { TR_VERIFICATION_CODE_LENGTH } from '@/lib/constants'
+import {
+  useTrSessionStatus,
+  useInitiateTrAuth,
+  useCompleteTrAuth,
+  useSyncTradeRepublic,
+  useImportTrCsv,
+  useClearTrSession,
+} from '@/features/sync/hooks'
 
 type AuthState = 'IDLE' | 'AWAITING_TAN' | 'CONNECTED' | 'ERROR'
 
 export function TradeRepublicTab() {
   const { t } = useTranslation()
-  const queryClient = useQueryClient()
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const [authState, setAuthState] = useState<AuthState>('IDLE')
@@ -35,102 +39,83 @@ export function TradeRepublicTab() {
   const [processId, setProcessId] = useState<string | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
-  const { data: sessionStatus, isLoading: statusLoading } = useQuery<TrSessionStatus>({
-    queryKey: ['sync', 'tr', 'status'],
-    queryFn: () => api.get<TrSessionStatus>('/tr/status').then(r => r.data),
-  })
+  // Every TR call goes through the shared feature hooks so this tab and the
+  // dashboard's "Sync all" modal read and invalidate the very same query key --
+  // a login or logout here is visible there immediately.
+  const { data: sessionStatus, isLoading: statusLoading } = useTrSessionStatus()
+  const initiateMutation = useInitiateTrAuth()
+  const submitTanMutation = useCompleteTrAuth()
+  const syncMutation = useSyncTradeRepublic()
+  const importCsvMutation = useImportTrCsv()
+  const logoutMutation = useClearTrSession()
 
   // Derive auth state from session status
   const effectiveState = sessionStatus?.isActive ? 'CONNECTED' : authState
 
-  const initiateMutation = useMutation({
-    mutationFn: (params: { phone: string; pin: string }) =>
-      api.post<{ processId: string }>('/tr/auth/initiate', { phoneNumber: params.phone, pin: params.pin }).then(r => r.data),
-    onSuccess: (data) => {
-      setProcessId(data.processId)
-      setTan('')
-      setAuthState('AWAITING_TAN')
-      setErrorMsg(null)
-    },
-    onError: (error: unknown) => {
-      const friendlyMsg = formatTrAuthError(error, t)
-      setErrorMsg(friendlyMsg)
-      setProcessId(null)
-      setTan('')
-      setAuthState('IDLE')
-    },
-  })
-
-  const submitTanMutation = useMutation({
-    mutationFn: (params: { processId: string; tan: string }) =>
-      api.post('/tr/auth/complete', params).then(r => r.data),
-    onSuccess: () => {
-      setAuthState('IDLE')
-      setTan('')
-      setPhone('')
-      setPin('')
-      setProcessId(null)
-      setErrorMsg(null)
-      queryClient.invalidateQueries({ queryKey: ['sync', 'tr', 'status'] })
-    },
-    onError: (error: unknown) => {
-      const friendlyMsg = formatTrAuthError(error, t)
-      setErrorMsg(friendlyMsg)
-      setTan('')
-      setAuthState('AWAITING_TAN')
-    },
-  })
-
-  const syncMutation = useMutation({
-    mutationFn: () => api.post('/tr/sync').then(r => r.data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['sync', 'tr', 'status'] })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-    },
-  })
-
-  const importCsvMutation = useMutation({
-    mutationFn: (file: File) => {
-      const formData = new FormData()
-      formData.append('file', file)
-      return api.post('/tr/import', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      }).then(r => r.data)
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
-      if (fileInputRef.current) fileInputRef.current.value = ''
-    },
-  })
-
-  const logoutMutation = useMutation({
-    mutationFn: () => api.delete('/tr/session').then(r => r.data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['sync', 'tr', 'status'] })
-      setAuthState('IDLE')
-      setPhone('')
-      setPin('')
-      setTan('')
-      setProcessId(null)
-    },
-  })
-
   function handleInitiate(e: React.FormEvent) {
     e.preventDefault()
-    initiateMutation.mutate({ phone, pin })
+    initiateMutation.mutate(
+      { phoneNumber: phone, pin },
+      {
+        onSuccess: (data) => {
+          setProcessId(data.processId)
+          setTan('')
+          setAuthState('AWAITING_TAN')
+          setErrorMsg(null)
+        },
+        onError: (error: unknown) => {
+          setErrorMsg(formatTrAuthError(error, t))
+          setProcessId(null)
+          setTan('')
+          setAuthState('IDLE')
+        },
+      },
+    )
   }
 
   function handleTan(e: React.FormEvent) {
     e.preventDefault()
     if (!processId || tan.length !== TR_VERIFICATION_CODE_LENGTH) return
-    submitTanMutation.mutate({ processId, tan })
+    submitTanMutation.mutate(
+      { processId, tan },
+      {
+        onSuccess: () => {
+          setAuthState('IDLE')
+          setTan('')
+          setPhone('')
+          setPin('')
+          setProcessId(null)
+          setErrorMsg(null)
+        },
+        onError: (error: unknown) => {
+          setErrorMsg(formatTrAuthError(error, t))
+          setTan('')
+          setAuthState('AWAITING_TAN')
+        },
+      },
+    )
   }
 
   function handleCsvChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
-    if (file) importCsvMutation.mutate(file)
+    if (!file) return
+    importCsvMutation.mutate(file, {
+      onSuccess: () => {
+        if (fileInputRef.current) fileInputRef.current.value = ''
+      },
+    })
+  }
+
+  function handleClearSession() {
+    logoutMutation.mutate(undefined, {
+      onSuccess: () => {
+        setAuthState('IDLE')
+        setPhone('')
+        setPin('')
+        setTan('')
+        setProcessId(null)
+      },
+    })
   }
 
   function handleRetry() {
@@ -200,7 +185,7 @@ export function TradeRepublicTab() {
             {t('sync.tr.importCsv')}
           </Button>
 
-          <Button variant="destructive" onClick={() => logoutMutation.mutate()} disabled={logoutMutation.isPending}>
+          <Button variant="destructive" onClick={handleClearSession} disabled={logoutMutation.isPending}>
             <LogOut />
             {t('sync.tr.clearSession')}
           </Button>

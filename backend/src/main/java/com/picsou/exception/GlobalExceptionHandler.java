@@ -3,6 +3,7 @@ package com.picsou.exception;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.*;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -61,6 +62,24 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return ProblemDetail.forStatusAndDetail(HttpStatus.UNAUTHORIZED, "Invalid credentials");
     }
 
+    // Services raise Spring Security's AccessDeniedException for "may read but not write"
+    // refusals (a co-owner editing an account, a non-owner reading a goal's contributions).
+    // Thrown inside the DispatcherServlet it never reaches ExceptionTranslationFilter, so
+    // without this handler a legitimate refusal would fall into handleGeneric as a 500 with
+    // a stack trace at ERROR. Filter-level denials (/api/admin/** role check) are answered
+    // by SecurityConfig's accessDeniedHandler with the same ProblemDetail shape.
+    @ExceptionHandler(AccessDeniedException.class)
+    ProblemDetail handleAccessDenied(AccessDeniedException ex) {
+        log.warn("Access denied: {}", ex.getMessage());
+        return ProblemDetail.forStatusAndDetail(HttpStatus.FORBIDDEN, ex.getMessage());
+    }
+
+    @ExceptionHandler(InvalidKeyMaterialException.class)
+    ProblemDetail handleInvalidKeyMaterial(InvalidKeyMaterialException ex) {
+        log.warn("Rejected key material: {} (cause: {})", ex.getMessage(), String.valueOf(ex.getCause()));
+        return ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, ex.getMessage());
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     ProblemDetail handleIllegalArgument(IllegalArgumentException ex) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, ex.getMessage());
@@ -76,10 +95,11 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         return ProblemDetail.forStatusAndDetail(HttpStatus.FORBIDDEN, ex.getMessage());
     }
 
+    // Machine-readable marker goes in `code` (api-rest.md), the title stays the reason phrase.
     @ExceptionHandler(com.picsou.service.ReAuthService.ReAuthFailedException.class)
     ProblemDetail handleReAuthFailed(com.picsou.service.ReAuthService.ReAuthFailedException ex) {
         ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.UNAUTHORIZED, ex.getMessage());
-        pd.setTitle("REAUTH_FAILED");
+        pd.setProperty("code", "REAUTH_FAILED");
         return pd;
     }
 

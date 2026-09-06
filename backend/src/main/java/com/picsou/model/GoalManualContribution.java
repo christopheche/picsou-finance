@@ -25,7 +25,7 @@ public class GoalManualContribution {
 
     @JsonIgnore
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "member_id")
+    @JoinColumn(name = "member_id", nullable = false)
     private FamilyMember member;
 
     @Column(name = "year_month", nullable = false, length = 7)

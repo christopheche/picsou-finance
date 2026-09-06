@@ -16,9 +16,13 @@ const cryptoExchangeApi = vi.hoisted(() => ({
   add: vi.fn(),
 }))
 
+const trApi = vi.hoisted(() => ({
+  sync: vi.fn(),
+}))
+
 vi.mock("./api", () => ({
   bankSyncApi: {},
-  trApi: {},
+  trApi,
   cryptoExchangeApi,
   cryptoWalletApi: {},
   finaryApi: {},
@@ -34,7 +38,9 @@ const {
   useSyncBourseDirect,
   useClearBourseDirectSession,
   useAddCryptoExchange,
+  useSyncTradeRepublic,
 } = await import("./hooks")
+const { WEALTH_QUERY_KEYS } = await import("@/features/accounts/hooks")
 
 const idleStatus: BourseDirectSessionStatus = {
   isActive: false,
@@ -165,5 +171,28 @@ describe("Crypto exchange hooks", () => {
     )
 
     expect(cryptoExchangeApi.add).toHaveBeenCalledWith("MERIA", "meria-key", undefined)
+  })
+})
+
+describe("sync mutations refresh every net-worth surface", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it("useSyncTradeRepublic invalidates the chart, P&L and intraday keys, not only the total", async () => {
+    trApi.sync.mockResolvedValue([])
+    const { client, wrapper } = createHarness()
+    const invalidations = vi.spyOn(client, "invalidateQueries")
+    const { result } = renderHook(() => useSyncTradeRepublic(), { wrapper })
+
+    await act(() => result.current.mutateAsync())
+
+    expect(invalidations).toHaveBeenCalledWith({ queryKey: syncKeys.tr() })
+    for (const queryKey of WEALTH_QUERY_KEYS) {
+      expect(invalidations).toHaveBeenCalledWith({ queryKey: [...queryKey] })
+    }
+    expect(WEALTH_QUERY_KEYS.map((k) => k[0])).toEqual(
+      expect.arrayContaining(["history", "pnl", "net-worth-intraday"])
+    )
   })
 })

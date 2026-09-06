@@ -18,6 +18,8 @@ export function TimeRangeSelector({ value, onChange }: TimeRangeSelectorProps) {
       {RANGES.map(range => (
         <button
           key={range}
+          type="button"
+          aria-pressed={value === range}
           onClick={() => onChange(range)}
           className={cn(
             'inline-flex h-10 min-w-12 items-center justify-center rounded-md px-4 text-sm font-medium transition-[background-color,color]',

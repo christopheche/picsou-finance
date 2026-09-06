@@ -11,6 +11,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.Set;
 
 @Component
 public class CryptoEncryption {
@@ -19,6 +20,8 @@ public class CryptoEncryption {
     private static final String ALGORITHM = "AES/GCM/NoPadding";
     private static final int GCM_IV_LENGTH = 12;
     private static final int GCM_TAG_LENGTH = 128;
+    /** AES-128 / AES-192 / AES-256; the documented generator (`openssl rand -base64 32`) yields 32. */
+    private static final Set<Integer> VALID_AES_KEY_LENGTHS = Set.of(16, 24, 32);
 
     private final SecretKey key;
     private final SecureRandom random = new SecureRandom();
@@ -29,7 +32,22 @@ public class CryptoEncryption {
                 "CRYPTO_ENCRYPTION_KEY is required. Generate one with: " +
                 "openssl rand -base64 32");
         }
-        this.key = new SecretKeySpec(Base64.getDecoder().decode(base64Key), "AES");
+        // Fail at startup, not on the first encrypt(): SecretKeySpec accepts any byte length
+        // and Cipher.init() would only reject a wrong-sized key at call time (ADR 2026-04-08).
+        byte[] keyBytes;
+        try {
+            keyBytes = Base64.getDecoder().decode(base64Key.strip());
+        } catch (IllegalArgumentException ex) {
+            throw new IllegalStateException(
+                "CRYPTO_ENCRYPTION_KEY is not valid Base64. Generate one with: " +
+                "openssl rand -base64 32", ex);
+        }
+        if (!VALID_AES_KEY_LENGTHS.contains(keyBytes.length)) {
+            throw new IllegalStateException(
+                "CRYPTO_ENCRYPTION_KEY must decode to 16, 24 or 32 bytes (got " + keyBytes.length +
+                "). Generate one with: openssl rand -base64 32");
+        }
+        this.key = new SecretKeySpec(keyBytes, "AES");
     }
 
     public String encrypt(String plainText) {

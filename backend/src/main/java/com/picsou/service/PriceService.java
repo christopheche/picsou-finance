@@ -2,13 +2,18 @@ package com.picsou.service;
 
 import com.picsou.adapter.CoinGeckoPriceProvider;
 import com.picsou.adapter.YahooFinancePriceProvider;
+import com.picsou.model.AccountType;
 import com.picsou.model.PriceSnapshot;
+import com.picsou.repository.AccountHoldingRepository;
+import com.picsou.repository.AccountRepository;
 import com.picsou.repository.PriceSnapshotRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -22,6 +27,14 @@ public class PriceService {
 
     private static final Logger log = LoggerFactory.getLogger(PriceService.class);
     private static final long CACHE_TTL_SECONDS = 900; // 15 minutes
+
+    /**
+     * How long a remembered <em>miss</em> is honoured before the provider is asked again. Far
+     * shorter than the hit TTL on purpose: a miss is more likely to be transient (a 429, a Yahoo
+     * hiccup) than a hit is to be stale, and it matches {@code CoinGeckoPriceProvider}'s default
+     * post-429 cooldown so a retry lines up with the cooldown lifting. See ADR 2026-08-01.
+     */
+    private static final long MISS_CACHE_TTL_SECONDS = 60;
 
     /**
      * How stale a {@code price_snapshot} row may be before it stops being an acceptable answer.
@@ -40,15 +53,34 @@ public class PriceService {
     private final CoinGeckoPriceProvider coinGecko;
     private final YahooFinancePriceProvider yahoo;
     private final PriceSnapshotRepository priceSnapshotRepository;
+    private final AccountHoldingRepository holdingRepository;
+    private final AccountRepository accountRepository;
+    private final Clock clock;
 
     // Simple in-memory price cache: ticker → (price, cachedAt)
     private final Map<String, CachedPrice> priceCache = new ConcurrentHashMap<>();
 
+    /**
+     * Single-flight for provider calls. The dashboard fires several requests in parallel
+     * (totals, account cards, goals, the history live point) and each values the same holdings,
+     * so a cold or just-expired cache used to cost one identical provider call per Tomcat thread
+     * — every one of them counted by the free tier. Fetches now run one at a time and re-check
+     * the cache once inside, so the threads that lose the race reuse the winner's answer. Cache
+     * hits never touch the lock.
+     */
+    private final Object fetchLock = new Object();
+
     public PriceService(CoinGeckoPriceProvider coinGecko, YahooFinancePriceProvider yahoo,
-                        PriceSnapshotRepository priceSnapshotRepository) {
+                        PriceSnapshotRepository priceSnapshotRepository,
+                        AccountHoldingRepository holdingRepository,
+                        AccountRepository accountRepository,
+                        Clock clock) {
         this.coinGecko = coinGecko;
         this.yahoo = yahoo;
         this.priceSnapshotRepository = priceSnapshotRepository;
+        this.holdingRepository = holdingRepository;
+        this.accountRepository = accountRepository;
+        this.clock = clock;
     }
 
     /**
@@ -60,7 +92,14 @@ public class PriceService {
      * @param live  true when the number came from the provider (or its 15-minute cache), false
      *              when it is the last price we ever managed to record
      */
-    public record Quote(BigDecimal price, LocalDate asOf, boolean live) {}
+    public record Quote(BigDecimal price, LocalDate asOf, boolean live) {
+        public Quote {
+            // A null-priced Quote once slipped out of refreshCryptoQuotes (a remembered miss served
+            // as a hit) and skipped the fallback the sync paths rely on; the consumer then wrote a
+            // partial balance into balance_snapshot. Fail here, loudly, rather than there, silently.
+            Objects.requireNonNull(price, "a Quote carries a price; an unresolved ticker has no Quote");
+        }
+    }
 
     /**
      * Returns EUR price for the given ticker.
@@ -143,15 +182,15 @@ public class PriceService {
             if (cryptoOnly && !coinGecko.supports(upper)) {
                 continue;
             }
-            CachedPrice cached = priceCache.get(upper);
-            if (cached != null && !cached.isExpired() && cached.price() != null) {
+            CachedPrice cached = fresh(upper);
+            if (cached != null && cached.price() != null) {
                 resolved.put(upper, new Quote(cached.price(), today, true));
                 continue;
             }
             // A cached entry with no price is a remembered miss: the provider was asked
             // recently and had nothing. Skip the network -- that is what the shorter
             // MISS_CACHE_TTL_SECONDS buys -- and go straight to the recorded fallback.
-            if (cached != null && !cached.isExpired()) {
+            if (cached != null) {
                 missCached.add(upper);
             }
             pending.add(upper);
@@ -159,20 +198,39 @@ public class PriceService {
 
         if (pending.isEmpty()) return resolved;
 
-        Set<String> fetchable = pending.stream()
+        Set<String> wanted = pending.stream()
             .filter(t -> !missCached.contains(t))
             .collect(Collectors.toCollection(TreeSet::new));
 
-        if (!fetchable.isEmpty()) {
-            Map<String, BigDecimal> live = fetchLive(fetchable, cryptoOnly);
-            Instant fetchedAt = Instant.now();
-            for (String ticker : fetchable) {
-                BigDecimal price = live.get(ticker);
-                // Misses are cached too: that null entry *is* the negative cache, and it
-                // expires on its own shorter TTL.
-                priceCache.put(ticker, new CachedPrice(price, fetchedAt));
-                if (price != null) {
-                    resolved.put(ticker, new Quote(price, today, true));
+        // Only the tickers this thread actually sent to a provider; the logging below must not
+        // blame a thread for an outage another one already recorded.
+        Set<String> fetchable = new TreeSet<>();
+        if (!wanted.isEmpty()) {
+            synchronized (fetchLock) {
+                // Re-check under the lock: whoever held it before us may have just fetched (or
+                // just failed to fetch) exactly these tickers.
+                for (String ticker : wanted) {
+                    CachedPrice cached = fresh(ticker);
+                    if (cached == null) {
+                        fetchable.add(ticker);
+                    } else if (cached.price() != null) {
+                        resolved.put(ticker, new Quote(cached.price(), today, true));
+                    } else {
+                        missCached.add(ticker);
+                    }
+                }
+                if (!fetchable.isEmpty()) {
+                    Map<String, BigDecimal> live = fetchLive(fetchable, cryptoOnly);
+                    Instant fetchedAt = clock.instant();
+                    for (String ticker : fetchable) {
+                        BigDecimal price = live.get(ticker);
+                        // Misses are cached too: that null entry *is* the negative cache, and it
+                        // expires on its own shorter TTL.
+                        priceCache.put(ticker, new CachedPrice(price, fetchedAt));
+                        if (price != null) {
+                            resolved.put(ticker, new Quote(price, today, true));
+                        }
+                    }
                 }
             }
         }
@@ -207,6 +265,12 @@ public class PriceService {
         }
 
         return resolved;
+    }
+
+    /** The cache entry for {@code ticker} if it is still within its TTL — a remembered miss included — else null. */
+    private CachedPrice fresh(String ticker) {
+        CachedPrice cached = priceCache.get(ticker);
+        return cached != null && !cached.isExpired(clock.instant()) ? cached : null;
     }
 
     /** One batched provider call, routed the same way {@link #refreshPrices} routes. */
@@ -298,18 +362,61 @@ public class PriceService {
      * here matters because {@code GET /prices} is polled by the frontend on an
      * interval — bypassing the cache would turn every open dashboard tab into
      * a steady stream of Yahoo/CoinGecko calls.
+     *
+     * <p>A remembered miss (see {@link #resolve}) is honoured the same way: the provider is not
+     * asked again inside {@link #MISS_CACHE_TTL_SECONDS}, and the ticker is simply <em>absent</em>
+     * from the result — never present with a null value. Callers treat absence as "unpriced this
+     * cycle", and {@link #refreshCryptoQuotes} routes it to the last-known-price fallback.
      */
     public Map<String, BigDecimal> refreshPrices(Set<String> tickers) {
         return refreshPrices(tickers, false);
+    }
+
+    /**
+     * {@link #refreshPrices} for a caller that does not know what kind of asset each ticker is —
+     * {@code GET /api/prices}, which the frontend feeds every holding of every account.
+     *
+     * <p>Tickers held in a {@link AccountType#CRYPTO} account (as a holding or as the account's
+     * own symbol) go through {@link #refreshCryptoPrices}; the rest through {@link #refreshPrices}.
+     * The generic route hands anything CoinGecko cannot map to Yahoo Finance <em>and records what
+     * it fetches</em>, so an unmapped coin whose symbol is a listed equity (SNX, STX, APT, SEI…)
+     * would otherwise be displayed at that company's share price and have it written into
+     * {@code price_snapshot} — the table the fallback and the P&amp;L history read by ticker
+     * alone. This is the same split {@code SchedulerService.refreshPrices} applies hourly.
+     *
+     * <p>The two ticker queries are global, like prices themselves: which symbols are crypto is
+     * not member data, and the answer only decides routing — the result never contains a ticker
+     * the caller did not ask for.
+     */
+    public Map<String, BigDecimal> refreshHeldPrices(Set<String> tickers) {
+        if (tickers.isEmpty()) return Map.of();
+
+        Set<String> cryptoHeld = new TreeSet<>(
+            holdingRepository.findDistinctTickersByAccountType(AccountType.CRYPTO));
+        cryptoHeld.addAll(accountRepository.findDistinctTickersByType(AccountType.CRYPTO));
+        Set<String> cryptoHeldUpper = cryptoHeld.stream()
+            .map(t -> t.toUpperCase(Locale.ROOT))
+            .collect(Collectors.toCollection(TreeSet::new));
+
+        Set<String> crypto = new TreeSet<>();
+        Set<String> other = new TreeSet<>();
+        for (String ticker : tickers) {
+            String upper = ticker.toUpperCase(Locale.ROOT);
+            if (cryptoHeldUpper.contains(upper)) crypto.add(upper);
+            else other.add(upper);
+        }
+
+        Map<String, BigDecimal> result = new HashMap<>();
+        if (!crypto.isEmpty()) result.putAll(refreshCryptoPrices(crypto));
+        if (!other.isEmpty()) result.putAll(refreshPrices(other));
+        return result;
     }
 
     private Map<String, BigDecimal> refreshPrices(Set<String> tickers, boolean cryptoOnly) {
         if (tickers.isEmpty()) return Map.of();
 
         Map<String, BigDecimal> result = new HashMap<>();
-
-        Set<String> cryptoTickers = new HashSet<>();
-        Set<String> stockTickers = new HashSet<>();
+        Set<String> wanted = new TreeSet<>();
 
         for (String ticker : tickers) {
             String upper = ticker.toUpperCase(Locale.ROOT);
@@ -317,33 +424,52 @@ public class PriceService {
                 result.put(upper, BigDecimal.ONE);
                 continue;
             }
-            CachedPrice cached = priceCache.get(upper);
-            if (cached != null && !cached.isExpired()) {
-                result.put(upper, cached.price());
-            } else if (coinGecko.supports(upper)) {
-                cryptoTickers.add(upper);
-            } else if (cryptoOnly) {
-                log.warn("No CoinGecko mapping for crypto ticker {} -- leaving it unpriced rather "
-                    + "than valuing it as the stock trading under that symbol", upper);
-            } else {
-                stockTickers.add(upper);
+            CachedPrice cached = fresh(upper);
+            if (cached != null) {
+                // A remembered miss skips the network exactly like a hit does, but it must not
+                // become an entry: a null value here once turned into a null-priced Quote that
+                // bypassed the sync paths' last-known-price fallback.
+                if (cached.price() != null) result.put(upper, cached.price());
+                continue;
             }
+            wanted.add(upper);
         }
 
         Map<String, BigDecimal> fetched = new HashMap<>();
 
-        if (!cryptoTickers.isEmpty()) {
-            coinGecko.getPricesEur(cryptoTickers).forEach((k, v) -> {
-                priceCache.put(k, new CachedPrice(v, Instant.now()));
-                fetched.put(k, v);
-            });
-        }
+        if (!wanted.isEmpty()) {
+            synchronized (fetchLock) {
+                Set<String> cryptoTickers = new HashSet<>();
+                Set<String> stockTickers = new HashSet<>();
+                for (String upper : wanted) {
+                    // Re-check under the lock -- see fetchLock.
+                    CachedPrice cached = fresh(upper);
+                    if (cached != null) {
+                        if (cached.price() != null) result.put(upper, cached.price());
+                    } else if (coinGecko.supports(upper)) {
+                        cryptoTickers.add(upper);
+                    } else if (cryptoOnly) {
+                        log.warn("No CoinGecko mapping for crypto ticker {} -- leaving it unpriced rather "
+                            + "than valuing it as the stock trading under that symbol", upper);
+                    } else {
+                        stockTickers.add(upper);
+                    }
+                }
 
-        if (!stockTickers.isEmpty()) {
-            yahoo.getPricesEur(stockTickers).forEach((k, v) -> {
-                priceCache.put(k, new CachedPrice(v, Instant.now()));
-                fetched.put(k, v);
-            });
+                if (!cryptoTickers.isEmpty()) {
+                    coinGecko.getPricesEur(cryptoTickers).forEach((k, v) -> {
+                        priceCache.put(k, new CachedPrice(v, clock.instant()));
+                        fetched.put(k, v);
+                    });
+                }
+
+                if (!stockTickers.isEmpty()) {
+                    yahoo.getPricesEur(stockTickers).forEach((k, v) -> {
+                        priceCache.put(k, new CachedPrice(v, clock.instant()));
+                        fetched.put(k, v);
+                    });
+                }
+            }
         }
 
         result.putAll(fetched);
@@ -355,20 +481,44 @@ public class PriceService {
         for (var entry : fetched.entrySet()) {
             if ("EUR".equals(entry.getKey())) continue;
             if (entry.getValue() == null) continue;
-            Optional<PriceSnapshot> existing = priceSnapshotRepository.findByTickerAndDate(entry.getKey(), today);
-            if (existing.isPresent()) {
-                existing.get().setPriceEur(entry.getValue());
-                priceSnapshotRepository.save(existing.get());
-            } else {
-                priceSnapshotRepository.save(PriceSnapshot.builder()
-                    .ticker(entry.getKey())
-                    .date(today)
-                    .priceEur(entry.getValue())
-                    .build());
-            }
+            upsertSnapshot(entry.getKey(), today, entry.getValue());
         }
 
         return result;
+    }
+
+    /**
+     * Writes {@code price} as the {@code (ticker, date)} row, replacing an existing one.
+     *
+     * <p>Check-then-insert is not atomic and nothing here is transactional, so two callers
+     * recording the same ticker's first price of the day — the hourly scheduler tick alongside a
+     * page load, or the boot-time tick alongside {@code PriceBackfillRunner} — can both find no
+     * row and both insert. The loser hits {@code uk_price_snapshot_ticker_date}; instead of a 500
+     * from {@code GET /api/prices}, it re-reads the winner's row and updates it. The recovery only
+     * works outside a surrounding transaction (PostgreSQL aborts an open transaction on the
+     * failed insert), which is where every caller but the wallet sync sits; there the exception
+     * propagates exactly as it did before.
+     */
+    private void upsertSnapshot(String ticker, LocalDate date, BigDecimal price) {
+        Optional<PriceSnapshot> existing = priceSnapshotRepository.findByTickerAndDate(ticker, date);
+        if (existing.isPresent()) {
+            existing.get().setPriceEur(price);
+            priceSnapshotRepository.save(existing.get());
+            return;
+        }
+        try {
+            priceSnapshotRepository.save(PriceSnapshot.builder()
+                .ticker(ticker)
+                .date(date)
+                .priceEur(price)
+                .build());
+        } catch (DataIntegrityViolationException raced) {
+            PriceSnapshot theirs = priceSnapshotRepository.findByTickerAndDate(ticker, date)
+                .orElseThrow(() -> raced);
+            log.debug("price_snapshot({}, {}) was inserted concurrently -- updating it instead", ticker, date);
+            theirs.setPriceEur(price);
+            priceSnapshotRepository.save(theirs);
+        }
     }
 
     /** Convert an account's balance to EUR using its currency/ticker. */
@@ -409,6 +559,21 @@ public class PriceService {
      * Skips dates that already have a snapshot.
      */
     public int backfillHistoricalPrices(Set<String> tickers, LocalDate from) {
+        return backfillHistoricalPrices(tickers, from, false);
+    }
+
+    /**
+     * {@link #backfillHistoricalPrices} for tickers known to be crypto: one CoinGecko cannot map
+     * is skipped with a warning instead of being handed to Yahoo Finance. The generic route would
+     * persist a year of the same-named equity's closes under the coin's symbol, at every boot
+     * until "covered" — and {@code HistoryService} values the position from those rows by ticker
+     * alone. Same split as {@link #refreshCryptoPrices}.
+     */
+    public int backfillHistoricalCryptoPrices(Set<String> tickers, LocalDate from) {
+        return backfillHistoricalPrices(tickers, from, true);
+    }
+
+    private int backfillHistoricalPrices(Set<String> tickers, LocalDate from, boolean cryptoOnly) {
         LocalDate to = LocalDate.now();
         int saved = 0;
         int failed = 0;
@@ -417,6 +582,12 @@ public class PriceService {
         for (String ticker : tickers) {
             String upper = ticker.toUpperCase(Locale.ROOT);
             if ("EUR".equals(upper)) continue;
+
+            if (cryptoOnly && !coinGecko.supports(upper)) {
+                log.warn("No CoinGecko mapping for crypto ticker {} -- not backfilling it rather "
+                    + "than recording the history of the stock trading under that symbol", upper);
+                continue;
+            }
 
             if (alreadyCovered(upper, from, to)) {
                 skipped++;
@@ -435,12 +606,20 @@ public class PriceService {
 
                 for (var entry : prices.entrySet()) {
                     if (priceSnapshotRepository.findByTickerAndDate(upper, entry.getKey()).isEmpty()) {
-                        priceSnapshotRepository.save(PriceSnapshot.builder()
-                            .ticker(upper)
-                            .date(entry.getKey())
-                            .priceEur(entry.getValue())
-                            .build());
-                        saved++;
+                        try {
+                            priceSnapshotRepository.save(PriceSnapshot.builder()
+                                .ticker(upper)
+                                .date(entry.getKey())
+                                .priceEur(entry.getValue())
+                                .build());
+                            saved++;
+                        } catch (DataIntegrityViolationException raced) {
+                            // The hourly refresh fires at boot too and may record today's row
+                            // between the lookup and this insert. That row is the fresher of the
+                            // two; losing to it is not a failure of this ticker.
+                            log.debug("price_snapshot({}, {}) was inserted concurrently -- keeping it",
+                                upper, entry.getKey());
+                        }
                     }
                 }
 
@@ -509,8 +688,9 @@ public class PriceService {
     }
 
     private record CachedPrice(BigDecimal price, Instant cachedAt) {
-        boolean isExpired() {
-            return Instant.now().isAfter(cachedAt.plusSeconds(CACHE_TTL_SECONDS));
+        boolean isExpired(Instant now) {
+            long ttl = price == null ? MISS_CACHE_TTL_SECONDS : CACHE_TTL_SECONDS;
+            return now.isAfter(cachedAt.plusSeconds(ttl));
         }
     }
 

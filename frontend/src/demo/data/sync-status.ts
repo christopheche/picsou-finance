@@ -1,4 +1,5 @@
 import type { ExchangeStatus, WalletStatus } from '@/types/api'
+import type { bankSyncApi } from '@/features/sync/api'
 
 export const mockExchangeStatuses: ExchangeStatus[] = [
   {
@@ -25,7 +26,8 @@ export const mockWalletStatuses: WalletStatus[] = [
   },
 ]
 
-export const mockRequisitions = [
+// Typed against the real `GET /sync/status` payload so the mock cannot drift from it.
+export const mockRequisitions: Awaited<ReturnType<typeof bankSyncApi.getStatus>> = [
   {
     id: 1,
     requisitionId: 'demo-requisition-1',
@@ -33,5 +35,6 @@ export const mockRequisitions = [
     institutionName: 'BNP Paribas',
     status: 'LINKED',
     authLink: null,
+    lastSyncedAt: '2025-03-15T08:00:00Z',
   },
 ]

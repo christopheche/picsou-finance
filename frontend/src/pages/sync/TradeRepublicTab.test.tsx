@@ -115,3 +115,39 @@ describe('TradeRepublicTab authentication flow', () => {
     })
   })
 })
+
+describe('TradeRepublicTab shared query key', () => {
+  beforeEach(() => {
+    apiGet.mockReset()
+    apiPost.mockReset()
+    apiDelete.mockReset()
+    apiGet.mockResolvedValue({ data: { isActive: true, expiresAt: null } })
+  })
+
+  it('caches the session status under syncKeys.tr(), the key SyncAllModal reads', async () => {
+    // The tab used to run its own useQuery on ['sync','tr','status'] while the
+    // shared hook uses ['sync','tr']; invalidating one never refreshed the other,
+    // so "Sync all" kept reporting a session the user had just logged out of.
+    const queryClient = makeClient()
+    render(<TradeRepublicTab />, {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      ),
+    })
+
+    expect(await screen.findByText('sync.tr.sessionActive')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(queryClient.getQueryData(['sync', 'tr'])).toEqual({ isActive: true, expiresAt: null }),
+    )
+    expect(queryClient.getQueryData(['sync', 'tr', 'status'])).toBeUndefined()
+  })
+
+  it('clears the session through the shared mutation', async () => {
+    apiDelete.mockResolvedValue({ data: undefined })
+    renderTab()
+
+    fireEvent.click(await screen.findByRole('button', { name: /sync\.tr\.clearSession/ }))
+
+    await waitFor(() => expect(apiDelete).toHaveBeenCalledWith('/tr/session'))
+  })
+})

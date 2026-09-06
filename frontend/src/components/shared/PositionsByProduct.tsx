@@ -3,7 +3,7 @@ import type { ExchangePositionResponse } from '@/types/api'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
 import { PriceFreshnessDot } from '@/components/shared/PriceFreshnessDot'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { cn } from '@/lib/utils'
+import { cn, formatPercent, localeFromLanguage } from '@/lib/utils'
 import {
   Table,
   TableBody,
@@ -35,7 +35,8 @@ const PRODUCT_ORDER = ['SPOT', 'STAKING', 'LENDING'] as const
  * something added to it.
  */
 export function PositionsByProduct({ positions }: PositionsByProductProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
 
   if (positions.length === 0) return null
 
@@ -131,7 +132,7 @@ export function PositionsByProduct({ positions }: PositionsByProductProps) {
                         </TableCell>
                         <TableCell className={cn('text-right', pnlColor(row.pnlPercent))}>
                           {row.pnlPercent != null
-                            ? `${row.pnlPercent >= 0 ? '+' : ''}${row.pnlPercent.toFixed(1)}%`
+                            ? `${row.pnlPercent >= 0 ? '+' : ''}${formatPercent(row.pnlPercent / 100, locale)}`
                             : '—'}
                         </TableCell>
                       </TableRow>

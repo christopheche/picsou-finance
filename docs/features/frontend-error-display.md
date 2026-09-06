@@ -1,6 +1,6 @@
 # Feature: Frontend Error Display (`formatApiError` / `safeBackendMessage`)
 
-> Last updated: 2026-05-31
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -84,21 +84,41 @@ down the Accounts page.
 Used by:
 
 - `frontend/src/pages/sync/BankSyncTab.tsx` — replaces hand-written extraction in
-  `completeMutation.onError` and `initiateMutation.onError`.
+  `completeMutation.onError` and `initiateMutation.onError`. `bankSyncApi.complete`
+  is a GET by backend contract but a mutation in practice, so it sets
+  `skipGlobalErrorRedirect: true`; without it a 5xx during OAuth completion hit the
+  global GET-5xx redirect to `/error/500` and `onError` never ran.
 - `frontend/src/pages/sync/TradeRepublicTab.tsx` — `formatAuthError` fallback.
 - `frontend/src/pages/sync/BoursoTab.tsx` — `formatError` fallback.
 - `frontend/src/pages/sync/FinaryTab.tsx` — replaces `err instanceof Error ? err.message : ...`.
 - `frontend/src/pages/sync/CryptoExchangeTab.tsx`,
-  `frontend/src/pages/sync/CryptoWalletTab.tsx` — error states show
-  `extractErrorMessage(error)`.
+  `frontend/src/pages/sync/CryptoWalletTab.tsx` — list-level error states use
+  `formatApiError(error, t)`; the exchange connect form keeps
+  `extractErrorMessage(err, t(…))` because its fallback key depends on whether the
+  exchange takes a secret.
 - `frontend/src/pages/admin/sections/{Security,EnableBanking}Section.tsx` — TanStack
-  Query mutation `error` rendered through the helper.
+  Query mutation `error` rendered through `formatApiError(err, t)`. A translator is
+  in scope here, so bare `extractErrorMessage` (whose default fallback is the French
+  *"Une erreur est survenue"*) is **not** used: a German admin hitting a 500 would
+  otherwise get a French sentence.
 - `frontend/src/pages/admin/sections/MembersSection.tsx` and
   `frontend/src/pages/settings/FamilySettingsPage.tsx` — member-delete failure shown
-  **inside** `ConfirmDialog` via `formatApiError(deleteMember.error, t)`.
-- `frontend/src/pages/settings/security/{ExportDataDialog,RecoveryCodesDialog,MfaEnrollDialog}.tsx`
+  **inside** `ConfirmDialog` via `formatApiError(deleteMember.error, t)`; the admin
+  section additionally renders create-user, activation-link, password-reset and
+  2FA-reset failures in `role="alert"` blocks.
+- `frontend/src/pages/settings/security/{ExportDataDialog,RecoveryCodesDialog,MfaEnrollDialog,MfaDisableDialog}.tsx`
   — replaced raw `err.message` / `` `${status} — …` `` displays with
-  `formatApiError(err, t)` (keeping their existing 401/429-specific branches).
+  `formatApiError(err, t)` (keeping their existing 400/401/429-specific branches).
+  `MfaDisableDialog`'s 400 branch goes through `safeBackendMessage`, never the raw
+  `getErrorDetail`, so a `ProblemDetail` carrying a class name can't reach the user.
+- `frontend/src/pages/activation/ActivationPage.tsx` —
+  `formatApiError(err, t, 'auth.activation.failed')`; the call itself moved to
+  `useActivateAccount()` in `features/auth/hooks.ts`.
+- `frontend/src/pages/setup/integrations/enablebanking/{EBStep2Credentials,EBStep3Keypair}.tsx`
+  — replaced `response.data.detail ?? String(err)` with
+  `formatApiError(err, t, 'setup.enablebanking.…')`.
+- `frontend/src/pages/family/FamilyDashboardPage.tsx` — renders `ErrorState` with
+  `formatApiError(error, t)` and a retry instead of dereferencing `data!`.
 
 ## Technical choices
 
@@ -127,6 +147,13 @@ Used by:
   *"Operation failed for {customerId}"* will trigger a (failed) parse, which
   silently falls through to returning the raw `detail`. That's the correct
   behaviour but worth understanding before tweaking the regex/slice logic.
+- **Per-row errors on a shared mutation hook go through the promise, not
+  mutate-level callbacks.** `SyncAllModal` fires one `useRetryBankSync` (and one
+  exchange, one wallet) hook for every row of that type. TanStack Query only
+  delivers the `onSuccess`/`onError`/`onSettled` passed to the *latest* `mutate()`
+  on a hook — "Sync all" over two banks left the first row spinning forever with its
+  error swallowed. The modal now uses `mutateAsync(id).then(clear, showError).finally(clearSpinner)`,
+  which settles per call (`SyncAllModal.test.tsx`, "several rows of one provider type").
 - **Type cast `err as { response?: ...; message?: ... }`.** The helper accepts
   `unknown` for safety but does no runtime guards beyond the `typeof string`
   checks. If a non-Axios shape (e.g. a thrown plain string) reaches it, none of

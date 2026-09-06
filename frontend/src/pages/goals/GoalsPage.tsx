@@ -15,6 +15,7 @@ import { Input } from '@/components/ui/input'
 import { NumericInput } from '@/components/shared/NumericInput'
 import { DateInput } from '@/components/shared/DateInput'
 import { parseAmount } from '@/lib/utils'
+import { formatApiError } from '@/lib/errors'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
@@ -58,11 +59,13 @@ export function GoalsPage() {
   const [editingGoal, setEditingGoal] = useState<GoalProgress | null>(null)
   const [deleteId, setDeleteId] = useState<number | null>(null)
   const [form, setForm] = useState(emptyForm)
+  const [submitError, setSubmitError] = useState<string | null>(null)
   const [detailGoalId, setDetailGoalId] = useState<number | null>(null)
 
   const openCreate = () => {
     setEditingGoal(null)
     setForm(emptyForm)
+    setSubmitError(null)
     setShowForm(true)
   }
 
@@ -74,12 +77,14 @@ export function GoalsPage() {
       deadline: goal.deadline,
       accountIds: goal.accounts.map((a) => a.id),
     })
+    setSubmitError(null)
     setShowForm(true)
   }
 
   const closeForm = () => {
     setShowForm(false)
     setEditingGoal(null)
+    setSubmitError(null)
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -90,10 +95,18 @@ export function GoalsPage() {
       deadline: form.deadline,
       accountIds: form.accountIds,
     }
-    if (editingGoal) {
-      await updateGoal.mutateAsync({ id: editingGoal.id, data })
-    } else {
-      await createGoal.mutateAsync(data)
+    // A rejected mutation used to be an unhandled promise rejection: the dialog stayed open,
+    // the spinner stopped and nothing said the goal had not been saved.
+    setSubmitError(null)
+    try {
+      if (editingGoal) {
+        await updateGoal.mutateAsync({ id: editingGoal.id, data })
+      } else {
+        await createGoal.mutateAsync(data)
+      }
+    } catch (err) {
+      setSubmitError(formatApiError(err, t))
+      return
     }
     closeForm()
   }
@@ -175,7 +188,7 @@ export function GoalsPage() {
                 required
                 value={form.name}
                 onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                placeholder="Apport immobilier"
+                placeholder={t('goals.namePlaceholder')}
               />
             </div>
 
@@ -202,7 +215,7 @@ export function GoalsPage() {
             </div>
 
             <div className="flex flex-col gap-2">
-              <Label>Comptes inclus</Label>
+              <Label>{t('goals.includedAccounts')}</Label>
               <div className="flex flex-col gap-2 max-h-40 overflow-y-auto">
                 {(accounts ?? []).map((a) => (
                   <label
@@ -227,6 +240,10 @@ export function GoalsPage() {
                 ))}
               </div>
             </div>
+
+            {submitError && (
+              <p role="alert" className="text-sm text-destructive">{submitError}</p>
+            )}
 
             <DialogFooter>
               <Button type="button" variant="outline" onClick={closeForm}>
@@ -257,7 +274,7 @@ export function GoalsPage() {
         open={deleteId != null}
         onOpenChange={(open) => { if (!open) setDeleteId(null) }}
         title={t('goals.deleteGoal')}
-        description={t('goals.deleteGoal')}
+        description={t('goals.deleteConfirm')}
         onConfirm={handleConfirmDelete}
         loading={deleteGoal.isPending}
         variant="destructive"

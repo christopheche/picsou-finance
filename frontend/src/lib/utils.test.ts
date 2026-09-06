@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { cn, formatCurrency, formatDate, formatPercent, freshnessLevel, localeFromLanguage, parseDate, todayLabel } from './utils'
+import { cn, formatCurrency, formatDate, formatNumber, formatPercent, formatTimeAgo, freshnessLevel, localeFromLanguage, parseApiDate, parseDate, safeRedirect, toLocalIsoDate, todayLabel } from './utils'
 
 describe('cn', () => {
   it('merges class names', () => {
@@ -75,6 +75,65 @@ describe('formatDate', () => {
       // rather than a parsing artefact — the date-only rule must not swallow it.
       expect(formatDate('2026-07-31T02:00:00Z', 'fr-FR', 'iso')).toBe('30-07-2026')
     })
+  })
+})
+
+describe('parseApiDate', () => {
+  // The chart components need the instant, not a label, so the local-midnight anchoring that
+  // `formatDate` relies on has to be reachable on its own — otherwise every `new Date(p.date)`
+  // on a backend LocalDate puts the point on the previous day west of UTC.
+  beforeEach(() => { vi.stubEnv('TZ', 'America/New_York') })
+  afterEach(() => { vi.unstubAllEnvs() })
+
+  it('anchors a date-only value at local midnight', () => {
+    const d = parseApiDate('2026-07-31')
+    expect([d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours()]).toEqual([2026, 7, 31, 0])
+  })
+
+  it('leaves a value that carries a time to Date', () => {
+    expect(parseApiDate('2026-07-31T02:00:00Z').getTime()).toBe(Date.UTC(2026, 6, 31, 2))
+  })
+})
+
+describe('toLocalIsoDate', () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs() })
+
+  it('names the local calendar day, not the UTC one, east of UTC', () => {
+    // 22:30Z on the 5th is already 00:30 on the 6th in Paris: the UTC day is yesterday.
+    vi.stubEnv('TZ', 'Europe/Paris')
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-05T22:30:00Z'))
+    expect(toLocalIsoDate()).toBe('2026-09-06')
+  })
+
+  it('names the local calendar day west of UTC', () => {
+    // 03:00Z on the 6th is still 23:00 on the 5th in New York: the UTC day is tomorrow.
+    vi.stubEnv('TZ', 'America/New_York')
+    expect(toLocalIsoDate(new Date('2026-09-06T03:00:00Z'))).toBe('2026-09-05')
+  })
+
+  it('zero-pads month and day', () => {
+    expect(toLocalIsoDate(new Date(2026, 0, 5))).toBe('2026-01-05')
+  })
+})
+
+describe('formatNumber', () => {
+  it('uses the app locale rather than the browser one', () => {
+    expect(formatNumber(1234.5, 'fr-FR')).toBe('1\u202f234,5')
+    expect(formatNumber(1234.5, 'en-US')).toBe('1,234.5')
+  })
+
+  it('keeps toLocaleString()’s default of up to three decimals', () => {
+    expect(formatNumber(0.12345, 'en-US')).toBe('0.123')
+  })
+
+  it('pins the decimals when asked, like toFixed', () => {
+    expect(formatNumber(1.5, 'en-US', 2)).toBe('1.50')
+    expect(formatNumber(1.5, 'fr-FR', 0)).toBe('2')
+  })
+
+  it('falls back to the default locale for an invalid one', () => {
+    expect(formatNumber(1.5, 'not-a-locale', 1)).toBe('1,5')
   })
 })
 
@@ -203,5 +262,61 @@ describe('freshnessLevel', () => {
   /** Server clock ahead of the browser: an age below zero is as fresh as it gets, not old. */
   it('treats a future date as fresh', () => {
     expect(freshnessLevel(ago(-DAY), bounds, NOW)).toBe('fresh')
+  })
+})
+
+describe('formatTimeAgo', () => {
+  // Same reason as the formatDate block: a date-only value is a calendar day, and it must be
+  // anchored at local midnight like `freshnessLevel` (which decides the bucket the card shows
+  // next to this label) — otherwise the two disagree by the local UTC offset.
+  beforeEach(() => {
+    vi.stubEnv('TZ', 'America/New_York')
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-29T14:00:00Z')) // 10:00 in New York
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllEnvs()
+  })
+
+  it('anchors a date-only value at local midnight', () => {
+    expect(formatTimeAgo('2026-08-29', 'en-US')).toBe('10 hours ago')
+  })
+
+  it('agrees with freshnessLevel on a date-only value exactly 7 local days old', () => {
+    const bounds = { fresh: 24 * 3_600_000, recent: 3 * 24 * 3_600_000, stale: 7 * 24 * 3_600_000 }
+    expect(freshnessLevel('2026-08-22', bounds)).toBe('old')
+    expect(formatTimeAgo('2026-08-22', 'en-US')).toBe('7 days ago')
+  })
+
+  it('still honours the offset of a value that carries a time', () => {
+    expect(formatTimeAgo('2026-08-29T13:30:00Z', 'en-US')).toBe('30 minutes ago')
+  })
+
+  it('returns a dash for a missing value', () => {
+    expect(formatTimeAgo(null)).toBe('—')
+  })
+})
+
+describe('safeRedirect', () => {
+  it('keeps a same-origin path with its query string', () => {
+    expect(safeRedirect('/accounts/3?x=1')).toBe('/accounts/3?x=1')
+  })
+
+  it('falls back on empty or absolute URLs', () => {
+    expect(safeRedirect(null)).toBe('/')
+    expect(safeRedirect('')).toBe('/')
+    expect(safeRedirect('https://evil.example/phish')).toBe('/')
+    expect(safeRedirect('accounts')).toBe('/')
+  })
+
+  it('rejects protocol-relative and backslash-normalised host redirects', () => {
+    expect(safeRedirect('//evil.example')).toBe('/')
+    expect(safeRedirect('//evil.example/phish')).toBe('/')
+    expect(safeRedirect('/\\evil.example')).toBe('/')
+  })
+
+  it('honours a custom fallback', () => {
+    expect(safeRedirect('//evil.example', '/settings')).toBe('/settings')
   })
 })

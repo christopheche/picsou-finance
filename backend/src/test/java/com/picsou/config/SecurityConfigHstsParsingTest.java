@@ -13,7 +13,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * {@code HSTS_ENABLED} gates two independent emitters — nginx (via the snippet
@@ -70,8 +69,15 @@ class SecurityConfigHstsParsingTest {
      */
     @Test
     void javaAndShellParsersAcceptExactlyTheSameTokens() throws IOException {
-        Path entrypoint = Path.of("..", "docker", "entrypoint.sh");
-        assumeTrue(Files.exists(entrypoint), "docker/entrypoint.sh not reachable from this module");
+        Path entrypoint = locateEntrypointScript();
+
+        // Deliberately an assertion, not an assumption: a skip is invisible in a green build, and
+        // this is the only thing tying the Bash parser to the Java one. If the file cannot be found
+        // the cross-check has stopped running and that must be loud.
+        assertThat(entrypoint)
+            .as("docker/entrypoint.sh not found walking up from %s — this cross-check must never "
+                + "be skipped, fix the lookup rather than letting it pass silently", searchRoot())
+            .isNotNull();
 
         String script = Files.readString(entrypoint, StandardCharsets.UTF_8);
 
@@ -94,5 +100,26 @@ class SecurityConfigHstsParsingTest {
             .as("docker/entrypoint.sh and SecurityConfig.HSTS_TRUTHY must accept the same tokens, "
                 + "or nginx and Spring Security disagree about whether to send HSTS")
             .isEqualTo(SecurityConfig.HSTS_TRUTHY);
+    }
+
+    /**
+     * Finds {@code docker/entrypoint.sh} by walking up from the module directory instead of
+     * assuming the JVM's working directory is {@code backend/}. Surefire sets {@code basedir} to
+     * the module root; an IDE run or a root-level {@code mvn -f backend/pom.xml test} does not, so
+     * the current directory is the fallback. Returns {@code null} when nothing matches, which the
+     * caller turns into a failure.
+     */
+    private static Path locateEntrypointScript() {
+        for (Path dir = searchRoot(); dir != null; dir = dir.getParent()) {
+            Path candidate = dir.resolve("docker").resolve("entrypoint.sh");
+            if (Files.exists(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static Path searchRoot() {
+        return Path.of(System.getProperty("basedir", "")).toAbsolutePath().normalize();
     }
 }

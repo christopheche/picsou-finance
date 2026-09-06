@@ -12,6 +12,11 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
+    baseline-on-migrate: false
+    # Feature branches number their migrations independently, so a lower version
+    # regularly lands after a higher one has already shipped. Without this,
+    # validate-on-migrate rejects the late arrival and the app refuses to start.
+    out-of-order: true
 ```
 
 **Never** use `ddl-auto: create`, `update`, or `create-drop`. Every schema change requires a new Flyway migration file.
@@ -27,11 +32,14 @@ V{n}__description.sql
 ```
 
 - `V` prefix for versioned migrations.
-- `{n}` is a sequential integer (1, 2, ..., 13 currently).
+- `{n}` is an integer, one higher than the highest version already in the folder
+  (V83 at the time of writing). Numbers are never reused and never renumbered once
+  a migration has shipped — Flyway checksums the file, and a renumbered migration is
+  a boot failure on every instance that already applied it.
 - Double underscore before the description.
 - Description in snake_case.
 
-### Existing migrations (V1-V32)
+### Existing migrations (V1-V83)
 
 | File | Content |
 |------|---------|
@@ -66,8 +74,52 @@ V{n}__description.sql
 | `V30__account_soft_delete.sql` | Soft-delete (`deleted_at`) on `account` |
 | `V31__price_cleanup_gate.sql` | Gate column controlling price-snapshot cleanup |
 | `V32__goal_history_start.sql` | `history_start` column anchoring goal trajectory charts |
+| `V36__transaction_security_name.sql` | `security_name` column on `transaction` |
+| `V37__access_keys.sql` | `access_key` table: scoped keys for the embedded MCP server |
+| `V38__backfill_tr_crypto_transaction_tickers.sql` | Backfill tickers on manual TR on-platform crypto transactions |
+| `V50__account_bank_logo.sql` | `logo_url` on `account` and `requisition` |
+| `V51__requisition_oauth_state.sql` | `oauth_state` nonce + unique index on `requisition` |
+| `V52__fix_negative_loan_balances.sql` | Data fix: LOAN balances stored positive |
+| `V53__transaction_fees.sql` | `fees` column on `transaction` |
+| `V54__wallet_ethereum_to_evm.sql` | Convert ETHEREUM wallets to the EVM fan-out |
+| `V55__wallet_evm_account_name.sql` | Rename the accounts V54 converted |
+| `V56__persistent_session_previous_token.sql` | Grace window for concurrent Remember-Me restores |
+| `V57__ibkr_connection.sql` | `ibkr_connection` table (IBKR Flex Web Service) |
+| `V58__account_cash_balance.sql` | `cash_balance` column on `account` |
+| `V59__bourse_direct_session.sql` | `bourse_direct_session` table |
+| `V60__bourse_direct_integration.sql` | Bourse Direct integration settings |
+| `V61__harden_bourse_direct_sync.sql` | Constraints on the Bourse Direct sync state |
+| `V62__backfill_bourse_direct_valuations.sql` | Backfill EUR valuations for early Bourse Direct holdings |
+| `V63__constrain_bourse_direct_sync_errors.sql` | CHECK bounding the Bourse Direct sync error state |
+| `V64__backfill_trade_republic_valuations.sql` | Backfill `provider_value_eur` on TR holdings |
+| `V66__real_estate_valuation_and_ownership.sql` | `property_valuation`, `account_ownership`, extended `real_estate_metadata` |
+| `V67__real_estate_bathrooms.sql` | `bathrooms` column on `real_estate_metadata` |
+| `V68__widen_requisition_institution_id.sql` | Widen `requisition.institution_id` to VARCHAR(255) |
+| `V69__account_type_employee_savings.sql` | `EMPLOYEE_SAVINGS` account type |
+| `V70__amundi_session.sql` | `amundi_session` table |
+| `V71__degiro_session.sql` | `degiro_session` table |
+| `V73__crypto_exchange_session_optional_secret.sql` | `api_secret` becomes nullable (Meria's single-key auth) |
+| `V74__crypto_exchange_position.sql` | `crypto_exchange_position` table (per-product breakdown) |
+| `V75__account_logo_key.sql` | `logo_key` column on `account` |
+| `V76__account_requisition_link.sql` | `requisition_id` column on `account` |
+| `V77__merge_duplicate_sync_accounts.sql` | Data fix: merge the duplicate synced accounts a missing guard created |
+| `V78__bourso_session.sql` | Rebuild `bourso_session` to the sidecar session shape |
+| `V79__account_type_french_savings.sql` | French regulated passbook account types |
+| `V80__drop_goal_deadline_check.sql` | Drop `chk_goal_deadline` so a past-deadline goal stays writable |
+| `V81__account_deleted_at_timestamptz.sql` | `account.deleted_at` TIMESTAMP → TIMESTAMPTZ |
+| `V82__unique_live_synced_account.sql` | Partial unique index on `(member_id, external_account_id, provider)` |
+| `V83__cleanup_orphan_shared_resources.sql` | Data fix: drop the `shared_resource` rows V77 orphaned |
 
-Note: V8 is absent by design (skipped — never rolled into another migration).
+#### Absent versions
+
+Flyway does not require contiguous versions, and `out-of-order: true` means a number left free
+today can still be taken tomorrow. The gaps are:
+
+| Missing | Why |
+|---------|-----|
+| V8 | Skipped — never written, never rolled into another migration |
+| V33-V35, V39-V49 | Reserved by the 1.1.0 branch, which owns V33-V47 (see the header of `V50__account_bank_logo.sql`); main only ever used V36-V38 out of that range, and numbering resumed at V50 |
+| V65, V72 | Never existed on any branch. The crypto branch's migrations were renumbered around main's own V64 and V71 and landed as V73/V74, leaving these two numbers unused |
 
 ### Writing a new migration
 
@@ -178,3 +230,10 @@ spring.jackson:
 - **Never use `Float` or `Double` for monetary values** — always `BigDecimal` / `NUMERIC(20, 8)`.
 - **Never skip `ON DELETE CASCADE`** on child table FKs unless orphan rows are intentional.
 - **Never use unnamed constraints** — always `CONSTRAINT uk_{table}_{columns}` / `idx_{table}_{columns}`.
+- **Never edit a migration that has shipped** — Flyway checksums the whole file, comments
+  included, and an edit fails validation at startup on every instance that already applied it.
+  Corrections go in a new migration.
+- **Never write a CHECK against `CURRENT_DATE` / `NOW()`** — PostgreSQL re-evaluates a table
+  CHECK on every UPDATE of the row, whatever column changed, so such a constraint silently
+  turns into "this row is frozen" once time moves past it (V2's `chk_goal_deadline`, dropped
+  by V80). A rule about *new* values belongs in Bean Validation on the request DTO.

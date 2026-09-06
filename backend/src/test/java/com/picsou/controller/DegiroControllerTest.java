@@ -40,12 +40,14 @@ class DegiroControllerTest {
 
     private DegiroController controller;
     private ConcurrentHashMap<String, Bucket> authBuckets;
+    private ConcurrentHashMap<String, Bucket> syncBuckets;
     private MockMvc mockMvc;
 
     @BeforeEach
     void setUp() {
         authBuckets = new ConcurrentHashMap<>();
-        controller = new DegiroController(service, userContext, authBuckets);
+        syncBuckets = new ConcurrentHashMap<>();
+        controller = new DegiroController(service, userContext, authBuckets, syncBuckets);
         mockMvc = MockMvcBuilders.standaloneSetup(controller)
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
@@ -142,5 +144,35 @@ class DegiroControllerTest {
 
         controller.clearSession();
         verify(service).clearSession(MEMBER_ID);
+    }
+
+    /**
+     * Every /sync decrypts the stored session and performs a live DEGIRO portfolio fetch from
+     * the instance's IP, so it is throttled like every other sync entry point.
+     */
+    @Test
+    void eleventhSyncFromTheSameIpIsRateLimited() {
+        when(request.getRemoteAddr()).thenReturn("127.0.0.1");
+
+        for (int attempt = 0; attempt < 10; attempt++) {
+            assertThat(controller.sync(request).getStatusCode()).isEqualTo(HttpStatus.OK);
+        }
+
+        assertThat(controller.sync(request).getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        verify(service, times(10)).sync(MEMBER_ID);
+    }
+
+    /** The sync budget is its own: exhausting it must not lock the member out of re-authenticating. */
+    @Test
+    void syncAndAuthenticationDrawOnSeparateBudgets() {
+        when(request.getRemoteAddr()).thenReturn("127.0.0.1");
+        when(service.initiateAuth("user", "password", MEMBER_ID))
+            .thenReturn(new DegiroSyncService.AuthInitResponse("process", true));
+
+        for (int attempt = 0; attempt < 5; attempt++) {
+            controller.initiateAuth(new DegiroController.InitiateAuthRequest("user", "password"), request);
+        }
+
+        assertThat(controller.sync(request).getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 }

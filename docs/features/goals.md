@@ -1,6 +1,6 @@
 # Feature: Goals
 
-> Last updated: 2026-06-02 (month-by-month backfill alongside yearly backfill)
+> Last updated: 2026-09-06 (calendar panel keyed per month; "achieved" counts strictly-past months; goal form surfaces save failures; past-deadline goals stay writable — V80)
 
 ## Context
 
@@ -20,7 +20,7 @@ A `Goal` has a M:N relationship with `Account` via the `goal_account` join table
 - **percentComplete**: `(currentTotal / targetAmount) * 100`, rounded to 4 decimal places.
 - **monthsLeft**: `ChronoUnit.MONTHS.between(today, deadline)`, minimum 0.
 - **monthlyNeeded**: `(target - currentTotal) / monthsLeft`. If deadline has passed, the entire remaining amount is the monthly need.
-- **avgMonthlyContribution**: Average monthly balance increase over the last 3 months across all linked accounts, computed from `BalanceSnapshot` history. **Fallback for manually-tracked goals**: when no linked account has snapshot data (`accountsWithData == 0`), the average is computed from the recorded `GoalManualContribution` entries instead (sum ÷ count), so backfilled manual history refines the figure. Returns `null` only when neither source has data. Displayed in the UI but no longer drives `isOnTrack`.
+- **avgMonthlyContribution**: Average monthly balance increase over the last 3 months, computed from `BalanceSnapshot` history and **summed across linked accounts** (each account's `(last − first) / elapsed months`, added up — two accounts growing 300/month give 600, the goal's real pace). It is compared against the goal-level `monthlyNeeded` (`surplus`, "at current pace" projection), so it must be the goal's pace, not the mean pace of one account. **Fallback for manually-tracked goals**: when no linked account has snapshot data (`accountsWithData == 0`), the average is computed from the recorded `GoalManualContribution` entries instead (sum ÷ count), so backfilled manual history refines the figure. Returns `null` only when neither source has data. Displayed in the UI but no longer drives `isOnTrack`.
 - **isOnTrack**: `Σ effective(past months) >= Σ objective(past months)`. `effective` = `manualActual ?? snapshot-delta` (months with neither are skipped). `objective` = `override ?? monthlyNeeded`. "Past" = strictly before the current month (current month is in progress). Returns `true` when the goal has no `createdAt`, no past month, or no past month with data (benefit of the doubt).
 
 ### Monthly tracking
@@ -28,10 +28,17 @@ A `Goal` has a M:N relationship with `Account` via the `goal_account` join table
 `GoalService.getMonthlyEntries()` generates a month-by-month breakdown from the *effective start month* to the deadline. The effective start is the goal's `createdAt` month, unless `Goal.historyStartMonth` is set to an earlier month (see **History backfill** below). For each month:
 
 - **objective**: The auto-computed `monthlyNeeded`.
-- **actual**: The real balance delta for that month (from snapshots: end-of-month balance minus end-of-previous-month balance). `null` for future months.
+- **actual**: The real balance delta for that month (from snapshots: end-of-month balance minus end-of-previous-month balance). `null` for future months and for months with no snapshot recorded inside them (both lookups are "latest snapshot on or before", so a month without one would otherwise resolve to the same row twice and read as 0 saved — it is unknown, not zero).
 - **manualActual**: A manually entered contribution amount (from `GoalManualContribution`). Takes precedence over computed actual.
 - **override**: A per-month override for the objective (from `GoalMonthOverride`). Stored but tracked alongside the auto-computed value.
-- **effective**: `manualActual` if set, otherwise `actual`.
+- **effective**: `manualActual` if set, otherwise `actual`. Never the override: the same rule applies in every entry writer (`setMonthOverride`, `setManualContribution`, `deleteManualContribution`, `deleteMonthOverride`).
+
+The calendar page measures each month against `override ?? objective` (`frontend/src/features/goals/objective.ts`, `monthObjective`) — the same denominator `isOnTrack` uses — so an override moves the target of the donut/bar/"achieved" count while `effective` stays what was actually saved.
+
+The "achieved x/y" badge counts **strictly past** months (`isStrictlyPast`), the same window
+`isOnTrack` uses: the month in progress still appears in every view (as an ongoing month) but
+never in the badge's denominator, where it would have read as a miss from the 1st of the month
+and contradicted the "on track" badge on the goal card.
 
 ### Overrides and manual contributions
 
@@ -39,6 +46,8 @@ Two separate override mechanisms:
 
 - **GoalMonthOverride**: Overrides the monthly savings *objective* for a specific month. Useful when the user plans to save more or less than the computed target.
 - **GoalManualContribution**: Overrides the monthly savings *actual* for a specific month. Useful when the user wants to track contributions that don't appear in account balances (e.g. cash savings).
+
+Both are keyed by the `{yearMonth}` path variable, stored as-is. `GoalService` validates it as strict `YYYY-MM` (`parseYearMonth`) before any lookup or write and rejects anything else with `IllegalArgumentException` → 400; previously a loose value ("2025-3", "foo") was saved first and only then blew up in `YearMonth.parse`, surfacing as a 500 (`GoalServiceTest.*_malformedMonth_*`).
 
 ### History backfill (before goal creation)
 
@@ -59,7 +68,7 @@ Users often start a goal in Picsou after they've already been saving for it. The
 - `backend/src/main/resources/db/migration/V32__goal_history_start.sql` -- adds the nullable `history_start_month` column
 - `backend/src/main/java/com/picsou/model/GoalMonthOverride.java` -- Per-month objective override (goal_id, yearMonth, amount)
 - `backend/src/main/java/com/picsou/model/GoalManualContribution.java` -- Per-month actual override (goal_id, yearMonth, amount)
-- `backend/src/main/java/com/picsou/repository/GoalRepository.java` -- `findAllWithAccounts()` for eager fetching
+- `backend/src/main/java/com/picsou/repository/GoalRepository.java` -- member-scoped lookups (`findAllByMemberIdOrderByCreatedAtAsc`, `findByIdAndMemberId`, `findByIdInAndMemberId`)
 - `backend/src/main/java/com/picsou/repository/GoalMonthOverrideRepository.java` -- Override lookup by goal + month
 - `backend/src/main/java/com/picsou/repository/GoalManualContributionRepository.java` -- Contribution lookup by goal + month
 - `frontend/src/pages/goals/GoalsPage.tsx` -- Goal list with cards, CRUD dialog, status badges, account chips
@@ -117,21 +126,29 @@ GoalService.setMonthOverride(goalId, yearMonth, amount)
 ## Gotchas / Pitfalls
 
 - **Accounts can belong to multiple goals**: If an account is linked to two goals, its full balance counts toward both goals' `currentTotal`. There is no "partial allocation."
-- **Monthly actual is computed from snapshots, not transactions**: The actual savings for a month is the delta between end-of-month snapshot balances. If snapshots are missing (e.g. new account, no sync), that month will have `null` actual.
-- **Override does not recalculate monthlyNeeded**: Setting a month override changes the display value for that month but does not affect the computed `monthlyNeeded`. The auto-computed objective is always based on `(target - current) / monthsLeft`.
+- **Monthly actual is computed from snapshots, not transactions**: The actual savings for a month is the delta between end-of-month snapshot balances. If snapshots are missing (e.g. new account, no sync, instance offline for the month), that month will have `null` actual and is skipped by `isOnTrack` rather than counted as 0 against a full objective.
+- **"Today" comes from the injected `java.time.Clock`** (`GoalService.today()`, JVM default zone): `monthsLeft`, the 3-month contribution window and the past/current month boundary all derive from it. `GoalServiceTest` pins the clock to a mid-month date so `plusMonths` never clamps — on a month-end day `deadline = today + 3 months` is only 2 whole months away and `monthlyNeeded` jumps.
+- **Override does not recalculate monthlyNeeded**: Setting a month override changes that month's *objective* (the denominator in the calendar and in `isOnTrack`), not the displayed savings and not the computed `monthlyNeeded`. The auto-computed objective (`objective` in the entry) is always based on `(target - current) / monthsLeft`.
 - **Effective-start to deadline range**: `getMonthlyEntries()` iterates from the effective start month (`min(createdAt, historyStartMonth)`) to the deadline month. If the goal was created mid-month, the first month's actual may be partial. Backfilled months (before `createdAt`) never have snapshot data.
-- **`findAllWithAccounts()` uses a custom query**: Goals are fetched with their accounts eagerly loaded to avoid N+1 queries during progress calculation.
+- **A passed deadline keeps the goal fully writable.** V2 declared `CHECK (deadline > CURRENT_DATE)` on `goal`, and PostgreSQL re-evaluates a table CHECK on every UPDATE of the row whatever column changed — so once the deadline was past, `extendHistory` / `extendHistoryByMonth` (which only set `historyStartMonth`) failed with a check violation and the backfill actions returned 500 on exactly the goals they exist for. `V80__drop_goal_deadline_check.sql` drops the constraint; the rule it meant to express — a *new* deadline must be in the future — lives on `@Future GoalRequest.deadline`, which the controller validates on create and on update alike.
+- **The month detail panel is keyed by `yearMonth`.** Its two inputs are seeded by lazy `useState` initializers (the [key-remount pattern](../conventions/frontend.md)), which only run at mount. Without `key={selectedEntry.yearMonth}` the desktop side panel is one long-lived instance, so selecting another month kept the previously typed amounts on screen and "Save override" / "Save manual" wrote them against the newly selected month.
 - **Account membership is member-scoped (IDOR guard)**: `create`/`update` resolve `accountIds` via `accountRepository.findByIdInAndMemberId(...)`, never the inherited `findAllById`. A caller can only attach accounts they own; a foreign/nonexistent id fails the size check with a generic 400. Do **not** revert this to `findAllById` — that re-opens a cross-member balance-disclosure IDOR (security audit 2026-06-27, CWE-639).
 
 ## Tests
 
-- `GoalServiceTest` -- unit tests for progress calculation, monthly entries, overrides, edge cases (deadline passed, no history)
+- `GoalDeadlineCheckMigrationTest` -- V80: the constraint is gone and a goal whose deadline has
+  passed still accepts the extend-history write (Testcontainers, skipped without Docker).
+- `GoalServiceTest` -- unit tests for progress calculation, monthly entries, override/manual-contribution writers (member scoping, upsert, override-vs-effective semantics), multi-account pace, months without snapshots, edge cases (deadline passed, no history). Runs on a fixed `Clock`.
+- `frontend/src/features/goals/objective.test.ts` -- `monthObjective` (override as denominator)
+- `frontend/src/pages/goals/GoalCalendarPage.test.tsx` -- selecting another month reloads the panel inputs from that month (the key-remount above), and the "achieved" badge counts only strictly-past months
+- `frontend/src/pages/goals/GoalsPage.test.tsx` -- a rejected create keeps the dialog open and shows the backend reason; a successful one closes it
 
 ## Frontend notes
 
 - **Account chips** use `<Badge variant="secondary">` — theme-aware, no per-account color. The `ACCOUNT_COLORS` palette is still used elsewhere (ColorPicker, DistributionPie, AccountCard, FinaryTab) but not in goal cards.
 - **Status badges**: achieved/on track use `variant="default"` (primary), behind uses `variant="destructive"`, waiting uses `variant="secondary"`.
-- **Calendar badges**: "manu." uses `variant="secondary"`, "modif." uses `variant="outline"` — no raw Tailwind color overrides.
+- **Calendar badges**: the "manual" badge uses `variant="secondary"`, the "modified" one `variant="outline"` — no raw Tailwind color overrides. Their labels, and the objective caption in the year grid and calendar grid, are translated (`goals.manualShort`, `goals.modifiedShort`, `goals.objectiveShort`); they used to be the hardcoded French `manu.` / `modif.` / `obj.`. The `€` adornment on the panel inputs stays literal: every goal figure is in EUR (`CurrencyDisplay` defaults to it), and a currency symbol is not a translatable string.
+- **Save failures are shown, never swallowed**: the goal dialog wraps `mutateAsync` in a `try/catch` and renders `formatApiError(err, t)` in a `role="alert"` line above the footer, keeping the dialog open. The calendar's not-found state goes through `formatApiError` too and retries with the query's `refetch` — never `error.message` (raw axios text) and never the non-existent `common.notFound` key.
 - **Icons**: `TrendingUp`/`TrendingDown` come from `lucide-react` (not HugeIcons) in the goals pages.
 - **Goal detail chart**: `GoalDetailModal` reuses the shared `NetWorthChart` with the optional `target`, `projection`, and `todayMs` props. The chart draws:
   - A dashed `var(--chart-3)` ideal trajectory from `(goal.createdAt, balanceAtCreation)` to `(goal.deadline, goal.targetAmount)`, where `balanceAtCreation` is the first history point at or after `goal.createdAt`. Using the baseline (not zero) keeps the trajectory in the same reference frame as the live area, so the visual matches the "behind/on track" badge.

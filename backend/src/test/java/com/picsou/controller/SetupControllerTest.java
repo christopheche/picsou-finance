@@ -3,11 +3,13 @@ package com.picsou.controller;
 import com.picsou.dto.BoursoBankHealthResponse;
 import com.picsou.dto.CryptoKeyGenerateResponse;
 import com.picsou.dto.EnableBankingConfigRequest;
+import com.picsou.dto.EnableBankingImportRequest;
 import com.picsou.dto.EnableBankingKeypairResponse;
 import com.picsou.dto.EnableBankingTestResponse;
 import com.picsou.dto.SetupAdminRequest;
 import com.picsou.dto.SetupAdminResponse;
 import com.picsou.dto.SetupSecurityRequest;
+import com.picsou.exception.InvalidKeyMaterialException;
 import com.picsou.model.AppUser;
 import com.picsou.model.FamilyMember;
 import com.picsou.service.CryptoKeyGeneratorService;
@@ -172,15 +174,40 @@ class SetupControllerTest {
     }
 
     @Test
-    void boursoBankHealth_enablesIntegration_onSuccess() {
+    void testBoursoBank_enablesIntegration_onSuccess() {
         when(healthService.checkBoursoBankSidecar()).thenReturn(
             new BoursoBankHealthResponse(true, "http://bourso-auth:8001", null));
 
         ResponseEntity<BoursoBankHealthResponse> response =
-            controller.boursoBankHealth(request("10.0.0.1"));
+            controller.testBoursoBank(request("10.0.0.1"));
 
         assertThat(response.getBody().ok()).isTrue();
         verify(integrationsService).enable("boursobank");
+    }
+
+    @Test
+    void testBoursoBank_isAPostAction_notAGet() throws Exception {
+        // It enables the integration and writes an audit row, so it must not be reachable
+        // through a link, a prefetch or a monitoring GET on this permitAll route.
+        var method = SetupController.class.getMethod("testBoursoBank", HttpServletRequest.class);
+
+        assertThat(method.getAnnotation(org.springframework.web.bind.annotation.PostMapping.class))
+            .isNotNull()
+            .extracting(org.springframework.web.bind.annotation.PostMapping::value)
+            .isEqualTo(new String[] {"/integrations/boursobank/test"});
+        assertThat(method.getAnnotation(org.springframework.web.bind.annotation.GetMapping.class)).isNull();
+    }
+
+    @Test
+    void importPrivateKey_invalid_propagatesToTheGlobalHandler() {
+        // No try/catch in the controller (error-handling.md): InvalidKeyMaterialException
+        // reaches GlobalExceptionHandler, which maps it to 422.
+        when(keyPairService.importPrivateKey("bad"))
+            .thenThrow(new InvalidKeyMaterialException("Not a valid PKCS#8 private key PEM."));
+
+        assertThatThrownBy(() -> controller.importEnableBankingPrivateKey(
+                new EnableBankingImportRequest("bad"), request("10.0.0.1")))
+            .isInstanceOf(InvalidKeyMaterialException.class);
     }
 
     @Test

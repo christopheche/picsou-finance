@@ -59,6 +59,8 @@ public class DegiroSyncService {
     private static final String EXTERNAL_ACCOUNT_ID = "degiro-portfolio";
     private static final String PROVIDER = "DEGIRO";
     private static final String COLOR = "#f97316";
+    /** {@code last_error} marker for a post-auth sync that failed while the session stayed usable. */
+    private static final String INITIAL_SYNC_FAILED = "INITIAL_SYNC_FAILED";
 
     private final DegiroPort               degiroPort;
     private final DegiroSessionRepository  sessionRepository;
@@ -135,8 +137,18 @@ public class DegiroSyncService {
             log.warn("DEGIRO session expired during the initial sync for member {} — marking REAUTH_REQUIRED", memberId);
             session.setStatus(DegiroSessionStatus.REAUTH_REQUIRED);
             session.setLastError("SESSION_EXPIRED");
-        } catch (Exception ex) {
+        } catch (SyncException ex) {
+            // Expected upstream flakiness (sidecar down, DEGIRO refusing the portfolio call).
+            // The session itself is valid, so it stays ACTIVE rather than sending the user
+            // back through TOTP; the failure is recorded on the row and resurfaces, with its
+            // real message, the moment they click Sync.
             log.warn("DEGIRO initial sync after auth failed for member {}: {}", memberId, ex.getMessage());
+            session.setLastError(INITIAL_SYNC_FAILED);
+        } catch (RuntimeException ex) {
+            // Anything else is a bug, and this is the only place the failure is visible: the
+            // user is told "connected" and the message alone is "null" for an NPE.
+            log.error("DEGIRO initial sync after auth failed unexpectedly for member {}", memberId, ex);
+            session.setLastError(INITIAL_SYNC_FAILED);
         }
 
         return getSessionStatus(memberId);
@@ -212,6 +224,7 @@ public class DegiroSyncService {
 
     private AccountResponse upsertAccount(DegiroPortfolioData data, Long memberId) {
         Map<String, HoldingDedup.HoldingAgg> deduped = new HashMap<>();
+        BigDecimal unresolvedValueEur = BigDecimal.ZERO;
         for (DegiroPosition p : data.positions()) {
             String ticker;
             String name = p.name();
@@ -221,6 +234,20 @@ public class DegiroSyncService {
                 if (resolved.name() != null) name = resolved.name();
             } else {
                 ticker = p.symbol();
+            }
+            if (ticker == null || ticker.isBlank()) {
+                // No ISIN and no symbol: nothing to key a holding on. Merging such positions
+                // under an empty ticker VWAP-blended unrelated instruments into one bogus row
+                // (the account page then showed the last one's name with everyone's quantity).
+                // Skip the holding, but keep DEGIRO's own valuation of the line in the account
+                // total below — that money is real, and dropping it would understate the
+                // balance and the day's snapshot.
+                BigDecimal value = p.quantity() != null && p.currentPrice() != null
+                    ? p.quantity().multiply(p.currentPrice()) : BigDecimal.ZERO;
+                unresolvedValueEur = unresolvedValueEur.add(value);
+                log.warn("DEGIRO: position '{}' has neither ISIN nor symbol -- counted in the "
+                    + "balance ({} EUR) but not persisted as a holding", p.name(), value);
+                continue;
             }
             deduped.merge(
                 ticker,
@@ -236,10 +263,22 @@ public class DegiroSyncService {
             .filter(agg -> agg.quantity().signum() != 0)
             .map(agg -> agg.quantity().multiply(agg.currentPrice() != null ? agg.currentPrice() : BigDecimal.ZERO))
             .reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal totalValueEur = data.cashEur().add(positionsValueEur);
+        BigDecimal totalValueEur = data.cashEur().add(positionsValueEur).add(unresolvedValueEur);
 
         Optional<Account> existing =
             accountRepository.findByExternalAccountIdAndMemberId(EXTERNAL_ACCOUNT_ID, memberId);
+
+        // Same guard as every other connector (see the account-deletion ADR): a soft-deleted
+        // account is the user's decision, and rebuilding it here would leave two rows sharing
+        // one external id, each with part of the history. Deleting the account clears the
+        // DEGIRO session with it, so reaching this means a sync raced the deletion.
+        if (existing.isEmpty()
+            && accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId(EXTERNAL_ACCOUNT_ID, memberId)) {
+            log.info("DEGIRO: account {} was soft-deleted for member {}, refusing to rebuild it",
+                EXTERNAL_ACCOUNT_ID, memberId);
+            throw new SyncException("This account's history was deleted. Disconnect DEGIRO from the "
+                + "Sync page to stop syncing it.");
+        }
 
         Account account;
         if (existing.isPresent()) {

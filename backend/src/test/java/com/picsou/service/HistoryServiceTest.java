@@ -7,6 +7,7 @@ import com.picsou.exception.ResourceNotFoundException;
 import com.picsou.model.Account;
 import com.picsou.model.AccountHolding;
 import com.picsou.model.AccountType;
+import com.picsou.model.BalanceSnapshot;
 import com.picsou.model.FamilyMember;
 import com.picsou.model.PriceSnapshot;
 import com.picsou.repository.AccountHoldingRepository;
@@ -16,14 +17,20 @@ import com.picsou.repository.PriceSnapshotRepository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.BeforeEach;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -32,6 +39,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -46,7 +55,21 @@ class HistoryServiceTest {
 
     @Mock AccountAccessResolver accessResolver;
 
-    @InjectMocks HistoryService historyService;
+    /**
+     * The intraday grid is built from this instant in UTC, so the hourly points a test asserts
+     * on are fixed rather than "whatever the machine's clock and default zone happen to be".
+     */
+    private static final Instant NOW = Instant.parse("2026-09-05T16:30:00Z");
+
+    private HistoryService historyService;
+
+    @BeforeEach
+    void buildService() {
+        historyService = new HistoryService(
+            accountRepository, snapshotRepository, holdingRepository, priceService,
+            priceSnapshotRepository, accountService, accessResolver,
+            Clock.fixed(NOW, ZoneOffset.UTC));
+    }
 
     @BeforeEach
     void stubOwnershipShares() {
@@ -151,6 +174,30 @@ class HistoryServiceTest {
         assertThat(todayPoint.date()).isEqualTo(today);
         assertThat(todayPoint.total()).isEqualByComparingTo("5100");
         assertThat(todayPoint.invested()).isEqualByComparingTo("4800");
+    }
+
+    @Test
+    void buildHistory_livePoint_foreignCurrencyCashAccount_hasZeroPnl() {
+        // valuation() hands back the EUR value as the cost basis of a holdings-less account,
+        // whatever unit its balance is kept in (AccountServiceTest pins that). The live point
+        // takes both halves from that one record, so a 1000 USD account prints a zero P&L --
+        // not the FX delta, which is what pairing an EUR value with the raw balance produced.
+        Account usdCash = Account.builder()
+            .id(2L).name("USD Cash").type(AccountType.CHECKING).currency("USD")
+            .currentBalance(new BigDecimal("1000")).color("#3b82f6").member(MEMBER).build();
+
+        when(accountRepository.findAllById(List.of(2L))).thenReturn(List.of(usdCash));
+        when(snapshotRepository.findForwardFillDataByAccountIds(any(LocalDate.class), eq(List.of(2L))))
+            .thenReturn(List.of());
+        stubValuation(usdCash, "920", "920");
+
+        List<NetWorthPoint> result = historyService.buildHistory(List.of(2L), 1, true, MEMBER_ID);
+
+        NetWorthPoint todayPoint = result.get(result.size() - 1);
+        assertThat(todayPoint.total()).isEqualByComparingTo("920");
+        assertThat(todayPoint.invested()).isEqualByComparingTo("920");
+        assertThat(todayPoint.pnl()).isEqualByComparingTo("0");
+        assertThat(todayPoint.accounts().get(2L).pnl()).isEqualByComparingTo("0");
     }
 
     @Test
@@ -309,6 +356,14 @@ class HistoryServiceTest {
 
     // ─── buildPnl characterization ────────────────────────────────────────────
 
+    private static PriceService.Quote quote(String price) {
+        return new PriceService.Quote(new BigDecimal(price), LocalDate.now(), true);
+    }
+
+    private static Map<String, PriceService.Quote> quotes(String ticker, String price) {
+        return Map.of(ticker, quote(price));
+    }
+
     private static Account loan(long id, String balance) {
         return Account.builder()
             .id(id).name("Loan").type(AccountType.LOAN).currency("EUR")
@@ -369,6 +424,7 @@ class HistoryServiceTest {
         when(accountRepository.findAllById(List.of(1L))).thenReturn(List.of(brokerageAcc));
         when(holdingRepository.findByAccount_Id(1L)).thenReturn(List.of(holding));
         stubValuation(brokerageAcc, "5100", "4800");
+        when(priceService.getQuotes(Set.of("AAPL"))).thenReturn(quotes("AAPL", "510"));
         when(priceSnapshotRepository.findLatestByTickerBeforeOrOnDate("AAPL", fromDate))
             .thenReturn(Optional.empty());
 
@@ -400,7 +456,7 @@ class HistoryServiceTest {
         when(priceSnapshotRepository.findLatestByTickerBeforeOrOnDate("AAPL", fromDate))
             .thenReturn(Optional.of(PriceSnapshot.builder()
                 .ticker("AAPL").date(fromDate).priceEur(new BigDecimal("90")).build()));
-        when(priceService.getPriceEur("AAPL")).thenReturn(new BigDecimal("510"));
+        when(priceService.getQuotes(Set.of("AAPL"))).thenReturn(quotes("AAPL", "510"));
 
         PnlResponse result = historyService.buildPnl(List.of(1L, 2L), MEMBER_ID, fromDate);
 
@@ -431,7 +487,9 @@ class HistoryServiceTest {
         // MSFT has NO snapshot at fromDate → excluded from BOTH sides of the range.
         when(priceSnapshotRepository.findLatestByTickerBeforeOrOnDate("MSFT", fromDate))
             .thenReturn(Optional.empty());
-        when(priceService.getPriceEur("AAPL")).thenReturn(new BigDecimal("510"));
+        // Both are priced live; only AAPL has a snapshot at fromDate.
+        when(priceService.getQuotes(Set.of("AAPL", "MSFT")))
+            .thenReturn(Map.of("AAPL", quote("510"), "MSFT", quote("640")));
 
         PnlResponse result = historyService.buildPnl(List.of(1L), MEMBER_ID, fromDate);
 
@@ -466,6 +524,209 @@ class HistoryServiceTest {
     }
 
     // ─── buildIntradayHistory characterization ────────────────────────────────
+
+    /**
+     * #77/#22: a CRYPTO account is resolved crypto-only, exactly as {@code AccountService.quotesFor}
+     * does. Dozens of coins share a symbol with a listed equity (STX/Seagate here), and the generic
+     * route valued the coin at that company's share price on the live side while
+     * {@code price_snapshot} — keyed by ticker alone — supplied the equity's price on the historical
+     * side, so the range P&L reported the stock's move for a Stacks position.
+     */
+    @Test
+    void buildPnl_cryptoAccount_isPricedCryptoOnly_andNeverReachesThePriceSnapshotFallback() {
+        LocalDate fromDate = LocalDate.now().minusDays(30);
+        Account exchange = Account.builder()
+            .id(1L).name("Kraken").type(AccountType.CRYPTO).currency("EUR")
+            .currentBalance(new BigDecimal("0")).color("#f59e0b").member(MEMBER).build();
+        Account brokerageAcc = brokerage(2L, "CT");
+        AccountHolding coin = AccountHolding.builder()
+            .id(11L).account(exchange).ticker("STX")
+            .quantity(new BigDecimal("500")).averageBuyIn(new BigDecimal("1")).build();
+        AccountHolding share = AccountHolding.builder()
+            .id(12L).account(brokerageAcc).ticker("AAPL")
+            .quantity(new BigDecimal("10")).averageBuyIn(new BigDecimal("100")).build();
+
+        when(accountRepository.findAllById(List.of(1L, 2L))).thenReturn(List.of(exchange, brokerageAcc));
+        when(holdingRepository.findByAccount_Id(1L)).thenReturn(List.of(coin));
+        when(holdingRepository.findByAccount_Id(2L)).thenReturn(List.of(share));
+        stubValuation(exchange, "0", "0");
+        stubValuation(brokerageAcc, "5100", "4800");
+        // CoinGecko maps neither, so the crypto-only route resolves nothing for STX.
+        when(priceService.getCryptoQuotes(Set.of("STX"))).thenReturn(Map.of());
+        when(priceService.getQuotes(Set.of("AAPL"))).thenReturn(quotes("AAPL", "510"));
+        when(priceSnapshotRepository.findLatestByTickerBeforeOrOnDate("AAPL", fromDate))
+            .thenReturn(Optional.of(PriceSnapshot.builder()
+                .ticker("AAPL").date(fromDate).priceEur(new BigDecimal("90")).build()));
+
+        PnlResponse result = historyService.buildPnl(List.of(1L, 2L), MEMBER_ID, fromDate);
+
+        // Only AAPL is in the range: 10 × 510 − 10 × 90 = 4200. The coin contributes nothing.
+        assertThat(result.valueAtFrom()).isEqualByComparingTo("900");
+        assertThat(result.rangePnl()).isEqualByComparingTo("4200");
+        // Never the generic route, and never a per-ticker lookup, for a coin.
+        verify(priceService, never()).getPriceEur(any());
+        verify(priceService, never()).getQuote(any());
+        // And its symbol is never looked up in the ticker-keyed snapshot table either: any row
+        // there for "STX" belongs to the equity.
+        verify(priceSnapshotRepository, never()).findLatestByTickerBeforeOrOnDate(eq("STX"), any());
+    }
+
+    /**
+     * #23: cash sitting inside a PEA/CTO is part of the account's value and of its cost basis
+     * ({@code AccountService.valuation} starts both from it). Leaving it out of the hourly series
+     * sat the whole 24H chart below the daily chart's today point by the cash amount.
+     */
+    @Test
+    void buildIntradayHistory_brokerageCash_countsInEveryPointAndInInvested() {
+        Account cto = Account.builder()
+            .id(1L).name("CTO").type(AccountType.COMPTE_TITRES).currency("EUR")
+            .currentBalance(new BigDecimal("3000")).cashBalance(new BigDecimal("2000"))
+            .color("#6366f1").member(MEMBER).build();
+        AccountHolding etf = AccountHolding.builder()
+            .id(11L).account(cto).ticker("CW8")
+            .quantity(new BigDecimal("10")).averageBuyIn(new BigDecimal("90")).build();
+
+        when(accountRepository.findAllById(List.of(1L))).thenReturn(List.of(cto));
+        when(holdingRepository.findByAccount_Id(1L)).thenReturn(List.of(etf));
+        when(priceService.toEur(new BigDecimal("90"), "EUR", null)).thenReturn(new BigDecimal("90"));
+        when(priceService.getIntradayPricesEur(eq("CW8"), any(LocalDateTime.class), any(LocalDateTime.class)))
+            .thenReturn(Map.of(utc("2026-09-04T15:00:00Z"), new BigDecimal("100")));
+
+        List<NetWorthIntradayPoint> result = historyService.buildIntradayHistory(List.of(1L), MEMBER_ID);
+
+        // Every point from 15:00 on: 2000 cash + 10 × 100. Cost basis: 2000 cash + 10 × 90.
+        assertThat(result).isNotEmpty();
+        assertThat(result.getLast().total()).isEqualByComparingTo("3000");
+        assertThat(result.getLast().invested()).isEqualByComparingTo("2900");
+    }
+
+    /**
+     * #23: a connector that reports only its own EUR figures (Trade Republic, Bourse Direct) leaves
+     * {@code averageBuyIn} empty; the cost basis is then {@code providerValueEur − providerPnlEur},
+     * the same rule {@code AccountService.valuation} applies. Reading {@code averageBuyIn} alone
+     * made those accounts contribute a zero cost basis to the 24H series.
+     */
+    @Test
+    void buildIntradayHistory_providerCostBasis_usedWhenAverageBuyInIsAbsent() {
+        Account cto = brokerage(1L, "TR");
+        AccountHolding position = AccountHolding.builder()
+            .id(11L).account(cto).ticker("CW8")
+            .quantity(new BigDecimal("10"))
+            .providerValueEur(new BigDecimal("1000")).providerPnlEur(new BigDecimal("100"))
+            .build();
+
+        when(accountRepository.findAllById(List.of(1L))).thenReturn(List.of(cto));
+        when(holdingRepository.findByAccount_Id(1L)).thenReturn(List.of(position));
+        when(priceService.getIntradayPricesEur(eq("CW8"), any(LocalDateTime.class), any(LocalDateTime.class)))
+            .thenReturn(Map.of(utc("2026-09-04T15:00:00Z"), new BigDecimal("100")));
+
+        List<NetWorthIntradayPoint> result = historyService.buildIntradayHistory(List.of(1L), MEMBER_ID);
+
+        // 1000 − 100 = 900, not 0.
+        assertThat(result.getLast().invested()).isEqualByComparingTo("900");
+    }
+
+    /**
+     * #79/#121: the hourly grid and both providers' series live in one zone, UTC. The grid used to
+     * come from {@code LocalDateTime.now()} (the JVM default, UTC in the container) while Yahoo
+     * keyed its bars in Europe/Paris and CoinGecko in UTC, so on every point the stock leg was
+     * valued at a close one or two hours older than the crypto leg — and the freshest bars of the
+     * trading day fell after {@code now} and were dropped.
+     */
+    @Test
+    void buildIntradayHistory_stockAndCryptoBarsForTheSameInstant_landOnTheSameHourlyPoint() {
+        Account cto = brokerage(1L, "CT");
+        Account exchange = Account.builder()
+            .id(2L).name("Kraken").type(AccountType.CRYPTO).currency("EUR")
+            .currentBalance(new BigDecimal("0")).color("#f59e0b").member(MEMBER).build();
+        AccountHolding stock = AccountHolding.builder()
+            .id(11L).account(cto).ticker("AAPL")
+            .quantity(new BigDecimal("1")).averageBuyIn(new BigDecimal("100")).build();
+        AccountHolding coin = AccountHolding.builder()
+            .id(12L).account(exchange).ticker("BTC")
+            .quantity(new BigDecimal("1")).averageBuyIn(new BigDecimal("20000")).build();
+
+        when(accountRepository.findAllById(List.of(1L, 2L))).thenReturn(List.of(cto, exchange));
+        when(holdingRepository.findByAccount_Id(1L)).thenReturn(List.of(stock));
+        when(holdingRepository.findByAccount_Id(2L)).thenReturn(List.of(coin));
+        when(priceService.toEur(new BigDecimal("100"), "EUR", null)).thenReturn(new BigDecimal("100"));
+        when(priceService.toEur(new BigDecimal("20000"), "EUR", null)).thenReturn(new BigDecimal("20000"));
+        // The last bar of both series is the same instant, 16:00 UTC — the hour the fixed clock
+        // (16:30 UTC) sits in. Both must reach the final grid point.
+        when(priceService.getIntradayPricesEur(eq("AAPL"), any(LocalDateTime.class), any(LocalDateTime.class)))
+            .thenReturn(new TreeMap<>(Map.of(
+                utc("2026-09-05T15:00:00Z"), new BigDecimal("200"),
+                utc("2026-09-05T16:00:00Z"), new BigDecimal("300"))));
+        when(priceService.getIntradayPricesEur(eq("BTC"), any(LocalDateTime.class), any(LocalDateTime.class)))
+            .thenReturn(new TreeMap<>(Map.of(
+                utc("2026-09-05T15:00:00Z"), new BigDecimal("50000"),
+                utc("2026-09-05T16:00:00Z"), new BigDecimal("60000"))));
+
+        List<NetWorthIntradayPoint> result = historyService.buildIntradayHistory(List.of(1L, 2L), MEMBER_ID);
+
+        NetWorthIntradayPoint last = result.getLast();
+        // The grid is UTC and the points are instants, so the last one is 16:00Z, not 16:00 in
+        // whatever zone the machine running this test happens to be in.
+        assertThat(last.timestamp()).isEqualTo(Instant.parse("2026-09-05T16:00:00Z"));
+        // Both 16:00Z bars are used: 300 + 60000. A Paris-keyed stock series would have left the
+        // stock leg on its 14:00Z close (200) here.
+        assertThat(last.total()).isEqualByComparingTo("60300");
+    }
+
+    /**
+     * #24: an account whose only snapshot predates the window contributed 0 to the first points
+     * (there was no row for {@code floorEntry} to find), and since the frontend reads a range's
+     * trend as {@code last − first}, that dip was reported as a gain.
+     */
+    @Test
+    void buildHistory_forwardFill_seedsAnAccountWhoseOnlySnapshotPrecedesTheWindow() {
+        LocalDate today = LocalDate.now();
+        LocalDate from = today.minusMonths(1);
+        Account crypto = Account.builder()
+            .id(1L).name("Kraken").type(AccountType.CRYPTO).currency("EUR")
+            .currentBalance(new BigDecimal("10000")).color("#f59e0b").member(MEMBER).build();
+        Account checking = checking(2L, "5000");
+
+        when(accountRepository.findAllById(List.of(1L, 2L))).thenReturn(List.of(crypto, checking));
+        when(snapshotRepository.findForwardFillDataByAccountIds(any(LocalDate.class), eq(List.of(1L, 2L))))
+            // The daily job could price nothing for the crypto account that morning, so it wrote
+            // no row inside the window; only the checking account has one.
+            .thenReturn(List.<Object[]>of(
+                new Object[]{2L, today.minusDays(20), new BigDecimal("5000"), new BigDecimal("5000")}
+            ));
+        when(snapshotRepository.findFirstByAccountIdAndDateLessThanEqualOrderByDateDesc(eq(1L), any(LocalDate.class)))
+            .thenReturn(Optional.of(BalanceSnapshot.builder()
+                .account(crypto).date(from.minusDays(3))
+                .balance(new BigDecimal("10000")).investedAmount(new BigDecimal("9000")).build()));
+        stubValuationLenient(crypto, "10000", "9000");
+        stubValuationLenient(checking, "5000", "5000");
+
+        List<NetWorthPoint> result = historyService.buildHistory(List.of(1L, 2L), 1, false, MEMBER_ID);
+
+        NetWorthPoint first = result.getFirst();
+        assertThat(first.date()).isEqualTo(today.minusDays(20));
+        // 5000 checking + 10000 carried forward from the pre-window snapshot, not 5000 alone.
+        assertThat(first.total()).isEqualByComparingTo("15000");
+        assertThat(first.invested()).isEqualByComparingTo("14000");
+        // The seed is a lookup key, not a chart date: it must not add a point of its own.
+        assertThat(result).noneMatch(p -> p.date().isBefore(today.minusDays(20)));
+    }
+
+    /**
+     * #82: {@code HistoryService} must not be transactional at class level. Its intraday path is a
+     * sequential loop of provider HTTP calls with a 15 s timeout each, and a class-level
+     * transaction pinned one of the ten pooled connections for the whole loop.
+     */
+    @Test
+    void historyService_isNotTransactional_soProviderCallsDoNotPinAConnection() {
+        assertThat(HistoryService.class.getAnnotation(
+            org.springframework.transaction.annotation.Transactional.class)).isNull();
+    }
+
+    /** A UTC wall-clock key, the shape both intraday providers hand back. */
+    private static LocalDateTime utc(String instant) {
+        return LocalDateTime.ofInstant(Instant.parse(instant), ZoneOffset.UTC);
+    }
 
     @Test
     void buildIntradayHistory_loanNegated_cashConstant() {

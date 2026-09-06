@@ -30,6 +30,8 @@ When an admin switches to a managed profile in the UI, the frontend sends `?memb
 
 Non-admin users always use their own memberId (override is ignored server-side, and the client no longer sends it).
 
+`UserContext.currentMember()` — the entity accessor the create paths hand to `AccountService.create` / `GoalService.create` — resolves the **same** override (loading the target `FamilyMember` when it is not the admin's own), so an account or goal added while impersonating lands under the impersonated profile and can attach that profile's accounts. `UserContext.ownMemberId()` is the one accessor that never honours it, for resources bound to the login rather than to the profile being viewed (access-keys — see [mcp-server.md](./mcp-server.md)).
+
 ### Client-state isolation across the login boundary
 
 `profile-store` persists `activeMemberId` to **localStorage** (`picsou-profile`) and the TanStack Query cache holds user-agnostic keys (`['dashboard', range]`, `['accounts']`, …). On a **shared family browser** both survive a logout, so without an explicit reset the next person's login would carry the previous user's impersonation target and see their cached balance/history (staleTime is 60 s).
@@ -97,6 +99,18 @@ switch into their profile and browse their data:
   the UI. Non-admin and demo sessions do not call `/family/members`; they keep
   the simple Settings account link. Independent members remain listed in Family
   settings and on the family dashboard.
+- **Frontend (self-heal of a stale target):** `activeMemberId` is persisted in
+  localStorage and only cleared at login/logout, so an admin who had a managed member
+  selected when that member activated used to be locked out — every page load fired a
+  GET with `?memberId=X`, got the 403 above, and the global GET-403 redirect sent the
+  browser to `/error/403` before the sidebar switcher (the only in-app way to clear the
+  target) could render. The response interceptor in `frontend/src/lib/api-client.ts`
+  now recognises that case (admin, GET, `params.memberId === activeMemberId`, first
+  attempt): it calls `useProfileStore.getState().reset()`, strips `memberId` from the
+  config and replays the request once under the admin's own scope; a second 403 falls
+  through to the normal `/error/403` redirect. Mutations are deliberately excluded —
+  replaying a write under another member would silently store data on the wrong
+  profile — so a stale target on a POST/PUT surfaces as the usual error toast.
 
 This is an automatic confidentiality guarantee, not a toggle. **Voluntary sharing is
 unaffected** — anything an independent member chooses to share via `SharingSettings`
@@ -113,10 +127,16 @@ sets a new password. The current `passwordHash` is **not** cleared — the old
 credential keeps working until the user actually completes the reset, so a
 mistakenly-issued reset link does not lock anyone out. Distinct from
 `POST /members/{id}/activate`, which deliberately rejects already-activated
-users (`FamilyService.generateActivationToken` line 92).
+users (`FamilyService.generateActivationToken`).
 
 `FamilyMemberResponse` now exposes `loginName` (= `AppUser.username` or `null`)
 so the admin UI can show both the display name and the login side-by-side.
+
+Member bodies are bean-validated so a bad value is a 422, not a constraint violation
+at write time: `POST /members` takes `FamilyMemberRequest` (`displayName` ≤ 100,
+`avatarColor` a `#rrggbb` hex or absent — the column is `VARCHAR(7)`), and
+`PUT /members/{id}` takes `FamilyMemberUpdateRequest` (`displayName` ≤ 100), no longer
+a raw map.
 
 ### Member deletion
 
@@ -150,8 +170,9 @@ persist a member + linked `AppUser`, flush, and assert `deleteMember` succeeds �
 reproducing `TransientObjectException` on the pre-fix code. That isn't feasible
 here: the schema is PostgreSQL-specific (`TIMESTAMPTZ`, native enum types, Flyway
 `ON DELETE CASCADE`) and does not replay on the H2 in-memory database used for
-tests, and the project deliberately avoids Testcontainers (see
-`docs/conventions/testing.md`) — every test is a Mockito unit test. The regression
+tests, and Testcontainers is reserved for data-mutating migrations, the schema↔entity
+check and ORM behaviour a mock cannot show (see `docs/conventions/testing.md`) — a
+flush-ordering guard does not justify a container. The regression
 is therefore guarded by `FamilyServiceTest.deleteMember_withLogin_deletesUserBeforeMember`,
 which uses Mockito `InOrder` to assert `userRepository.delete(user)` is invoked
 **before** `memberRepository.delete(member)`. It cannot reproduce the flush
@@ -200,7 +221,7 @@ Step 3 is critical: without it, the next request would fail because the old JWT 
 - `backend/src/main/java/com/picsou/controller/AuthController.java` — `/api/auth/activate/{token}`
 
 **Frontend:**
-- `frontend/src/stores/profile-store.ts` — `activeMemberId`, `viewMode` (own/managed/family)
+- `frontend/src/stores/profile-store.ts` — `activeMemberId` (persisted impersonation target; `null` = own profile)
 - `frontend/src/features/family/hooks.ts` — TanStack Query hooks for members, sharing, dashboard
 - `frontend/src/features/family/api.ts` — API functions
 - `frontend/src/features/family/members.ts` — `selectSwitchableMembers()` helper used by the admin switcher; excludes independent members
@@ -210,9 +231,17 @@ Step 3 is critical: without it, the next request would fail because the old JWT 
 - `frontend/src/features/auth/hooks.ts` — `useLogout` calls `resetClientState` (logout side)
 - `frontend/src/features/mfa/hooks.ts` — `useLoginWithRememberMe` / `useVerifyMfa` call `resetClientState` before writing the new identity (login side)
 - `frontend/src/pages/settings/FamilySettingsPage.tsx` — member management + sharing config UI
-- `frontend/src/pages/family/FamilyDashboardPage.tsx` — shared overview
-- `frontend/src/pages/activation/ActivationPage.tsx` — activation flow for new members
-- `frontend/src/pages/settings/SettingsPage.tsx` — username edit inline (pencil → input → save)
+- `frontend/src/pages/family/FamilyDashboardPage.tsx` — shared overview. Renders
+  `ErrorState` + retry when the query fails (a network error has no response, so the
+  global 5xx redirect never fires and `data` is simply undefined); a non-EUR shared
+  account is formatted in its own currency via `formatCurrency(balance, currency)`
+  and its type through `t(accountTypeLabelKey(type))`, never the raw enum.
+- `frontend/src/pages/activation/ActivationPage.tsx` — activation flow for new
+  members. Fully translated under `auth.activation.*`; the call goes through
+  `useActivateAccount()` and failures through `formatApiError`.
+- `frontend/src/pages/settings/SettingsPage.tsx` — username edit inline (pencil →
+  input → save), driven by `useUpdateUsername()` (`features/auth/hooks.ts`). The
+  validation copy lives under `auth.username*`, not `settings.*`.
 
 **Migrations:**
 - `V20__create_family_system.sql` — creates family_member, sharing_settings, shared_resource, goal_contributor tables; adds member_id to all owner tables
@@ -267,9 +296,13 @@ Admin selects their own account
 
 - `GoalServiceTest` — goal CRUD scoped by memberId
 - `HistoryServiceTest` — history scoped by memberId, incl. `buildHistory_rejectsAccountsOwnedByAnotherMember` and `buildHistory_rejectsNullMemberId`
-- `api-client.test.ts` (frontend) — `?memberId` is attached only for admins, never for a non-admin with a stale `activeMemberId`
+- `api-client.test.ts` (frontend) — `?memberId` is attached only for admins, never for a non-admin with a stale `activeMemberId`; the 403 self-heal drops a refused target and replays the GET without `memberId` (a genuine 403, a second 403 on the replay, and a mutation 403 keep their existing behaviour)
+- `frontend/src/stores/profile-store.test.ts` — the target persists across reloads and is cleared by `reset()`
 - `frontend/src/features/mfa/hooks.test.ts` (frontend) — login-side `resetClientState`: wipes the cache + impersonation target on a non-MFA login and on MFA verify, and performs **no** reset on the `mfaRequired` branch
-- `FamilyServiceTest` — username derivation, activation/reset, and **member deletion**:
+- `FamilyControllerTest` — `/api/family/**` has no path rule in `SecurityConfig`, so `requireAdmin()` is the only guard: every admin-only endpoint (list, create, update, delete, activate, reset-password) is pinned to 403 for a MEMBER with the service never reached, and to its delegation for an ADMIN (`deleteMember` passes `currentMemberId()` as the requester); sharing endpoints are member-scoped without an admin check
+- `dto/FamilyMemberRequestTest` — standalone bean-validation of the member bodies (name length, hex avatar colour)
+- `FamilyViewServiceTest` — `getGoalContributions` sharing gate: owner always allowed, other members refused with `AccessDeniedException` on NONE / no settings / MANUAL-not-listed, allowed on ALL / MANUAL-listed; `FamilyViewControllerTest` pins the viewer as `currentMemberId()`
+- `FamilyServiceTest` — username derivation, activation/reset (`generateActivationToken` rejects an activated login with 400 and rotates the token of a pending one in place; `resetPasswordToken` sets a 64-hex token with a 7-day expiry and leaves `passwordHash`/`activated` untouched, 400 without a login), and **member deletion**:
   `deleteMember_withLogin_deletesUserBeforeMember` (Mockito `InOrder` guard for the
   `TransientObjectException` fix), `deleteMember_managedWithoutLogin_deletesOnlyMember`,
   `deleteMember_self_throwsForbidden`, `deleteMember_lastAdmin_throwsForbidden`,

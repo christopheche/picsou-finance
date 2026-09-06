@@ -64,4 +64,36 @@ class CsvWriterTest {
             assertThat(bytes[2]).isEqualTo((byte) 0xBF);
         }
     }
+
+    // --- Formula injection (OWASP CSV injection) ------------------------------------------
+
+    @Test
+    void neutralisesLeadingEqualsSign() throws Exception {
+        String out = write(List.of("label"), List.of(List.of("=HYPERLINK(\"http://evil\";\"click\")")));
+        assertThat(out).contains("\"'=HYPERLINK(\"\"http://evil\"\";\"\"click\"\")\"\r\n");
+    }
+
+    @Test
+    void neutralisesLeadingAtTabAndCr() throws Exception {
+        String out = write(List.of("a", "b", "c"),
+            List.of(List.of("@SUM(A1)", "\tcmd", "\rcmd")));
+        assertThat(out).contains("\"'@SUM(A1)\",\"'\tcmd\",\"'\rcmd\"\r\n");
+    }
+
+    @Test
+    void neutralisesSignedFormulas_butKeepsSignedNumbers() throws Exception {
+        String out = write(List.of("amount", "label", "label2"),
+            List.of(List.of("-853.00", "-2+3+cmd|' /C calc'!A0", "+cmd|' /C calc'!A0")));
+        assertThat(out).contains("-853.00,\"'-2+3+cmd|' /C calc'!A0\",\"'+cmd|' /C calc'!A0\"\r\n");
+    }
+
+    @Test
+    void startsFormula_signedPlainNumbersAreData() {
+        assertThat(CsvWriter.startsFormula("-1")).isFalse();
+        assertThat(CsvWriter.startsFormula("+12.50")).isFalse();
+        assertThat(CsvWriter.startsFormula("-0.00000001")).isFalse();
+        assertThat(CsvWriter.startsFormula("")).isFalse();
+        assertThat(CsvWriter.startsFormula("-1E+3")).isTrue();
+        assertThat(CsvWriter.startsFormula("=1")).isTrue();
+    }
 }

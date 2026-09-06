@@ -1,4 +1,12 @@
-fastapi==0.111.0
-uvicorn==0.30.1
-httpx==0.27.0
-playwright==1.44.0
+# Aligned on the bourso/amundi line: fastapi 0.111 bundled python-multipart,
+# orjson and ujson as hard dependencies and pinned Starlette to a range with
+# published DoS advisories. This sidecar speaks JSON only and parses no
+# multipart, so the newer line both patches Starlette and drops those three
+# from the image entirely.
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+# Production dependency: the Trade Republic API is called with httpx; the
+# browser only fetches the WAF token.
+httpx==0.28.1
+playwright==1.52.0

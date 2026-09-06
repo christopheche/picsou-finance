@@ -76,6 +76,51 @@ class SyncControllerTest {
         assertThat(response.getBody()).isEqualTo(List.of("FR"));
     }
 
+    @Test
+    void searchInstitutions_returnsServiceResult() {
+        when(httpRequest.getRemoteAddr()).thenReturn("127.0.0.1");
+        when(syncService.searchInstitutions("bnp", "FR")).thenReturn(List.of());
+
+        ResponseEntity<?> response = controller(new ConcurrentHashMap<>())
+            .searchInstitutions("bnp", "FR", httpRequest);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isEqualTo(List.of());
+    }
+
+    /**
+     * The one sync endpoint that was unthrottled while calling the provider on every request:
+     * the search is uncached (Germany alone is ~1.4 MB of ASPSPs) whereas /countries, which is
+     * served from a 6-hour cache, was already limited.
+     */
+    @Test
+    void searchInstitutions_rateLimitExceeded_returns429_withoutCallingService() {
+        when(httpRequest.getRemoteAddr()).thenReturn("10.0.0.3");
+        Map<String, Bucket> buckets = new ConcurrentHashMap<>();
+        buckets.put("10.0.0.3:institutions", exhaustedOneTokenBucket());
+
+        ResponseEntity<?> response = controller(buckets).searchInstitutions("bnp", "FR", httpRequest);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        verifyNoInteractions(syncService);
+    }
+
+    /**
+     * The search box fires a request per keystroke with no debounce, so it gets a typeahead
+     * budget (60/min), not the 10/min sync one — typing a bank name must not 429.
+     */
+    @Test
+    void searchInstitutions_toleratesTypeaheadBursts() {
+        when(httpRequest.getRemoteAddr()).thenReturn("10.0.0.4");
+        when(syncService.searchInstitutions("bnp", "FR")).thenReturn(List.of());
+        SyncController ctrl = controller(new ConcurrentHashMap<>());
+
+        for (int keystroke = 0; keystroke < 30; keystroke++) {
+            assertThat(ctrl.searchInstitutions("bnp", "FR", httpRequest).getStatusCode())
+                .isEqualTo(HttpStatus.OK);
+        }
+    }
+
     private static Bucket exhaustedOneTokenBucket() {
         Bucket bucket = Bucket.builder()
             .addLimit(Bandwidth.builder().capacity(1).refillIntervally(1, Duration.ofMinutes(1)).build())

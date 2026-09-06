@@ -11,7 +11,9 @@ import com.picsou.repository.RequisitionRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.time.LocalDate;
@@ -32,6 +34,7 @@ public class SyncService {
     private final AccountService accountService;
     private final RequisitionLifecycleWriter requisitionLifecycleWriter;
     private final BankLogoResolver bankLogoResolver;
+    private final TransactionTemplate txTemplate;
 
     public SyncService(
         BankConnectorPort bankConnector,
@@ -40,7 +43,8 @@ public class SyncService {
         FamilyMemberRepository familyMemberRepository,
         AccountService accountService,
         RequisitionLifecycleWriter requisitionLifecycleWriter,
-        BankLogoResolver bankLogoResolver
+        BankLogoResolver bankLogoResolver,
+        TransactionTemplate txTemplate
     ) {
         this.bankConnector = bankConnector;
         this.accountRepository = accountRepository;
@@ -49,6 +53,7 @@ public class SyncService {
         this.accountService = accountService;
         this.requisitionLifecycleWriter = requisitionLifecycleWriter;
         this.bankLogoResolver = bankLogoResolver;
+        this.txTemplate = txTemplate;
     }
 
     /** Step 1: Initiate Enable Banking bank connection for a given institution. */
@@ -246,41 +251,86 @@ public class SyncService {
         log.info("Deleted requisition {}", id);
     }
 
-    /** Retry all FAILED Enable Banking sessions for a member (called by scheduler). */
+    /**
+     * Retry all FAILED Enable Banking sessions for a member (called by scheduler).
+     *
+     * <p>Not transactional as a whole, for the same reason as {@link #resyncAll}: each
+     * requisition retries in its own transaction, so one that still fails cannot discard the
+     * ones that recovered. {@link #retrySync} is a self-invocation here, so its own
+     * {@code @Transactional} never applies — the template is what gives it a boundary.
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void retryAllFailed(Long memberId) {
         List<Requisition> failed = requisitionRepository
             .findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.FAILED, memberId);
         for (Requisition req : failed) {
+            Long requisitionId = req.getId();
+            String institutionName = req.getInstitutionName();
             try {
-                retrySync(req.getId(), memberId);
-            } catch (Exception ex) {
+                txTemplate.executeWithoutResult(status -> retrySync(requisitionId, memberId));
+            } catch (SyncException ex) {
+                // Expected upstream flakiness (session still dead, provider down) — WARN, as elsewhere.
                 log.warn("Scheduled retry failed for {} (requisition={}): {}",
-                    req.getInstitutionName(), req.getId(), ex.getMessage());
+                    institutionName, requisitionId, ex.getMessage());
+            } catch (RuntimeException ex) {
+                // Anything else is a bug: the message alone is "null" for an NPE, so log the trace.
+                log.error("Unexpected scheduled retry failure for {} (requisition={})",
+                    institutionName, requisitionId, ex);
             }
         }
     }
 
-    /** Re-sync all LINKED requisitions for a specific member (called by scheduler). */
+    /**
+     * Re-sync all LINKED requisitions for a specific member (called by scheduler).
+     *
+     * <p><b>Each requisition commits on its own.</b> This method deliberately opts out of the
+     * class-level {@code @Transactional}: catching the exception is not enough to isolate a
+     * database failure, because a repository call that throws inside a shared transaction marks
+     * it rollback-only through the repository's own proxy, and the commit at method exit then
+     * throws {@code UnexpectedRollbackException} — discarding every balance, snapshot and
+     * {@code lastSyncedAt} written for the member's other banks, along with the FAILED mark the
+     * catch had just saved. The provider round-trip happens before the transaction opens, so a
+     * pooled connection is not held across Enable Banking's polling; the FAILED mark goes through
+     * {@link RequisitionLifecycleWriter} so it survives whatever the failed transaction did. Same
+     * reason {@code PropertyValuationService.refreshAllForMember} uses a per-item template.
+     */
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void resyncAll(Long memberId) {
         List<Requisition> linked = requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId);
         for (Requisition req : linked) {
+            Long requisitionId = req.getId();
+            String institutionName = req.getInstitutionName();
             try {
-                ensureLogoUrl(req);
                 List<BankConnectorPort.AccountData> accounts = bankConnector.fetchBalances(req.getRequisitionId());
-                if (markRetryableIfEmpty(req, accounts, "resync")) {
-                    continue;
-                }
-                FamilyMember member = req.getMember();
-                accounts.forEach(data -> upsertAccount(data, req, member));
-                req.setLastSyncedAt(Instant.now());
-                requisitionRepository.save(req);
-                log.info("Auto-resync OK for {}: {} accounts", req.getInstitutionName(), accounts.size());
-            } catch (Exception ex) {
-                req.setStatus(RequisitionStatus.FAILED);
-                requisitionRepository.save(req);
-                log.warn("Auto-resync failed for {}: {}", req.getInstitutionName(), ex.getMessage());
+                txTemplate.executeWithoutResult(status -> applyResync(requisitionId, memberId, accounts));
+            } catch (SyncException ex) {
+                requisitionLifecycleWriter.markFailed(requisitionId, memberId);
+                log.warn("Auto-resync failed for {}: {}", institutionName, ex.getMessage());
+            } catch (RuntimeException ex) {
+                requisitionLifecycleWriter.markFailed(requisitionId, memberId);
+                log.error("Unexpected auto-resync failure for {} (requisition={})",
+                    institutionName, requisitionId, ex);
             }
         }
+    }
+
+    /**
+     * The write half of one requisition's scheduled resync, run inside its own transaction.
+     * The requisition is re-read here rather than carried in from the caller's list: that list
+     * was loaded outside any transaction, so its entities are detached.
+     */
+    private void applyResync(Long requisitionId, Long memberId, List<BankConnectorPort.AccountData> accounts) {
+        Requisition req = requisitionRepository.findByIdAndMemberId(requisitionId, memberId)
+            .orElseThrow(() -> new ResourceNotFoundException("Requisition not found"));
+        ensureLogoUrl(req);
+        if (markRetryableIfEmpty(req, accounts, "resync")) {
+            return;
+        }
+        FamilyMember member = req.getMember();
+        accounts.forEach(data -> upsertAccount(data, req, member));
+        req.setLastSyncedAt(Instant.now());
+        requisitionRepository.save(req);
+        log.info("Auto-resync OK for {}: {} accounts", req.getInstitutionName(), accounts.size());
     }
 
     /**
@@ -408,10 +458,21 @@ public class SyncService {
             return Optional.empty();
         }
 
+        // A null balance is the provider saying it has none for this account right now, not a
+        // zero (see BankConnectorPort.AccountData#balance). Creating an account on it would
+        // invent a 0.00 EUR starting point, so the account waits for a sync that carries one.
+        if (data.balance() == null && existing.isEmpty()) {
+            log.warn("Skipping creation of account externalId={} for {}: no balance reported yet",
+                data.externalId(), requisition.getInstitutionName());
+            return Optional.empty();
+        }
+
         Account account;
         if (existing.isPresent()) {
             account = existing.get();
-            account.setCurrentBalance(data.balance());
+            if (data.balance() != null) {
+                account.setCurrentBalance(data.balance());
+            }
             account.setLastSyncedAt(Instant.now());
             if (account.getLogoUrl() == null && requisition.getLogoUrl() != null) {
                 account.setLogoUrl(requisition.getLogoUrl());
@@ -437,7 +498,11 @@ public class SyncService {
         }
 
         account = accountRepository.save(account);
-        accountService.upsertSnapshot(account, data.balance(), LocalDate.now());
+        // No snapshot without a balance: upsertSnapshot overwrites the day's existing row, so a
+        // 0.00 written here would replace a good morning figure and stay in the history for good.
+        if (data.balance() != null) {
+            accountService.upsertSnapshot(account, data.balance(), LocalDate.now());
+        }
 
         return Optional.of(accountService.toResponse(account));
     }

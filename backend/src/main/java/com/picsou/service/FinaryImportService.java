@@ -18,6 +18,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -48,7 +49,9 @@ public class FinaryImportService {
     private final FinaryPersistenceHelper persistenceHelper;
     private final ConcurrentHashMap<String, ParsedFinaryData> cache = new ConcurrentHashMap<>();
 
+    /** Parsed upload, bound to the member who previewed it so a token cannot be replayed by another. */
     record ParsedFinaryData(
+        Long memberId,
         List<FinaryPersistenceHelper.ParsedFinaryAccount> accounts,
         List<FinaryPersistenceHelper.ParsedFinaryTransaction> transactions,
         Instant parsedAt
@@ -58,9 +61,10 @@ public class FinaryImportService {
      * Parse xlsx file and return a preview with mapping suggestions
      */
     public FinaryPreviewResponse preview(MultipartFile file, Long memberId) {
-        try {
-            Workbook workbook = WorkbookFactory.create(file.getInputStream());
-            ParsedFinaryData parsed = parseXlsx(workbook);
+        // try-with-resources: a workbook that fails mid-parse (missing sheet, odd cell) must still
+        // release POI's temp-backed package and the upload stream, not only the happy path.
+        try (InputStream in = file.getInputStream(); Workbook workbook = WorkbookFactory.create(in)) {
+            ParsedFinaryData parsed = parseXlsx(workbook, memberId);
 
             String fileToken = UUID.randomUUID().toString();
             cache.put(fileToken, parsed);
@@ -80,7 +84,9 @@ public class FinaryImportService {
                 ))
                 .collect(Collectors.toList());
 
+            // Only accounts that may be mapped onto (manual, unbound or Finary-bound) are offered
             List<AccountResponse> existing = accountRepository.findAllByMemberIdOrderByCreatedAtAsc(memberId).stream()
+                .filter(FinaryPersistenceHelper::isMappable)
                 .map(a -> AccountResponse.from(a, a.getCurrentBalance()))
                 .collect(Collectors.toList());
 
@@ -101,6 +107,9 @@ public class FinaryImportService {
         ParsedFinaryData parsed = cache.get(req.fileToken());
         if (parsed == null) {
             throw new IllegalArgumentException("Preview expired or invalid -- please re-upload the file");
+        }
+        if (!parsed.memberId().equals(memberId)) {
+            throw new IllegalArgumentException("Preview does not belong to this member");
         }
 
         FamilyMember member = familyMemberRepository.findById(memberId)
@@ -129,6 +138,8 @@ public class FinaryImportService {
             if (finaryAcc == null) continue;
 
             Account account = null;
+            String externalId = FinaryPersistenceHelper.EXTERNAL_ID_PREFIX
+                + finaryAcc.category() + "_" + slugify(finaryAcc.name());
 
             if (mapping.action() == com.picsou.dto.FinaryMappingAction.SKIP) {
                 accountsSkipped++;
@@ -138,11 +149,21 @@ public class FinaryImportService {
                     .orElseThrow(() -> new IllegalArgumentException(
                         "Account " + mapping.targetAccountId() + " not found"
                     ));
+                if (!FinaryPersistenceHelper.isMappable(account)) {
+                    throw new IllegalArgumentException(
+                        "Only manual accounts can be mapped to a Finary account -- '"
+                            + account.getName() + "' is synced by another provider");
+                }
+                // Same as the API path: the account takes the Finary figure and is bound to the
+                // Finary id, so today's snapshot equals the balance and a re-import auto-matches.
+                account.setCurrentBalance(finaryAcc.balance());
+                account.setCurrency(finaryAcc.currency());
+                account.setLastSyncedAt(Instant.now());
+                account.setExternalAccountId(externalId);
+                accountRepository.save(account);
                 accountsMapped++;
             } else if (mapping.action() == com.picsou.dto.FinaryMappingAction.CREATE_NEW) {
                 NewAccountDetails det = mapping.newAccount();
-                String slug = slugify(finaryAcc.name());
-                String externalId = "finary_" + finaryAcc.category() + "_" + slug;
 
                 account = Account.builder()
                     .member(member)
@@ -189,7 +210,7 @@ public class FinaryImportService {
     /**
      * Parse the xlsx file into structured data
      */
-    private ParsedFinaryData parseXlsx(Workbook workbook) throws IOException {
+    private ParsedFinaryData parseXlsx(Workbook workbook, Long memberId) {
         List<FinaryPersistenceHelper.ParsedFinaryAccount> accounts = new ArrayList<>();
         List<FinaryPersistenceHelper.ParsedFinaryTransaction> transactions = new ArrayList<>();
 
@@ -260,8 +281,7 @@ public class FinaryImportService {
             }
         }
 
-        workbook.close();
-        return new ParsedFinaryData(accounts, transactions, Instant.now());
+        return new ParsedFinaryData(memberId, accounts, transactions, Instant.now());
     }
 
     private String cellString(Row row, int col) {

@@ -18,6 +18,7 @@ import { ImportTransactionsModal } from '@/components/shared/ImportTransactionsM
 import { EditHoldingModal } from '@/components/shared/EditHoldingModal'
 import { MonthEndBalanceModal } from '@/components/shared/MonthEndBalanceModal'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
+import { ErrorState } from '@/components/shared/ErrorState'
 import { AccountTypeBadge } from '@/components/shared/AccountTypeBadge'
 import { PageHeader } from '@/components/shared/PageHeader'
 import { LoanDetailSection } from '@/components/loan/LoanDetailSection'
@@ -27,6 +28,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ArrowLeft, Calendar, TrendingUp, TrendingDown, Upload } from 'lucide-react'
 import { formatLocalDate } from '@/lib/utils'
+import { formatApiError } from '@/lib/errors'
 import { accountTypeLabelKey } from '@/lib/constants'
 import { type TimeRange } from '@/components/shared/TimeRangeSelector'
 import type { HoldingResponse, Transaction } from '@/types/api'
@@ -37,9 +39,14 @@ export function AccountDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const { t } = useTranslation()
-  const accountId = parseInt(id!, 10)
+  const parsedId = parseInt(id!, 10)
+  // A non-numeric id must not reach the hooks as NaN (they would request `/accounts/NaN/...`);
+  // 0 is falsy, so every `enabled: !!id` guard keeps its query switched off. Such a query never
+  // loads and never errors, so the page has to recognise the bad id on its own.
+  const hasValidId = Number.isFinite(parsedId)
+  const accountId = hasValidId ? parsedId : 0
 
-  const { data: account, isLoading } = useAccount(accountId)
+  const { data: account, isLoading, error, refetch } = useAccount(accountId)
   const { data: history } = useAccountHistory(accountId)
   const { data: holdings } = useHoldingsWithLivePrices(accountId)
   const { data: positions } = useAccountPositions(accountId)
@@ -58,7 +65,27 @@ export function AccountDetailPage() {
   const [editingHolding, setEditingHolding] = useState<HoldingResponse | null>(null)
   const [range, setRange] = useState<TimeRange>('1Y')
 
-  if (!account && !isLoading) return null
+  // A deleted account (404), a failed request or a junk id used to render an empty column with
+  // no message and no way back. Name what happened and keep the return path to the list.
+  if (!account && !isLoading) {
+    return (
+      <div className="space-y-4">
+        <PageHeader
+          title={t('accounts.title')}
+          actions={
+            <Button variant="outline" size="sm" onClick={() => navigate('/accounts')}>
+              <ArrowLeft size={14} className="mr-1.5" />
+              {t('common.back')}
+            </Button>
+          }
+        />
+        <ErrorState
+          message={error ? formatApiError(error, t) : t('error.notFound')}
+          onRetry={hasValidId ? () => { void refetch() } : undefined}
+        />
+      </div>
+    )
+  }
 
   const chartData = (history ?? []).map(s => ({ date: s.date, balance: s.balance }))
   const isLoan = account?.type === 'LOAN'

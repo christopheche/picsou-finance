@@ -89,11 +89,17 @@ async def log_request_duration(request: Request, call_next):
         return await call_next(request)
     finally:
         if request.url.path != "/health":
+            # Uvicorn percent-decodes the path, so a caller can plant CR/LF in it
+            # and forge log lines. Strip controls and bound the length.
             log.info(
                 "Bourse Direct request completed (path=%s; duration=%.2fs)",
-                request.url.path,
+                _log_safe(request.url.path),
                 time.monotonic() - started_at,
             )
+
+
+def _log_safe(value: str) -> str:
+    return "".join(char for char in value if char.isprintable())[:200]
 
 
 class InitiateRequest(BaseModel):

@@ -8,5 +8,5 @@ public record GoalMonthEntryResponse(
     BigDecimal actual,       // derived from balance snapshots, null if no data
     BigDecimal manualActual, // manual declaration, null if not set
     BigDecimal override,     // manual override of objective, null if not set
-    BigDecimal effective     // override ?? manualActual ?? actual
+    BigDecimal effective     // manualActual ?? actual (an override changes the objective, not this)
 ) {}

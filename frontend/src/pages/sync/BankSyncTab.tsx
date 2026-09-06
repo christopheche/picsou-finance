@@ -81,10 +81,12 @@ export function BankSyncTab() {
       },
       onError: (err: unknown) => {
         setCallbackStatus('error')
-        setCallbackError(extractErrorMessage(err))
+        setCallbackError(formatApiError(err, t))
       },
     })
-  }, [completeSync])
+    // `t` is listed because the error message is translated here; the
+    // `handledCode` ref keeps a language switch from replaying the callback.
+  }, [completeSync, t])
 
   useEffect(() => {
     const code = searchParams.get('code')

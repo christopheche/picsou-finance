@@ -110,12 +110,13 @@ class EvmWalletSyncFlowTest {
         Account account = mock(Account.class);
         when(account.getId()).thenReturn(100L);
         when(accountRepository.save(any())).thenReturn(account);
-        when(priceService.refreshPrices(any())).thenReturn(Map.of(
-            "ETH", new BigDecimal("2000"),
-            "BNB", new BigDecimal("500"),
-            "POL", new BigDecimal("1"),
-            "AVAX", new BigDecimal("30"),
-            "USDC", new BigDecimal("1")));
+        // Crypto-only quotes: the wallet sync never routes a symbol through Yahoo Finance.
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of(
+            "ETH", quote("2000"),
+            "BNB", quote("500"),
+            "POL", quote("1"),
+            "AVAX", quote("30"),
+            "USDC", quote("1")));
 
         var service = new WalletSyncService(
             List.of(adapter), walletRepository, accountRepository,
@@ -154,5 +155,9 @@ class EvmWalletSyncFlowTest {
         // package to reach EvmWalletAdapter's test constructor. The EUR conversion math is
         // covered by WalletSyncServiceTest.sync_persistsHoldingsAndSnapshot_onSuccess; what
         // this test exists for is the aggregation contract above.
+    }
+
+    private static PriceService.Quote quote(String priceEur) {
+        return new PriceService.Quote(new BigDecimal(priceEur), java.time.LocalDate.now(), true);
     }
 }

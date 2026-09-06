@@ -1,84 +1,89 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { useParams, useNavigate } from 'react-router-dom'
-import { authApi } from '@/features/auth/api'
+import { useActivateAccount } from '@/features/auth/hooks'
+import { formatApiError } from '@/lib/errors'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 
+/** How long the success card stays up before the user lands on /login. */
+const REDIRECT_DELAY_MS = 2000
+
 export function ActivationPage() {
+  const { t } = useTranslation()
   const { token } = useParams<{ token: string }>()
   const navigate = useNavigate()
+  const activate = useActivateAccount()
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [acknowledged, setAcknowledged] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [success, setSuccess] = useState(false)
+  const [validationError, setValidationError] = useState<string | null>(null)
 
-  async function handleSubmit(e: React.FormEvent) {
+  // Redirect from an effect (not from the submit handler) so the timer is cleared
+  // if the user navigates away first -- a navigate() on an unmounted page would
+  // otherwise yank them back to /login from wherever they went.
+  useEffect(() => {
+    if (!activate.isSuccess) return
+    const id = window.setTimeout(() => navigate('/login'), REDIRECT_DELAY_MS)
+    return () => window.clearTimeout(id)
+  }, [activate.isSuccess, navigate])
+
+  function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    setError(null)
+    setValidationError(null)
+    activate.reset()
 
     if (!acknowledged) {
-      setError('You must acknowledge the data access warning.')
+      setValidationError(t('auth.activation.acknowledgeRequired'))
       return
     }
     if (password.length < 8) {
-      setError('Password must be at least 8 characters.')
+      setValidationError(t('auth.activation.passwordTooShort'))
       return
     }
     if (password !== confirmPassword) {
-      setError('Passwords do not match.')
+      setValidationError(t('auth.activation.passwordMismatch'))
       return
     }
     if (!token) {
-      setError('Invalid activation link.')
+      setValidationError(t('auth.activation.invalidLink'))
       return
     }
 
-    setLoading(true)
-    try {
-      await authApi.activate(token, password, true)
-      setSuccess(true)
-      setTimeout(() => navigate('/login'), 2000)
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Activation failed. The link may have expired.'
-      setError(message)
-    } finally {
-      setLoading(false)
-    }
+    activate.mutate({ token, password })
   }
 
-  if (success) {
+  if (activate.isSuccess) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background p-4">
         <Card className="w-full max-w-md">
           <CardHeader>
-            <CardTitle>Account activated!</CardTitle>
-            <CardDescription>Redirecting to login...</CardDescription>
+            <CardTitle>{t('auth.activation.successTitle')}</CardTitle>
+            <CardDescription>{t('auth.activation.successDescription')}</CardDescription>
           </CardHeader>
         </Card>
       </div>
     )
   }
 
+  const error =
+    validationError ??
+    (activate.isError ? formatApiError(activate.error, t, 'auth.activation.failed') : null)
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-background p-4">
       <Card className="w-full max-w-md">
         <CardHeader>
-          <CardTitle>Activate your account</CardTitle>
-          <CardDescription>Choose a password to complete your account setup.</CardDescription>
+          <CardTitle>{t('auth.activation.title')}</CardTitle>
+          <CardDescription>{t('auth.activation.description')}</CardDescription>
         </CardHeader>
         <CardContent>
           {/* Warning */}
-          <div className="mb-6 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm text-yellow-200">
-            <p className="font-semibold mb-1">Data access notice</p>
-            <p>
-              The administrator of this Picsou instance has technical access to all data stored
-              here, including bank account details and API credentials. By activating your account,
-              you acknowledge this.
-            </p>
+          <div className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-700 dark:text-amber-400">
+            <p className="font-semibold mb-1">{t('auth.activation.warningTitle')}</p>
+            <p>{t('auth.activation.warningBody')}</p>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-4">
@@ -91,41 +96,43 @@ export function ActivationPage() {
                 className="mt-1"
               />
               <Label htmlFor="acknowledge" className="text-sm">
-                I understand and acknowledge that the admin has access to all data on this instance.
+                {t('auth.activation.acknowledgeLabel')}
               </Label>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
+              <Label htmlFor="password">{t('auth.activation.passwordLabel')}</Label>
               <Input
                 id="password"
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="Min. 8 characters"
+                placeholder={t('auth.activation.passwordPlaceholder')}
                 minLength={8}
                 required
               />
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="confirmPassword">Confirm password</Label>
+              <Label htmlFor="confirmPassword">{t('auth.activation.confirmPasswordLabel')}</Label>
               <Input
                 id="confirmPassword"
                 type="password"
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder="Repeat your password"
+                placeholder={t('auth.activation.confirmPasswordPlaceholder')}
                 required
               />
             </div>
 
             {error && (
-              <p className="text-sm text-destructive">{error}</p>
+              <p role="alert" className="text-sm text-destructive">{error}</p>
             )}
 
-            <Button type="submit" className="w-full" disabled={!acknowledged || loading}>
-              {loading ? 'Activating...' : 'Activate account'}
+            <Button type="submit" className="w-full" disabled={!acknowledged || activate.isPending}>
+              {activate.isPending
+                ? t('auth.activation.submitting')
+                : t('auth.activation.submit')}
             </Button>
           </form>
         </CardContent>

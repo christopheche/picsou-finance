@@ -1,6 +1,6 @@
 # Feature: Amundi Épargne Salariale sync
 
-> Last updated: 2026-08-09
+> Last updated: 2026-09-06 (`AmundiSyncRecoveryTest` added)
 
 ## Context
 
@@ -159,6 +159,23 @@ See [the ADR](../decisions/2026-08-09-amundi-epargne-salariale-sidecar.md).
 - **`mtBrut` (gross) is the valuation, not `mtNet`.** Net is after prélèvements
   sociaux on the gains; gross is the conventional portfolio value and is what
   reconciles against the plan total.
+- **A wrong password shows nothing.** No error banner is detected on the
+  password screen, so a rejected password looks like "no second-factor prompt
+  and no bearer". The second-factor poll (`MFA_PROMPT_TIMEOUT_SECONDS`, 20 s)
+  and the bearer wait therefore share one budget after "Connexion" is clicked
+  (`TOKEN_CAPTURE_TIMEOUT_SECONDS`, 30 s — `_token_capture_budget()` hands the
+  remainder to `_capture_session`). Running them back to back took ≥ 50 s,
+  past `AmundiAdapter`'s 45 s auth timeout, so the user was told Amundi was
+  unavailable instead of that the password was wrong, and a Chromium stayed
+  open after Java had given up. `LoginTimingTest` pins the sum under the
+  backend timeout (`BACKEND_AUTH_TIMEOUT_SECONDS`).
+- **A browser slot is released on every failure path.** `_new_browser` takes a
+  `MAX_CONCURRENT_BROWSERS` slot before launching; if `new_context` (a stored
+  session Playwright rejects, say) or the route/collector setup raises, the
+  caller's `browser` local is still `None` and `_close_resources` would never
+  give the slot back — four such failures would answer 503 to every request
+  with no browser open. `_new_browser` therefore closes the browser and
+  releases the slot itself before re-raising.
 - **Single replica.** Pending authentication attempts live in the sidecar's
   process memory with a 600 s TTL, exactly as for Bourse Direct.
 
@@ -192,13 +209,17 @@ See [the ADR](../decisions/2026-08-09-amundi-epargne-salariale-sidecar.md).
   sidecar contract, every error-code mapping, the explicit null `code` for an
   app push, and that the validation timeout outlives the auth timeout
 - `AmundiAdapterWiringTest` — Spring picks the production constructor
+- `AmundiSyncRecoveryTest` — the boot runner delegates to
+  `recoverInterruptedSyncs()` and is ordered before `StartupSyncService`, so a
+  stale RUNNING row cannot make the startup `queueSync` return early
 - `AmundiControllerTest` — member scoping, 202 on sync, rate limiting, an app
   push accepted without a code
 - `AccountServiceTest` — an Amundi account with unpriceable FCPEs falls back to
   the provider total instead of collapsing to zero
-- `services/amundi-auth/test_main.py`, `test_lifecycle.py` — 26 cases run inside
+- `services/amundi-auth/test_main.py`, `test_lifecycle.py` — 41 cases run inside
   the built image in CI: parser rules, session encoding, bearer capture, pending
-  TTL, and the HTTP contract
+  TTL, browser-slot release when context setup fails after launch, the shared
+  login budget staying under the backend auth timeout, and the HTTP contract
 - `frontend/src/pages/sync/AmundiTab.test.tsx` — SMS and app-push paths, error-code
   translation, background failure reporting
 

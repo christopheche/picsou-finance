@@ -11,14 +11,24 @@ mvn test -Dtest=GoalServiceTest                       # Run a single test class
 mvn package -DskipTests                               # Build JAR
 ```
 
-Tests use H2 in-memory — no external database needed. The one exception is the Flyway
-migration tests, which need real PostgreSQL (Testcontainers, Docker Engine ≥ 25.0); they
-skip themselves when Docker is unreachable, so the rest of the suite still runs.
+Tests use H2 in-memory — no external database needed. The exception is the handful of
+classes gated with `@EnabledIf("dockerAvailable")` — the Flyway migration tests, the
+entity↔schema validation, and one ORM-behaviour slice — which need real PostgreSQL
+(Testcontainers, Docker Engine ≥ 25.0); they skip themselves when Docker is unreachable,
+so the rest of the suite still runs.
 
 That skip is invisible in a green build, so CI sets `PICSOU_REQUIRE_DOCKER_TESTS=true`,
 which turns "no Docker" into a hard failure instead — a red build there means the daemon
-was unreachable, not that a migration broke. Watch the **Skipped** count locally: one is
-normal, a handful means the migration tests silently sat out.
+was unreachable, not that a migration broke. Watch the **Skipped** count locally: with
+Docker it must be 0; without it the gated classes account for every skip. Get the exact
+figure with
+
+```bash
+grep -rl 'EnabledIf("dockerAvailable")' src/test/java \
+  | xargs grep -hoE '@(Test|ParameterizedTest)\b' | wc -l
+```
+
+Any skip beyond that is a test silently bypassing itself.
 
 ## Package structure
 
@@ -41,7 +51,7 @@ com.picsou/
 
 **Auth flow:** `JwtAuthenticationFilter` reads the `access_token` HttpOnly cookie, validates the `tv` (token-version) claim against `AppUser.tokenVersion`, and sets the `SecurityContext`. `AuthController` issues and rotates access/refresh tokens; `MfaController` issues `mfa_challenge` JWTs and verifies TOTP; `PersistentTokenAuthFilter` re-issues access tokens from rotating "Remember Me" tokens. CSRF is disabled — `SameSite=Lax` cookies + JSON-only API surface provide equivalent protection (`Lax` rather than `Strict` for Safari iOS compatibility).
 
-**Member-scoped authorization:** every controller resolves `UserContext.currentMemberId()` (or `currentMemberIdOverride()` for admin impersonation), and every service/repository scopes queries by `member_id`. Family-shared access goes through `SharingSettings` + `SharedResource`. Never query a repo without a member filter — the sole exception is a lookup whose key is itself an unguessable single-use credential (e.g. `RequisitionRepository.findByOauthState`, see the OAuth-state ADR), where the member is derived from the resolved row.
+**Member-scoped authorization:** every controller resolves `UserContext.currentMemberId()` (or `currentMember()` when the service needs the entity — both honour the admin `?memberId=` impersonation override; `ownMemberId()` is the one accessor that never does, for resources bound to the login such as access-keys), and every service/repository scopes queries by `member_id`. Family-shared access goes through `SharingSettings` + `SharedResource`. Never query a repo without a member filter — the sole exception is a lookup whose key is itself an unguessable single-use credential (e.g. `RequisitionRepository.findByOauthState`, see the OAuth-state ADR), where the member is derived from the resolved row.
 
 **Rate limiting:** `RateLimitConfig` exposes named `Map<String, Bucket>` beans (Bucket4j); controllers inject the relevant bucket map via `@Qualifier` and enforce manually with `tryConsume(1)` before doing rate-limited work (there is no annotation-based limiter — every controller uses this same explicit check). Login: 5 attempts/15 min. Sync endpoints are also throttled.
 

@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.within;
 
 class YahooFinancePriceProviderTest {
@@ -81,6 +82,19 @@ class YahooFinancePriceProviderTest {
         };
         WebClient client = WebClient.builder().exchangeFunction(exchange).build();
         return new YahooFinancePriceProvider(client);
+    }
+
+    /** Answers every request with {@code status}, optionally carrying a {@code Retry-After}. */
+    private YahooFinancePriceProvider providerAnswering(HttpStatus status, String retryAfter,
+                                                        AtomicInteger callCounter) {
+        ExchangeFunction exchange = request -> {
+            callCounter.incrementAndGet();
+            ClientResponse.Builder builder = ClientResponse.create(status)
+                .header("Content-Type", MediaType.APPLICATION_JSON_VALUE);
+            if (retryAfter != null) builder = builder.header("Retry-After", retryAfter);
+            return Mono.just(builder.body("{}").build());
+        };
+        return new YahooFinancePriceProvider(WebClient.builder().exchangeFunction(exchange).build());
     }
 
     @Test
@@ -239,6 +253,24 @@ class YahooFinancePriceProviderTest {
         // 3000 JPY × 0.006 = 18; 3100 JPY × 0.006 = 18.6 — both must be present
         assertThat(prices.values().stream().map(BigDecimal::doubleValue).toList())
             .anySatisfy(v -> assertThat(v).isCloseTo(18.0, within(0.01)));
+    }
+
+    @Test
+    void getIntradayPricesEur_keysBarsInUtc_notEuropeParis() {
+        var provider = providerWith(url -> {
+            if (url.contains("/8729.T")) return INTRADAY_JPY;
+            if (url.contains("JPYEUR")) return FX_JPY_EUR;
+            return null;
+        }, null);
+
+        var from = java.time.LocalDateTime.of(2023, 1, 1, 0, 0);
+        var to = java.time.LocalDateTime.of(2030, 1, 1, 0, 0);
+        Map<java.time.LocalDateTime, BigDecimal> prices = provider.getIntradayPricesEur("8729.T", from, to);
+
+        // HistoryService merges this series with CoinGecko's (UTC) on one LocalDateTime axis and
+        // against a UTC grid. Keying epoch 1700000000 in Europe/Paris labelled it 23:13 instead of
+        // 22:13, which valued every hour at a one-to-two-hour-old close.
+        assertThat(prices).containsKey(java.time.LocalDateTime.of(2023, 11, 14, 22, 13, 20));
     }
 
     @Test
@@ -407,6 +439,59 @@ class YahooFinancePriceProviderTest {
         assertThat(provider.searchSymbols("IE000BI8OT95"))
             .extracting(SymbolCatalogPort.SymbolMatch::symbol)
             .containsExactly("MWRD.PA");
+    }
+
+    // ── Rate limiting and failure grading ─────────────────────────────────────
+
+    @Test
+    void getPricesEur_stopsTheBatchOnA429_insteadOfAskingForEveryRemainingTicker() {
+        // Answering a rate limit with more traffic is what turns a one-minute limit into a
+        // morning of missing prices: Yahoo counts the calls it rejects.
+        AtomicInteger calls = new AtomicInteger();
+        var provider = providerAnswering(HttpStatus.TOO_MANY_REQUESTS, null, calls);
+
+        assertThat(provider.getPricesEur(Set.of("AAPL", "MSFT", "ASML.AS", "MC.PA"))).isEmpty();
+
+        assertThat(calls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void getPricesEur_staysPausedAfterA429_untilTheCooldownExpires() {
+        AtomicInteger calls = new AtomicInteger();
+        var provider = providerAnswering(HttpStatus.TOO_MANY_REQUESTS, "5", calls);
+
+        provider.getPricesEur(Set.of("AAPL"));
+        assertThat(provider.getPricesEur(Set.of("MSFT"))).isEmpty();
+
+        // The second batch never touched the network: the 429 is still in force.
+        assertThat(calls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void getPricesEur_keepsGoingPastATickerYahooDoesNotCarry() {
+        // A 404 is one symbol's problem, not the endpoint's — unlike a 429, it must not stop
+        // the batch, or one delisted holding would cost every other holding its price.
+        AtomicInteger calls = new AtomicInteger();
+        var provider = providerWith(url -> url.contains("/ASML.AS") ? ASML_EUR : null, calls);
+
+        Map<String, BigDecimal> prices = provider.getPricesEur(Set.of("ASML.AS", "DEADSYMBOL"));
+
+        assertThat(prices).containsOnlyKeys("ASML.AS");
+        assertThat(calls.get()).isEqualTo(2);
+    }
+
+    @Test
+    void getPricesEur_rethrowsAProgrammingError_insteadOfSwallowingItAsAMissingPrice() {
+        // The contract SchedulerService relies on (docs/features/price-service.md): expected
+        // upstream failures return no price, anything else propagates so it gets a stack trace
+        // instead of hiding behind data that merely looks unpriced.
+        ExchangeFunction exchange = request -> Mono.error(new IllegalStateException("a real bug"));
+        var provider = new YahooFinancePriceProvider(
+            WebClient.builder().exchangeFunction(exchange).build());
+
+        assertThatThrownBy(() -> provider.getPricesEur(Set.of("AAPL")))
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessage("a real bug");
     }
 
     @Test

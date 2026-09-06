@@ -296,7 +296,25 @@ public class IbkrSyncService {
         // for a fully liquidated statement account is exactly the stale value we must
         // NOT keep — a holdings-driven COMPTE_TITRES with nothing held is worth 0 here
         // (cash is not modeled: CASH lines are skipped by isReportable).
-        BigDecimal liveEur = persisted == 0 ? BigDecimal.ZERO : accountService.liveBalanceEur(account);
+        BigDecimal liveEur = BigDecimal.ZERO;
+        if (persisted > 0) {
+            AccountService.Valuation valuation = accountService.valuation(account);
+            // Holdings are there but none could be priced (a Yahoo outage or rate-limit —
+            // IBKR is not provider-valued, so nothing else can put a number on them). That
+            // zero is not a balance, it is a blank: writing it would replace a correct
+            // currentBalance with 0 and stamp a 0 snapshot over the day, which the 08:05
+            // dailySnapshots guard cannot repair because it only writes when the row is
+            // absent. Refuse instead — the connection goes to ERROR and yesterday's figures
+            // stand (the manual path rolls the whole sync back; the scheduled path, which
+            // catches inside the transaction, keeps the fresh holdings and withholds only the
+            // valuation). Same rule as CryptoExchangeSyncService and WalletSyncService.
+            if (!valuation.anyPriced()) {
+                throw new SyncException("No EUR price available for any Interactive Brokers "
+                    + "holding right now — refusing to record a zero balance for "
+                    + account.getName() + ". Please try again later.");
+            }
+            liveEur = valuation.liveEur();
+        }
         account.setCurrentBalance(liveEur);
         account = accountRepository.save(account);
         accountService.upsertSnapshot(account, liveEur, LocalDate.now());

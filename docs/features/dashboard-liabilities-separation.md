@@ -89,7 +89,8 @@ DashboardPage ─► chart (title per wealth mode, tooltip = point.pnl)
 - `total`/`invested` in `PnlResponse` keep their old meaning (net worth /
   invested); only `pnl` and `rangePnl` changed semantics.
 - Intraday points (`buildIntradayHistory`) carry no pnl field — deliberately
-  untouched (its timezone bugs are a separate concern, audit BE-11).
+  untouched. Its timezone bugs (audit BE-11) are fixed: the grid and both
+  providers now key on UTC, see [Intraday chart](./intraday-chart.md).
 - If a future feature wants per-liability "progress" (debt paydown as a
   positive metric), build it as its OWN series — do not re-mix it into pnl.
 - The demo `GET /history` handler is still missing (known bug FE-06), so the

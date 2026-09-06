@@ -1,7 +1,12 @@
 package com.picsou.service;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.picsou.dto.AccountResponse;
+import com.picsou.exception.SyncException;
 import com.picsou.model.Account;
+import com.picsou.model.AccountType;
 import com.picsou.model.FamilyMember;
 import com.picsou.model.Requisition;
 import com.picsou.model.RequisitionStatus;
@@ -11,13 +16,20 @@ import com.picsou.port.BankConnectorPort.InstitutionData;
 import com.picsou.repository.AccountRepository;
 import com.picsou.repository.FamilyMemberRepository;
 import com.picsou.repository.RequisitionRepository;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.SimpleTransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -41,6 +53,36 @@ class SyncServiceTest {
     @Mock RequisitionLifecycleWriter requisitionLifecycleWriter;
 
     SyncService syncService;
+    CountingTxManager txManager;
+
+    private ListAppender<ILoggingEvent> logs;
+    private ch.qos.logback.classic.Logger logger;
+
+    /**
+     * Runs callbacks straight through while counting boundaries, so a test can assert that each
+     * scheduled requisition gets its own transaction rather than sharing one for the member.
+     */
+    static final class CountingTxManager implements PlatformTransactionManager {
+        int started;
+        int committed;
+        int rolledBack;
+
+        @Override
+        public TransactionStatus getTransaction(TransactionDefinition definition) {
+            started++;
+            return new SimpleTransactionStatus();
+        }
+
+        @Override
+        public void commit(TransactionStatus status) {
+            committed++;
+        }
+
+        @Override
+        public void rollback(TransactionStatus status) {
+            rolledBack++;
+        }
+    }
 
     /**
      * The real resolver over the mocked connector, not a mock of it: the logo assertions below
@@ -49,6 +91,7 @@ class SyncServiceTest {
      */
     @BeforeEach
     void wireSyncService() {
+        txManager = new CountingTxManager();
         syncService = new SyncService(
             bankConnector,
             accountRepository,
@@ -56,8 +99,26 @@ class SyncServiceTest {
             familyMemberRepository,
             accountService,
             requisitionLifecycleWriter,
-            new BankLogoResolver(bankConnector)
+            new BankLogoResolver(bankConnector),
+            new TransactionTemplate(txManager)
         );
+    }
+
+    @BeforeEach
+    void captureLogs() {
+        logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(SyncService.class);
+        logs = new ListAppender<>();
+        logs.start();
+        logger.addAppender(logs);
+    }
+
+    @AfterEach
+    void releaseLogs() {
+        logger.detachAppender(logs);
+    }
+
+    private List<ILoggingEvent> eventsAt(Level level) {
+        return logs.list.stream().filter(e -> e.getLevel() == level).toList();
     }
 
     /**
@@ -178,6 +239,7 @@ class SyncServiceTest {
 
         when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
             .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(requisition.getId(), memberId)).thenReturn(Optional.of(requisition));
 
         InstitutionData match = new InstitutionData("BoursoBank::FR::personal", "BoursoBank", "BNPAFRPP",
             "https://logos.example/bourso.png", "FR", "personal");
@@ -210,6 +272,7 @@ class SyncServiceTest {
 
         when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
             .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(requisition.getId(), memberId)).thenReturn(Optional.of(requisition));
         when(bankConnector.fetchBalances("session-21")).thenReturn(List.of());
 
         syncService.resyncAll(memberId);
@@ -236,6 +299,7 @@ class SyncServiceTest {
 
         when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
             .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(requisition.getId(), memberId)).thenReturn(Optional.of(requisition));
 
         InstitutionData wrongCountryMatch = new InstitutionData("Revolut::LT::personal", "Revolut", "REVOLT21",
             "https://logos.example/revolut-lt.png", "LT", "personal");
@@ -272,6 +336,7 @@ class SyncServiceTest {
 
         when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
             .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(requisition.getId(), memberId)).thenReturn(Optional.of(requisition));
 
         InstitutionData wrongCountry = new InstitutionData("Revolut::LT::personal", "Revolut", "REVOLT21",
             "https://logos.example/revolut-lt.png", "LT", "personal");
@@ -309,6 +374,7 @@ class SyncServiceTest {
 
         when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
             .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(requisition.getId(), memberId)).thenReturn(Optional.of(requisition));
 
         InstitutionData wrongCountry = new InstitutionData("Revolut::LT::personal", "Revolut", "REVOLT21",
             "https://logos.example/revolut-lt.png", "LT", "personal");
@@ -340,6 +406,7 @@ class SyncServiceTest {
 
         when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
             .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(requisition.getId(), memberId)).thenReturn(Optional.of(requisition));
         when(bankConnector.searchInstitutions("Unknown Bank", "FR"))
             .thenThrow(new RuntimeException("provider unavailable"));
         when(bankConnector.fetchBalances("session-3")).thenReturn(List.of());
@@ -353,6 +420,206 @@ class SyncServiceTest {
         assertThat(requisition.getStatus()).isEqualTo(RequisitionStatus.LINKED);
         assertThat(requisition.getLastSyncedAt()).isNull();
         verify(requisitionRepository, never()).save(requisition);
+    }
+
+    // --- Scheduled entry points: one requisition's failure stays that requisition's ---
+
+    private static Requisition linkedRequisition(Long id, FamilyMember member, String session, String name) {
+        return Requisition.builder()
+            .id(id)
+            .member(member)
+            .requisitionId(session)
+            .institutionId(name + "::FR::personal")
+            .institutionName(name)
+            .logoUrl("https://logos.example/" + id + ".png")
+            .status(RequisitionStatus.LINKED)
+            .build();
+    }
+
+    private void stubNewAccountUpsert(String externalId, Long memberId) {
+        when(accountRepository.findByExternalAccountIdAndMemberId(externalId, memberId)).thenReturn(Optional.empty());
+        lenient().when(accountRepository.existsSoftDeletedByExternalAccountIdAndMemberId(externalId, memberId))
+            .thenReturn(false);
+    }
+
+    /**
+     * The failure that used to cost the whole member: a repository call throwing for one bank
+     * marked the shared transaction rollback-only, and the commit at method exit discarded every
+     * other bank's balances together with the FAILED mark. Each requisition now gets its own
+     * transaction, the failed one is rolled back alone and its FAILED status is written
+     * through the lifecycle writer, independently of that rollback.
+     */
+    @Test
+    void resyncAll_persistenceFailureOnOneRequisitionDoesNotAffectOthers() {
+        Long memberId = 6L;
+        FamilyMember member = FamilyMember.builder().id(memberId).displayName("Owner").build();
+        Requisition failing = linkedRequisition(61L, member, "session-61", "Boursorama");
+        Requisition healthy = linkedRequisition(62L, member, "session-62", "BNP Paribas");
+
+        when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
+            .thenReturn(List.of(failing, healthy));
+        when(requisitionRepository.findByIdAndMemberId(61L, memberId)).thenReturn(Optional.of(failing));
+        when(requisitionRepository.findByIdAndMemberId(62L, memberId)).thenReturn(Optional.of(healthy));
+
+        AccountData failingData = new AccountData("ext-61", "Courant", "FR76...61", "EUR", new BigDecimal("10"));
+        AccountData healthyData = new AccountData("ext-62", "Courant", "FR76...62", "EUR", new BigDecimal("20"));
+        when(bankConnector.fetchBalances("session-61")).thenReturn(List.of(failingData));
+        when(bankConnector.fetchBalances("session-62")).thenReturn(List.of(healthyData));
+        stubNewAccountUpsert("ext-61", memberId);
+        stubNewAccountUpsert("ext-62", memberId);
+        when(accountRepository.save(any(Account.class))).thenAnswer(inv -> {
+            Account a = inv.getArgument(0);
+            if ("ext-61".equals(a.getExternalAccountId())) {
+                throw new DataIntegrityViolationException("duplicate key value violates unique constraint");
+            }
+            a.setId(620L);
+            return a;
+        });
+        lenient().when(accountService.toResponse(any(Account.class)))
+            .thenReturn(new AccountResponse(620L, "Courant", null, "BNP Paribas", "EUR",
+                new BigDecimal("20"), new BigDecimal("20"), null, null, false, "#6366f1", null,
+                null, null, null, null, null, null, null));
+
+        syncService.resyncAll(memberId);
+
+        // The healthy bank is synced and committed on its own.
+        assertThat(healthy.getLastSyncedAt()).isNotNull();
+        verify(requisitionRepository).save(healthy);
+        verify(accountService).upsertSnapshot(any(Account.class), any(BigDecimal.class), any());
+        // The failing bank is marked FAILED outside its rolled-back transaction, not with a plain save.
+        verify(requisitionLifecycleWriter).markFailed(61L, memberId);
+        verify(requisitionRepository, never()).save(failing);
+        assertThat(txManager.started).isEqualTo(2);
+        assertThat(txManager.rolledBack).isEqualTo(1);
+        assertThat(txManager.committed).isEqualTo(1);
+        // A repository failure is a bug, not provider flakiness: ERROR with the trace attached.
+        assertThat(eventsAt(Level.ERROR)).hasSize(1);
+        assertThat(eventsAt(Level.ERROR).get(0).getThrowableProxy()).isNotNull();
+        assertThat(eventsAt(Level.ERROR).get(0).getFormattedMessage()).contains("Boursorama");
+    }
+
+    // ─── A missing balance is not a zero ──────────────────────────────────────
+
+    /**
+     * The reported failure: a bank answers 200 with an empty {@code balances} list for an account
+     * holding 3 200 EUR. Persisting that as {@code 0.00} overwrote the balance AND stamped a zero
+     * into the day's snapshot — and {@code upsertSnapshot} overwrites an existing same-day row, so
+     * the dip stayed in the net-worth chart even after the next good sync fixed the balance. Same
+     * refusal {@code WalletSyncService} and {@code CryptoExchangeSyncService} make on their paths.
+     */
+    @Test
+    void resyncAll_keepsTheLastKnownBalance_whenTheProviderReportsNone() {
+        Long memberId = 90L;
+        FamilyMember member = FamilyMember.builder().id(memberId).displayName("Owner").build();
+        Requisition requisition = linkedRequisition(90L, member, "session-90", "BNP Paribas");
+
+        when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
+            .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(90L, memberId)).thenReturn(Optional.of(requisition));
+        when(bankConnector.fetchBalances("session-90"))
+            .thenReturn(List.of(new AccountData("ext-90", "Courant", "FR76...90", "EUR", null)));
+
+        Account existing = Account.builder()
+            .id(900L).member(member).name("Courant").type(AccountType.CHECKING)
+            .currency("EUR").currentBalance(new BigDecimal("3200.00"))
+            .externalAccountId("ext-90").isManual(false).build();
+        when(accountRepository.findByExternalAccountIdAndMemberId("ext-90", memberId))
+            .thenReturn(Optional.of(existing));
+        when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(accountService.toResponse(any(Account.class))).thenReturn(new AccountResponse(
+            900L, "Courant", null, "BNP Paribas", "EUR", new BigDecimal("3200.00"),
+            new BigDecimal("3200.00"), null, null, false, "#6366f1", null,
+            null, null, null, null, null, null, null));
+
+        syncService.resyncAll(memberId);
+
+        assertThat(existing.getCurrentBalance()).isEqualByComparingTo("3200.00");
+        assertThat(existing.getLastSyncedAt()).isNotNull();
+        verify(accountService, never()).upsertSnapshot(any(Account.class), any(), any());
+    }
+
+    /** And a brand-new account is not invented at 0.00 either — it waits for a real balance. */
+    @Test
+    void resyncAll_doesNotCreateAnAccountTheProviderReportsNoBalanceFor() {
+        Long memberId = 91L;
+        FamilyMember member = FamilyMember.builder().id(memberId).displayName("Owner").build();
+        Requisition requisition = linkedRequisition(91L, member, "session-91", "BNP Paribas");
+
+        when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
+            .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(91L, memberId)).thenReturn(Optional.of(requisition));
+        when(bankConnector.fetchBalances("session-91"))
+            .thenReturn(List.of(new AccountData("ext-91", "Courant", "FR76...91", "EUR", null)));
+        stubNewAccountUpsert("ext-91", memberId);
+
+        syncService.resyncAll(memberId);
+
+        verify(accountRepository, never()).save(any(Account.class));
+        verify(accountService, never()).upsertSnapshot(any(Account.class), any(), any());
+    }
+
+    /** Expected upstream flakiness stays a one-line WARN, and the session is still marked retryable. */
+    @Test
+    void resyncAll_providerFailureIsWarnedAndMarkedFailed() {
+        Long memberId = 7L;
+        FamilyMember member = FamilyMember.builder().id(memberId).displayName("Owner").build();
+        Requisition requisition = linkedRequisition(71L, member, "session-71", "Revolut");
+
+        when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
+            .thenReturn(List.of(requisition));
+        when(bankConnector.fetchBalances("session-71")).thenThrow(new SyncException("Enable Banking session expired"));
+
+        syncService.resyncAll(memberId);
+
+        verify(requisitionLifecycleWriter).markFailed(71L, memberId);
+        assertThat(eventsAt(Level.WARN)).hasSize(1);
+        assertThat(eventsAt(Level.WARN).get(0).getFormattedMessage()).contains("Revolut");
+        assertThat(eventsAt(Level.ERROR)).isEmpty();
+        // The provider round-trip happens before any transaction opens, so a dead session costs none.
+        assertThat(txManager.started).isZero();
+    }
+
+    /** A retry that still fails must not keep the next FAILED session from recovering. */
+    @Test
+    void retryAllFailed_oneFailingRetryDoesNotStopTheNext() {
+        Long memberId = 8L;
+        FamilyMember member = FamilyMember.builder().id(memberId).displayName("Owner").build();
+        Requisition stillDead = Requisition.builder()
+            .id(81L).member(member).requisitionId("session-81")
+            .institutionId("Revolut::FR::personal").institutionName("Revolut")
+            .logoUrl("https://logos.example/81.png").status(RequisitionStatus.FAILED).build();
+        Requisition recovering = Requisition.builder()
+            .id(82L).member(member).requisitionId("session-82")
+            .institutionId("BNP Paribas::FR::personal").institutionName("BNP Paribas")
+            .logoUrl("https://logos.example/82.png").status(RequisitionStatus.FAILED).build();
+
+        when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.FAILED, memberId))
+            .thenReturn(List.of(stillDead, recovering));
+        when(requisitionRepository.findByIdAndMemberId(81L, memberId)).thenReturn(Optional.of(stillDead));
+        when(requisitionRepository.findByIdAndMemberId(82L, memberId)).thenReturn(Optional.of(recovering));
+        when(bankConnector.fetchBalances("session-81")).thenThrow(new SyncException("still expired"));
+        AccountData data = new AccountData("ext-82", "Courant", "FR76...82", "EUR", new BigDecimal("30"));
+        when(bankConnector.fetchBalances("session-82")).thenReturn(List.of(data));
+        stubNewAccountUpsert("ext-82", memberId);
+        when(accountRepository.save(any(Account.class))).thenAnswer(inv -> {
+            Account a = inv.getArgument(0);
+            a.setId(820L);
+            return a;
+        });
+        lenient().when(accountService.toResponse(any(Account.class)))
+            .thenReturn(new AccountResponse(820L, "Courant", null, "BNP Paribas", "EUR",
+                new BigDecimal("30"), new BigDecimal("30"), null, null, false, "#6366f1", null,
+                null, null, null, null, null, null, null));
+
+        syncService.retryAllFailed(memberId);
+
+        assertThat(recovering.getStatus()).isEqualTo(RequisitionStatus.LINKED);
+        assertThat(recovering.getLastSyncedAt()).isNotNull();
+        assertThat(txManager.started).isEqualTo(2);
+        assertThat(txManager.rolledBack).isEqualTo(1);
+        assertThat(txManager.committed).isEqualTo(1);
+        assertThat(eventsAt(Level.WARN)).hasSize(1);
+        assertThat(eventsAt(Level.ERROR)).isEmpty();
     }
 
     // --- Reconnect: re-initiate OAuth on an existing (dead) requisition ---

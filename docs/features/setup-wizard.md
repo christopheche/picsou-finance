@@ -1,6 +1,6 @@
 # Feature: First-launch Setup Wizard
 
-> Last updated: 2026-07-19 (HSTS is opt-in, no longer an always-on nginx header)
+> Last updated: 2026-09-06 (`IntegrationsHealthServiceTest`, 403 branch logged; previously 2026-07-19: HSTS is opt-in, no longer an always-on nginx header)
 
 ## Context
 
@@ -13,11 +13,14 @@ with a guided, web-based flow the first time the app is opened.
 
 The bootstrap runs on two levels.
 
-- **Invisible (Docker entrypoint)** auto-generates `JWT_SECRET`, `CRYPTO_ENCRYPTION_KEY`,
-  `POSTGRES_PASSWORD` into `/data/.secrets/` when the corresponding env vars are unset.
-  This happens before `supervisord` starts Spring, because those three secrets are
-  consumed by bean constructors (`JwtUtil`, `CryptoEncryption`) and by Flyway before any
-  DB-backed config is available.
+- **Invisible (Docker entrypoint)** auto-generates `JWT_SECRET` and `CRYPTO_ENCRYPTION_KEY`
+  into `/data/.secrets/` when the corresponding env vars are unset. This happens before
+  `supervisord` starts Spring, because those secrets are consumed by bean constructors
+  (`JwtUtil`, `CryptoEncryption`) before any DB-backed config is available. The database
+  password is *not* generated there: Postgres initialises its role from the db service's own
+  `POSTGRES_PASSWORD` before the app starts, so `docker/docker-compose.yml` derives
+  `SPRING_DATASOURCE_PASSWORD` from the same `${POSTGRES_PASSWORD:-picsou}` expression
+  (see [docker-deployment.md](./docker-deployment.md)).
 - **Visible (web wizard)** is served at `/setup` while `setup.state != COMPLETE`. It
   walks the user through: admin account → CORS & secure cookies → integration picker →
   per-integration sub-flows → Done (with confetti + auto-login).
@@ -37,8 +40,12 @@ Backend:
   `setup_audit` table writes; swallows its own errors so audit failure never blocks a
   controller response.
 - `backend/src/main/java/com/picsou/service/EnableBankingKeyPairService.java` —
-  idempotent RSA-2048 PEM generation at `/data/keys/enablebanking-private.pem` (POSIX
-  `0600`).
+  idempotent RSA-2048 PEM generation at `/data/keys/enablebanking-private.pem`. The PEM
+  is written to a temp file *created* with POSIX `0600` in the same directory and moved
+  into place atomically, so the umask never widens it, not even transiently; a failed
+  permission fix-up on POSIX is logged at WARN rather than swallowed. Imported PEMs that
+  cannot be parsed raise `InvalidKeyMaterialException` (422, fixed message — the JDK
+  parser text stays in the log).
 - `backend/src/main/java/com/picsou/service/CryptoKeyGeneratorService.java` —
   idempotent AES-256 key checker/writer. If `CRYPTO_ENCRYPTION_KEY` is already present
   in the running process (the normal bare-metal `.env.local` flow), the wizard treats
@@ -78,7 +85,7 @@ Frontend:
 First boot
     │
     ▼
-docker entrypoint.sh  ──► writes /data/.secrets/{jwt_secret,crypto_key,postgres_password}
+docker entrypoint.sh  ──► writes /data/.secrets/{jwt_secret,crypto_key}
                               (only if env vars unset — idempotent)
     │
     ▼
@@ -91,7 +98,7 @@ User opens http://host:8080  ──► RequireSetup redirects /login → /setup
 Hello greeting → Admin → Security → Integration picker
     │                                    │
     │                                    ├─ Enable Banking: 5 substeps
-    │                                    ├─ BoursoBank: sidecar ping
+    │                                    ├─ BoursoBank: sidecar ping (POST /integrations/boursobank/test — it enables the integration, so not a GET)
     │                                    ├─ Bourse Direct: post-setup login acknowledgement
     │                                    ├─ Trade Republic: ack
     │                                    ├─ Finary: ack
@@ -138,6 +145,13 @@ Done → POST /api/setup/complete → auto-login → /
   the wizard will hand the user a new public PEM and invalidate what they uploaded to
   Enable Banking. A proper key-rotation flow is explicitly out of scope for this
   wizard.
+- **The keypair substep auto-generates on the draft, not on the mutation status.**
+  `EBStep3Keypair` fires the generation when the mode is `generate` and
+  `ebDraft.publicKeyPem` is empty. Guarding on `generate.isSuccess` instead made the
+  Generate → Import → Generate path a dead end: the draft key was cleared but the
+  mutation still reported success, so nothing rendered and "Continue" stayed
+  disabled. `handleSwitchMode` also resets both mutations, and an explicit
+  "Generate" button is rendered whenever there is no PEM and nothing in flight.
 - **Auto-login at the Done screen is best-effort.** If the user refreshes mid-wizard,
   the in-memory credentials are lost and the Done CTA falls back to the login page.
   setup.state is COMPLETE either way; no data is lost.
@@ -249,9 +263,15 @@ The wizard makes zero outbound requests on first load:
 - `CryptoKeyGeneratorServiceTest` — Base64 AES-256 shape on first call, never
   overwrites on re-run, `exists()` reports absence then presence.
 
-`IntegrationsHealthService` is tested indirectly through `SetupControllerTest` mocks
-— no dedicated unit test today, since its logic is a thin HTTP-client wrapper whose
-failure modes are better exercised at the controller boundary.
+- `IntegrationsHealthServiceTest` — over a fake `ExchangeFunction` (no network, no
+  Spring context): the JWT sent to `GET /aspsps` is signed with the stored key and
+  carries the Key ID / Application ID, the status → code mapping (401 →
+  `invalid_key_id`, 403 → `public_key_not_uploaded`, other HTTP → `unknown`,
+  connection failure → `network`), no call is made when the Application ID is
+  missing, and the sidecar health check prefers the URL stored in the database over
+  the environment default. Every failure branch of the Enable Banking test also
+  logs a `setup.integration.enablebanking.test` line (the 403 one keeps the response
+  body, since Enable Banking uses that status for several distinct causes).
 
 Frontend coverage is smoke-tested via `bun run typecheck` + `bun run build` + manual
 flow verification until a Playwright e2e suite is added (tracked as future work).

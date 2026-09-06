@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Check, Copy, Download, KeyRound, Loader2, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -8,6 +8,7 @@ import {
   useGenerateEnableBankingKeyPair,
   useImportEnableBankingPrivateKey,
 } from '@/features/setup/hooks'
+import { formatApiError } from '@/lib/errors'
 
 interface Props {
   onNext: () => void
@@ -22,6 +23,9 @@ export function EBStep3Keypair({ onNext, onBack }: Props) {
   const updateEbDraft = useSetupFlowStore((s) => s.updateEbDraft)
   const generate = useGenerateEnableBankingKeyPair()
   const importKey = useImportEnableBankingPrivateKey()
+  // Stable mutate fn so the auto-generate effect can list its real dependencies
+  // instead of silencing exhaustive-deps (docs/conventions/frontend.md).
+  const { mutate: generateKeyPair } = generate
 
   const [mode, setMode] = useState<Mode>('generate')
   const [copied, setCopied] = useState(false)
@@ -29,20 +33,25 @@ export function EBStep3Keypair({ onNext, onBack }: Props) {
   const [importError, setImportError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  /**
-   * Auto-generate on mount only in "generate" mode, and only if we don't
-   * already have a public key in the draft (back-nav guard).
-   */
-  useEffect(() => {
-    if (mode !== 'generate') return
-    if (draft.publicKeyPem || generate.isPending || generate.isSuccess || generate.isError) return
-    generate.mutate(undefined, {
+  const pem = draft.publicKeyPem
+
+  const runGenerate = useCallback(() => {
+    generateKeyPair(undefined, {
       onSuccess: (data) => updateEbDraft({ publicKeyPem: data.publicKeyPem }),
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode])
+  }, [generateKeyPair, updateEbDraft])
 
-  const pem = draft.publicKeyPem
+  /**
+   * Auto-generate in "generate" mode when the draft holds no public key (the
+   * back-nav guard). Deliberately keyed on the draft key rather than on the
+   * mutation status: a status guard made a second visit to this mode a dead end
+   * (nothing generated, nothing rendered, "Continue" disabled). The explicit
+   * Generate button below is the manual escape hatch either way.
+   */
+  useEffect(() => {
+    if (mode !== 'generate' || pem) return
+    runGenerate()
+  }, [mode, pem, runGenerate])
 
   const handleCopy = async () => {
     if (!pem) return
@@ -90,11 +99,10 @@ export function EBStep3Keypair({ onNext, onBack }: Props) {
       { privatePem: privatePem.trim() },
       {
         onSuccess: (data) => updateEbDraft({ publicKeyPem: data.publicKeyPem }),
-        onError: (err) => {
-          const msg = (err as { response?: { data?: { detail?: string } } })
-            ?.response?.data?.detail
-          setImportError(msg ?? t('setup.enablebanking.keypair.importError'))
-        },
+        onError: (err) =>
+          setImportError(
+            formatApiError(err, t, 'setup.enablebanking.keypair.importError'),
+          ),
       }
     )
   }
@@ -103,13 +111,11 @@ export function EBStep3Keypair({ onNext, onBack }: Props) {
     setMode(next)
     setPrivatePem('')
     setImportError(null)
-    if (next === 'generate') {
-      // Clear draft public key so the auto-generate effect fires cleanly.
-      updateEbDraft({ publicKeyPem: null })
-    } else {
-      // Switching to import: clear any previously generated public key.
-      updateEbDraft({ publicKeyPem: null })
-    }
+    // Both directions drop the public key of the abandoned mode, and both
+    // mutations are reset so a previous success/failure can't block the new one.
+    updateEbDraft({ publicKeyPem: null })
+    generate.reset()
+    importKey.reset()
   }
 
   return (
@@ -171,8 +177,17 @@ export function EBStep3Keypair({ onNext, onBack }: Props) {
                 <p className="text-sm text-destructive">
                   {t('setup.enablebanking.keypair.error')}
                 </p>
-                <Button variant="outline" size="sm" onClick={() => generate.mutate()}>
+                <Button variant="outline" size="sm" onClick={runGenerate}>
                   {t('setup.enablebanking.test.retry')}
+                </Button>
+              </div>
+            )}
+
+            {!pem && !generate.isPending && !generate.isError && (
+              <div className="flex justify-center">
+                <Button type="button" onClick={runGenerate} className="w-full sm:w-auto">
+                  <KeyRound className="mr-2 h-4 w-4" />
+                  {t('setup.enablebanking.keypair.generate')}
                 </Button>
               </div>
             )}

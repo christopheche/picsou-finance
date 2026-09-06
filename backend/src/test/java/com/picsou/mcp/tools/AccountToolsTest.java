@@ -7,6 +7,7 @@ import com.picsou.dto.SnapshotRequest;
 import com.picsou.model.AccountType;
 import com.picsou.model.BalanceSnapshot;
 import com.picsou.model.FamilyMember;
+import com.picsou.service.AccountConnectionService;
 import com.picsou.service.AccountService;
 import com.picsou.service.UserContext;
 import org.junit.jupiter.api.Test;
@@ -21,14 +22,22 @@ import java.time.LocalDate;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
  * Every tool must resolve {@link UserContext#currentMemberId()} (or {@code currentMember()}) and
  * delegate to the already member-scoped {@link AccountService} — never reaching across members.
  * These tests pin that delegation; member isolation itself is enforced (and tested) in the service.
+ * They also pin the documented {@code accounts:write} contract: every write tool other than create
+ * refuses a synced account before touching the service.
  */
 @ExtendWith(MockitoExtension.class)
 class AccountToolsTest {
@@ -36,8 +45,16 @@ class AccountToolsTest {
     private static final long MID = 7L;
 
     @Mock AccountService accountService;
+    @Mock AccountConnectionService accountConnectionService;
     @Mock UserContext userContext;
     @InjectMocks AccountTools tools;
+
+    /** The member-scoped lookup every write tool performs first; {@code manual} drives the guard. */
+    private void stubAccount(boolean manual) {
+        AccountResponse account = mock(AccountResponse.class);
+        when(account.isManual()).thenReturn(manual);
+        when(accountService.findById(5L, MID)).thenReturn(account);
+    }
 
     @Test
     void listAccounts_delegatesScopedToCurrentMember() {
@@ -103,6 +120,7 @@ class AccountToolsTest {
     void updateAccount_delegatesScopedToCurrentMember() {
         AccountResponse updated = mock(AccountResponse.class);
         when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(true);
         when(accountService.update(org.mockito.ArgumentMatchers.eq(5L), org.mockito.ArgumentMatchers.any(),
             org.mockito.ArgumentMatchers.eq(MID))).thenReturn(updated);
 
@@ -114,13 +132,20 @@ class AccountToolsTest {
             org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(MID));
     }
 
+    /**
+     * Same delegate as {@code AccountController.delete}: the connection behind the account is removed
+     * with it once no live account is left (account-deletion ADR). {@code AccountService.delete} only
+     * flips {@code deletedAt} and would leave the connection syncing forever.
+     */
     @Test
-    void deleteAccount_delegatesScopedToCurrentMember() {
+    void deleteAccount_goesThroughAccountConnectionService_scopedToCurrentMember() {
         when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(true);
 
         tools.deleteAccount(5L);
 
-        verify(accountService).delete(5L, MID);
+        verify(accountConnectionService).deleteAccount(5L, MID);
+        verify(accountService, never()).delete(anyLong(), anyLong());
     }
 
     @Test
@@ -128,6 +153,7 @@ class AccountToolsTest {
         BalanceSnapshot saved = mock(BalanceSnapshot.class);
         LocalDate date = LocalDate.of(2026, 6, 4);
         when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(true);
         when(accountService.addManualSnapshot(org.mockito.ArgumentMatchers.eq(5L),
             org.mockito.ArgumentMatchers.eq(MID), org.mockito.ArgumentMatchers.any(SnapshotRequest.class)))
             .thenReturn(saved);
@@ -146,6 +172,7 @@ class AccountToolsTest {
     void upsertHolding_upsertsThenReturnsHoldingsDto_neverTheEntity() {
         HoldingResponse h = mock(HoldingResponse.class);
         when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(true);
         when(accountService.getHoldings(5L, MID)).thenReturn(List.of(h));
 
         List<HoldingResponse> out = tools.upsertHolding(5L, "AAPL", "Apple", new BigDecimal("3"), new BigDecimal("180"));
@@ -158,9 +185,71 @@ class AccountToolsTest {
     @Test
     void deleteHolding_delegatesScopedToCurrentMember() {
         when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(true);
 
         tools.deleteHolding(5L, "AAPL");
 
         verify(accountService).deleteHolding(5L, MID, "AAPL");
+    }
+
+    // ─── accounts:write reaches manual accounts only ──────────────────────────
+    // A leaked key must not be able to rename/retype a synced account, rewrite its balance
+    // history, or add/remove its positions; those belong to the sync that produced them.
+
+    @Test
+    void updateAccount_syncedAccount_isRefusedBeforeAnyWrite() {
+        when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(false);
+
+        assertThatThrownBy(() -> tools.updateAccount(5L, "Renamed", AccountType.CHECKING, "EUR", null, null, null))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("manual");
+        verify(accountService, never()).update(anyLong(), any(), anyLong());
+    }
+
+    @Test
+    void deleteAccount_syncedAccount_isRefusedBeforeAnyWrite() {
+        when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(false);
+
+        assertThatThrownBy(() -> tools.deleteAccount(5L))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("manual");
+        verifyNoInteractions(accountConnectionService);
+        verify(accountService, never()).delete(anyLong(), anyLong());
+    }
+
+    @Test
+    void addBalanceSnapshot_syncedAccount_isRefusedBeforeAnyWrite() {
+        when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(false);
+
+        assertThatThrownBy(() -> tools.addBalanceSnapshot(5L, BigDecimal.ZERO, LocalDate.of(2026, 6, 4)))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("manual");
+        verify(accountService, never()).addManualSnapshot(anyLong(), anyLong(), any());
+    }
+
+    @Test
+    void upsertHolding_syncedAccount_isRefusedBeforeAnyWrite() {
+        when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(false);
+
+        assertThatThrownBy(() -> tools.upsertHolding(5L, "AAPL", "Apple", BigDecimal.ONE, BigDecimal.TEN))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("manual");
+        verify(accountService, never()).upsertHolding(anyLong(), anyLong(), anyString(), anyString(), any(), any());
+        verify(accountService, never()).getHoldings(anyLong(), anyLong());
+    }
+
+    @Test
+    void deleteHolding_syncedAccount_isRefusedBeforeAnyWrite() {
+        when(userContext.currentMemberId()).thenReturn(MID);
+        stubAccount(false);
+
+        assertThatThrownBy(() -> tools.deleteHolding(5L, "AAPL"))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("manual");
+        verify(accountService, never()).deleteHolding(anyLong(), anyLong(), anyString());
     }
 }

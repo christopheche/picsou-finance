@@ -14,20 +14,41 @@ import com.picsou.repository.PriceSnapshotRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
+import java.time.ZoneOffset;
 import java.util.*;
 import java.util.stream.Collectors;
 
+/**
+ * Net-worth history, intraday series and P&L over a set of accounts.
+ *
+ * <p>Deliberately <em>not</em> {@code @Transactional}: every read here is a self-contained
+ * repository call (each already runs in its own short read-only transaction), and the
+ * expensive part of {@link #buildIntradayHistory} is a sequential loop of provider HTTP calls
+ * with a 15 s timeout each. A class-level transaction pinned a pooled connection for that
+ * whole loop, so a few concurrent 24H-chart loads during a slow Yahoo response could exhaust
+ * the 10-connection pool and fail unrelated requests. The entities read here expose only basic
+ * columns (and the owner's id, which a lazy proxy answers without a session), so nothing needs
+ * the session kept open. {@code HistoryServiceTest} pins the absence of the annotation.
+ */
 @Service
-@Transactional(readOnly = true)
 public class HistoryService {
 
     private static final Logger log = LoggerFactory.getLogger(HistoryService.class);
+
+    /**
+     * The one zone of the intraday pipeline. Both providers key their hourly series in UTC
+     * wall-clock ({@code LocalDateTime}), the grid below is built in UTC from the injected
+     * clock, and the points are emitted as {@link java.time.Instant}s so the client localises
+     * them. Building the grid from the JVM default zone while Yahoo keyed its bars in
+     * Europe/Paris valued every stock point at a close one or two hours stale and dropped the
+     * freshest bars of the day.
+     */
+    static final ZoneOffset INTRADAY_ZONE = ZoneOffset.UTC;
 
     private final AccountRepository accountRepository;
     private final BalanceSnapshotRepository snapshotRepository;
@@ -36,6 +57,7 @@ public class HistoryService {
     private final PriceSnapshotRepository priceSnapshotRepository;
     private final AccountService accountService;
     private final AccountAccessResolver accessResolver;
+    private final Clock clock;
 
     public HistoryService(
         AccountRepository accountRepository,
@@ -44,7 +66,8 @@ public class HistoryService {
         PriceService priceService,
         PriceSnapshotRepository priceSnapshotRepository,
         AccountService accountService,
-        AccountAccessResolver accessResolver
+        AccountAccessResolver accessResolver,
+        Clock clock
     ) {
         this.accountRepository = accountRepository;
         this.snapshotRepository = snapshotRepository;
@@ -53,10 +76,15 @@ public class HistoryService {
         this.priceSnapshotRepository = priceSnapshotRepository;
         this.accountService = accountService;
         this.accessResolver = accessResolver;
+        this.clock = clock;
     }
 
     public List<NetWorthPoint> buildHistory(List<Long> accountIds, int months, Long memberId) {
         return buildHistory(accountIds, months, false, memberId);
+    }
+
+    public List<NetWorthPoint> buildHistory(List<Long> accountIds, int months, boolean split, Long memberId) {
+        return buildHistory(accountIds, LocalDate.now().minusMonths(months), split, memberId);
     }
 
     /**
@@ -103,7 +131,7 @@ public class HistoryService {
     }
 
     /**
-     * Build daily history with PnL for a set of accounts over the last N months.
+     * Build daily history with PnL for a set of accounts from {@code from} to today.
      *
      * For each date:
      * - total = forward-filled sum of per-account balance from balance_snapshot
@@ -115,13 +143,11 @@ public class HistoryService {
      * Today's point is replaced with live values from AccountService.liveBalanceEur
      * and AccountService.calculateInvestedAmount, so intraday changes are visible.
      */
-    public List<NetWorthPoint> buildHistory(List<Long> accountIds, int months, boolean split, Long memberId) {
+    public List<NetWorthPoint> buildHistory(List<Long> accountIds, LocalDate from, boolean split, Long memberId) {
         List<Account> accounts = accountRepository.findAllById(accountIds);
         if (accounts.isEmpty()) return List.of();
 
         Map<Long, BigDecimal> shares = assertReadable(accounts, memberId);
-
-        LocalDate from = LocalDate.now().minusMonths(months);
 
         Set<Long> loanIds = accounts.stream()
             .filter(a -> a.getType() == AccountType.LOAN)
@@ -236,9 +262,13 @@ public class HistoryService {
     /**
      * Build hourly net worth history for the last 24 hours.
      *
-     * For investment accounts (PEA, CT, Crypto): portfolio value = sum(holding.qty × intraday price at each hour).
+     * For investment accounts (PEA, CT, Crypto): portfolio value = cash balance
+     * + sum(holding.qty × intraday price at each hour) -- the same shape as
+     * {@link AccountService#valuation}, so the 24H series meets the daily chart's today point.
      * For bank/savings accounts: use today's balance snapshot (constant throughout the day).
      * For loans: negate the balance.
+     *
+     * <p>Timestamps are UTC instants: see {@link #INTRADAY_ZONE}.
      */
     public List<NetWorthIntradayPoint> buildIntradayHistory(List<Long> accountIds, Long memberId) {
         List<Account> accounts = accountRepository.findAllById(accountIds);
@@ -246,14 +276,15 @@ public class HistoryService {
 
         Map<Long, BigDecimal> shares = assertReadable(accounts, memberId);
 
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = LocalDateTime.ofInstant(clock.instant(), INTRADAY_ZONE);
         LocalDateTime from = now.minusHours(24);
 
         // Collect all tickers and group holdings
-        record HoldingData(String ticker, BigDecimal quantity, BigDecimal avgBuyEur) {}
+        record HoldingData(String ticker, BigDecimal quantity) {}
 
         Map<Long, List<HoldingData>> accountHoldings = new HashMap<>();
         Map<Long, BigDecimal> accountHoldingsInvested = new HashMap<>();
+        Map<Long, BigDecimal> accountCashBalance = new HashMap<>(); // cash held inside a brokerage account, unweighted
         Map<Long, BigDecimal> accountBankBalance = new HashMap<>(); // non-investment account balances
         Set<String> allTickers = new HashSet<>();
         Set<Long> loanIds = new HashSet<>();
@@ -281,20 +312,24 @@ public class HistoryService {
                 accountHoldings.put(accId, List.of());
                 accountHoldingsInvested.put(accId, BigDecimal.ZERO);
             } else {
+                // Cash sitting inside a PEA/CTO is part of the account's value and of its cost
+                // basis, exactly as valuation() counts it. Leaving it out sat the whole 24H
+                // series below the daily chart's today point by that amount, so switching
+                // 24H <-> 7D showed a discontinuity the size of the cash.
+                BigDecimal cashBalance = account.getCashBalance() != null
+                    ? account.getCashBalance() : BigDecimal.ZERO;
                 List<HoldingData> holdingDataList = new ArrayList<>();
-                BigDecimal invested = BigDecimal.ZERO;
+                BigDecimal invested = cashBalance;
 
                 for (AccountHolding h : holdings) {
-                    BigDecimal qty = h.getQuantity();
-                    BigDecimal avgBuy = h.getAverageBuyIn() != null ? h.getAverageBuyIn() : BigDecimal.ZERO;
-                    BigDecimal avgBuyEur = priceService.toEur(avgBuy, account.getCurrency(), null);
-                    String ticker = h.getTicker() != null ? h.getTicker().toUpperCase() : null;
-                    holdingDataList.add(new HoldingData(ticker, qty, avgBuyEur));
-                    invested = invested.add(qty.multiply(avgBuyEur));
+                    String ticker = h.getTicker() != null ? h.getTicker().toUpperCase(Locale.ROOT) : null;
+                    holdingDataList.add(new HoldingData(ticker, h.getQuantity()));
+                    invested = invested.add(costBasisEur(h, account.getCurrency()));
                     if (ticker != null) allTickers.add(ticker);
                 }
 
                 accountHoldings.put(accId, holdingDataList);
+                accountCashBalance.put(accId, cashBalance);
                 accountHoldingsInvested.put(accId, weigh(invested, shares, accId));
             }
         }
@@ -336,8 +371,8 @@ public class HistoryService {
                         aggInvested = aggInvested.add(value);
                     }
                 } else {
-                    // Investment account: compute market value at this hour
-                    BigDecimal marketValue = BigDecimal.ZERO;
+                    // Investment account: cash (constant) + market value of the holdings at this hour
+                    BigDecimal marketValue = accountCashBalance.getOrDefault(accId, BigDecimal.ZERO);
                     for (HoldingData hd : holdings) {
                         if (hd.ticker == null) continue;
                         NavigableMap<LocalDateTime, BigDecimal> priceMap = intradayPricesByTicker.get(hd.ticker);
@@ -353,7 +388,7 @@ public class HistoryService {
                     // keeps this consistent with the daily chart's per-account weighting.
                     marketValue = weigh(marketValue, shares, accId);
 
-                    // If no intraday price found, account has zero market value at that hour (skip)
+                    // If no intraday price found, a holding has zero market value at that hour (skip)
                     if (loanIds.contains(accId)) {
                         aggTotal = aggTotal.subtract(marketValue);
                     } else {
@@ -363,13 +398,28 @@ public class HistoryService {
                 }
             }
 
-            result.add(new NetWorthIntradayPoint(ts, aggTotal, aggInvested));
+            result.add(new NetWorthIntradayPoint(ts.toInstant(INTRADAY_ZONE), aggTotal, aggInvested));
         }
 
         log.info("buildIntradayHistory: {} hourly points, {} accounts, {} tickers",
             result.size(), accounts.size(), allTickers.size());
 
         return result;
+    }
+
+    /**
+     * A holding's EUR cost basis, by the same rule as {@link AccountService#valuation}: the
+     * connector's own figure ({@code providerValueEur - providerPnlEur}) when it reported one --
+     * Trade Republic and Bourse Direct populate those and leave {@code averageBuyIn} empty --
+     * else {@code averageBuyIn × quantity} converted from the account's currency.
+     */
+    private BigDecimal costBasisEur(AccountHolding holding, String accountCurrency) {
+        if (holding.getProviderValueEur() != null && holding.getProviderPnlEur() != null) {
+            return holding.getProviderValueEur().subtract(holding.getProviderPnlEur());
+        }
+        BigDecimal avgBuy = holding.getAverageBuyIn() != null ? holding.getAverageBuyIn() : BigDecimal.ZERO;
+        BigDecimal avgBuyEur = priceService.toEur(avgBuy, accountCurrency, null);
+        return holding.getQuantity().multiply(avgBuyEur);
     }
 
     /**
@@ -391,16 +441,15 @@ public class HistoryService {
         BigDecimal liveInvested = BigDecimal.ZERO;
         BigDecimal liveNonLoanValue = BigDecimal.ZERO;
 
-        // Collect all holdings for historical lookup, remembering which account each came
-        // from so the range PnL below can weight it by that account's share.
-        List<AccountHolding> allHoldings = new ArrayList<>();
-        Map<Long, Long> accountIdByHolding = new HashMap<>();
+        // Each holding kept paired with its own account: the range P&L below needs the account
+        // both to weight the position by that account's share and to route its price lookup by
+        // that account's type.
+        record Position(Account account, AccountHolding holding) {}
+        List<Position> positions = new ArrayList<>();
 
         for (Account account : accounts) {
-            List<AccountHolding> holdings = holdingRepository.findByAccount_Id(account.getId());
-            allHoldings.addAll(holdings);
-            for (AccountHolding h : holdings) {
-                accountIdByHolding.put(h.getId(), account.getId());
+            for (AccountHolding h : holdingRepository.findByAccount_Id(account.getId())) {
+                positions.add(new Position(account, h));
             }
 
             // One valuation per account, for the same reason as buildHistory above: the P&L
@@ -424,9 +473,27 @@ public class HistoryService {
             : null;
 
         // If no fromDate, return live PnL only
-        if (fromDate == null || allHoldings.isEmpty()) {
+        if (fromDate == null || positions.isEmpty()) {
             return new com.picsou.dto.PnlResponse(liveTotal, liveInvested, pnl, pnlPercent);
         }
+
+        // Live prices, one batched call per route -- the same routing as AccountService.quotesFor.
+        // A CRYPTO account is resolved crypto-only: dozens of coins share a symbol with a listed
+        // equity (SUI, ATOM, TIA, STX...), and the generic route valued an unmapped coin at that
+        // company's share price, on both sides of the range. Per-holding lookups are avoided for
+        // the reason price-service.md gives: a lookup per holding per render is how a brief
+        // rate-limit sustains itself.
+        Set<String> cryptoTickers = new TreeSet<>();
+        Set<String> otherTickers = new TreeSet<>();
+        for (Position position : positions) {
+            String ticker = tickerOf(position.holding());
+            if (ticker == null) continue;
+            (isCrypto(position.account()) ? cryptoTickers : otherTickers).add(ticker);
+        }
+        Map<String, PriceService.Quote> cryptoQuotes = cryptoTickers.isEmpty()
+            ? Map.of() : priceService.getCryptoQuotes(cryptoTickers);
+        Map<String, PriceService.Quote> otherQuotes = otherTickers.isEmpty()
+            ? Map.of() : priceService.getQuotes(otherTickers);
 
         // Compute the range over holdings priced on BOTH sides (live and at fromDate,
         // with weekend/holiday fallback). Cash, loans and unmatched holdings are
@@ -434,32 +501,33 @@ public class HistoryService {
         BigDecimal valueAtFrom = BigDecimal.ZERO;
         BigDecimal liveMatchedValue = BigDecimal.ZERO;
         int matchedPrices = 0;
-        // Same ticker can appear across several accounts — look each price up once.
+        // Same ticker can appear across several accounts — look each snapshot up once.
         Map<String, Optional<PriceSnapshot>> snapByTicker = new HashMap<>();
-        Map<String, BigDecimal> livePriceByTicker = new HashMap<>();
-        for (AccountHolding h : allHoldings) {
-            String ticker = h.getTicker();
+        for (Position position : positions) {
+            AccountHolding h = position.holding();
+            String ticker = tickerOf(h);
             if (ticker == null) continue;
+            PriceService.Quote quote =
+                (isCrypto(position.account()) ? cryptoQuotes : otherQuotes).get(ticker);
+            // No live price -> excluded. For a coin CoinGecko cannot map this also keeps the
+            // ticker-keyed price_snapshot table out of reach: its rows for that symbol, if any,
+            // were written for the same-named equity.
+            if (quote == null) continue;
             Optional<PriceSnapshot> snap = snapByTicker.computeIfAbsent(ticker,
                 t -> priceSnapshotRepository.findLatestByTickerBeforeOrOnDate(t, fromDate));
             if (snap.isEmpty()) continue;
-            if (!livePriceByTicker.containsKey(ticker)) {
-                livePriceByTicker.put(ticker, priceService.getPriceEur(ticker));
-            }
-            BigDecimal livePrice = livePriceByTicker.get(ticker);
-            if (livePrice == null) continue;
             // Both sides weighted by the same share, so the ratio -- and therefore the
             // percentage -- is unchanged; only the absolute figures shrink to the member's part.
-            Long holdingAccountId = accountIdByHolding.get(h.getId());
+            Long holdingAccountId = position.account().getId();
             valueAtFrom = valueAtFrom.add(
                 weigh(h.getQuantity().multiply(snap.get().getPriceEur()), shares, holdingAccountId));
             liveMatchedValue = liveMatchedValue.add(
-                weigh(h.getQuantity().multiply(livePrice), shares, holdingAccountId));
+                weigh(h.getQuantity().multiply(quote.price()), shares, holdingAccountId));
             matchedPrices++;
         }
 
         if (matchedPrices == 0) {
-            log.warn("buildPnl: no historical prices found for {} holdings at {}", allHoldings.size(), fromDate);
+            log.warn("buildPnl: no historical prices found for {} holdings at {}", positions.size(), fromDate);
             return new com.picsou.dto.PnlResponse(liveTotal, liveInvested, pnl, pnlPercent);
         }
 
@@ -479,6 +547,20 @@ public class HistoryService {
         return buildPnl(accountIds, memberId, null);
     }
 
+    /**
+     * Whether the account's holdings must be priced crypto-only, the same test
+     * {@code AccountService.quotesFor} applies.
+     */
+    private static boolean isCrypto(Account account) {
+        return account.getType() == AccountType.CRYPTO;
+    }
+
+    /** The holding's ticker as the price cache and price_snapshot key it, or null when it has none. */
+    private static String tickerOf(AccountHolding holding) {
+        String ticker = holding.getTicker();
+        return ticker == null || ticker.isBlank() ? null : ticker.toUpperCase(Locale.ROOT);
+    }
+
     /** Per-account forward-filled snapshot data. */
     private record ForwardFillData(
         NavigableSet<LocalDate> dates,
@@ -486,6 +568,16 @@ public class HistoryService {
         Map<Long, NavigableMap<LocalDate, BigDecimal>> investedByAccount
     ) {}
 
+    /**
+     * Loads every snapshot in the window, then seeds each account that has no row on the
+     * window's first chart date with its latest snapshot <em>before</em> the window.
+     *
+     * <p>Without the seed, an account whose first in-window row comes later than another's --
+     * the daily job skips an account it could not price that morning, which is an expected
+     * outcome -- contributed 0 to the earlier points even though an older snapshot existed. The
+     * first points then understated net worth by that account, and since the frontend's trend
+     * for a range is {@code last − first}, the dip was reported as a gain.
+     */
     private ForwardFillData buildPerAccountForwardFill(LocalDate from, List<Account> accounts) {
         List<Long> accountIds = accounts.stream().map(Account::getId).toList();
         List<Object[]> rows = snapshotRepository.findForwardFillDataByAccountIds(from, accountIds);
@@ -504,6 +596,25 @@ public class HistoryService {
                 investedByAccount.computeIfAbsent(accId, k -> new TreeMap<>()).put(date, invested);
             }
             allDates.add(date);
+        }
+
+        // The seed keeps its own (pre-window) date so floorEntry finds it for every chart date;
+        // it does not become a chart date itself.
+        if (!allDates.isEmpty()) {
+            LocalDate firstDate = allDates.first();
+            for (Long accId : accountIds) {
+                NavigableMap<LocalDate, BigDecimal> balMap = balanceByAccount.get(accId);
+                if (balMap != null && !balMap.firstKey().isAfter(firstDate)) continue;
+                snapshotRepository.findFirstByAccountIdAndDateLessThanEqualOrderByDateDesc(accId, from.minusDays(1))
+                    .ifPresent(seed -> {
+                        balanceByAccount.computeIfAbsent(accId, k -> new TreeMap<>())
+                            .put(seed.getDate(), seed.getBalance());
+                        if (seed.getInvestedAmount() != null) {
+                            investedByAccount.computeIfAbsent(accId, k -> new TreeMap<>())
+                                .put(seed.getDate(), seed.getInvestedAmount());
+                        }
+                    });
+            }
         }
 
         return new ForwardFillData(allDates, balanceByAccount, investedByAccount);

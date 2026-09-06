@@ -3,9 +3,17 @@ package com.picsou.adapter;
 import com.picsou.port.SymbolCatalogPort;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.web.reactive.function.client.ClientResponse;
+import org.springframework.web.reactive.function.client.ExchangeFunction;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -30,6 +38,36 @@ class OpenFigiIsinConverterTest {
 
     private static OpenFigiIsinConverter converterWith(SymbolCatalogPort catalog) {
         return new OpenFigiIsinConverter(new CoinGeckoPriceProvider(), catalog);
+    }
+
+    /** A clock the negative-cache tests can move, so a 6-hour TTL costs no wall-clock time. */
+    private static final class TestClock extends java.time.Clock {
+        private java.time.Instant now = java.time.Instant.parse("2026-09-06T08:00:00Z");
+
+        void advance(java.time.Duration by) {
+            now = now.plus(by);
+        }
+
+        @Override public java.time.ZoneId getZone() { return java.time.ZoneOffset.UTC; }
+        @Override public java.time.Clock withZone(java.time.ZoneId zone) { return this; }
+        @Override public java.time.Instant instant() { return now; }
+    }
+
+    private static OpenFigiIsinConverter converterWith(
+        SymbolCatalogPort catalog, ExchangeFunction openFigi, java.time.Clock clock) {
+        return new OpenFigiIsinConverter(new CoinGeckoPriceProvider(), catalog,
+            WebClient.builder().baseUrl("https://api.openfigi.test").exchangeFunction(openFigi).build(),
+            clock);
+    }
+
+    private static ExchangeFunction openFigiAnswering(HttpStatus status, String body, AtomicInteger calls) {
+        return request -> {
+            calls.incrementAndGet();
+            return Mono.just(ClientResponse.create(status)
+                .header("Content-Type", MediaType.APPLICATION_JSON_VALUE)
+                .body(body)
+                .build());
+        };
     }
 
     @Test
@@ -348,5 +386,69 @@ class OpenFigiIsinConverterTest {
         SymbolCatalogPort catalog = silentCatalog();
 
         assertThat(converterWith(catalog).priceable("XS2657412201", null)).isNull();
+    }
+
+    // ── The negative cache is bounded, and bounded by *why* the miss happened ──
+
+    /**
+     * The reported failure: OpenFIGI's keyless quota is 25 requests per minute, so a first sync of
+     * a 40-position account gets 429 for everything past position 25. Those ISINs used to be
+     * cached as "unresolvable" for the process lifetime — every later sync persisted the ISIN as
+     * the ticker, {@code YahooFinancePriceProvider.supports()} refused it, and the holdings
+     * dropped out of the account's value until the next redeploy.
+     */
+    @Test
+    void resolve_reAsksSoonAfterOpenFigiCouldNotBeReached() {
+        AtomicInteger calls = new AtomicInteger();
+        TestClock clock = new TestClock();
+        var converter = converterWith(silentCatalog(),
+            openFigiAnswering(HttpStatus.TOO_MANY_REQUESTS, "{\"error\":\"rate limited\"}", calls), clock);
+
+        assertThat(converter.resolve("IE00B4L5Y983").ticker()).isEqualTo("IE00B4L5Y983");
+        converter.resolve("IE00B4L5Y983");
+        // Still cached in between: a sustained outage must not turn every resolve() into a request.
+        assertThat(calls.get()).isEqualTo(1);
+
+        clock.advance(Duration.ofMinutes(6));
+        converter.resolve("IE00B4L5Y983");
+
+        assertThat(calls.get()).isEqualTo(2);
+    }
+
+    @Test
+    void resolve_keepsAnAuthoritativeMissMuchLongerThanAnUnreachableSource() {
+        // OpenFIGI answered and simply has nothing: re-asking every five minutes would be noise.
+        AtomicInteger calls = new AtomicInteger();
+        TestClock clock = new TestClock();
+        var converter = converterWith(silentCatalog(),
+            openFigiAnswering(HttpStatus.OK, "[{\"warning\":\"No identifier found.\"}]", calls), clock);
+
+        assertThat(converter.resolve("IE00B4L5Y983").ticker()).isEqualTo("IE00B4L5Y983");
+
+        clock.advance(Duration.ofMinutes(30));
+        converter.resolve("IE00B4L5Y983");
+        assertThat(calls.get()).isEqualTo(1);
+
+        // ...but still bounded, so a newly-listed instrument resolves without a redeploy.
+        clock.advance(Duration.ofHours(7));
+        converter.resolve("IE00B4L5Y983");
+        assertThat(calls.get()).isEqualTo(2);
+    }
+
+    @Test
+    void resolve_neverReAsksForAnIsinItResolved() {
+        AtomicInteger calls = new AtomicInteger();
+        TestClock clock = new TestClock();
+        SymbolCatalogPort catalog = silentCatalog();
+        when(catalog.hasQuote("IWDA.AS")).thenReturn(true);
+        var converter = converterWith(catalog, openFigiAnswering(HttpStatus.OK,
+            "[{\"data\":[{\"exchCode\":\"NA\",\"ticker\":\"IWDA\",\"name\":\"ISHARES CORE MSCI WORLD\"}]}]",
+            calls), clock);
+
+        assertThat(converter.resolve("IE00B4L5Y983").ticker()).isEqualTo("IWDA.AS");
+
+        clock.advance(Duration.ofDays(30));
+        assertThat(converter.resolve("IE00B4L5Y983").ticker()).isEqualTo("IWDA.AS");
+        assertThat(calls.get()).isEqualTo(1);
     }
 }

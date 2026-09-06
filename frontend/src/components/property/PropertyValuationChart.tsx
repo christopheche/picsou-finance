@@ -2,7 +2,7 @@ import { Area, AreaChart, CartesianGrid, ReferenceLine, XAxis, YAxis } from 'rec
 import { useTranslation } from 'react-i18next'
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from '@/components/ui/chart'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { formatCurrency, localeFromLanguage } from '@/lib/utils'
+import { formatCurrency, formatNumber, localeFromLanguage, parseApiDate } from '@/lib/utils'
 import { usePropertyValuations } from '@/features/accounts/hooks'
 
 interface PropertyValuationChartProps {
@@ -57,7 +57,7 @@ export function PropertyValuationChart({ accountId, costBasis }: PropertyValuati
               axisLine={false}
               tickMargin={8}
               tickFormatter={(value) =>
-                new Date(value).toLocaleDateString(locale, { month: 'short', year: '2-digit' })}
+                parseApiDate(String(value)).toLocaleDateString(locale, { month: 'short', year: '2-digit' })}
             />
             <YAxis
               tickLine={false}
@@ -65,7 +65,7 @@ export function PropertyValuationChart({ accountId, costBasis }: PropertyValuati
               tickMargin={8}
               // Compact on the axis: full currency labels collide at this width, and the
               // tooltip already gives the exact figure.
-              tickFormatter={(value) => `${(value / 1000).toFixed(0)}k`}
+              tickFormatter={(value) => `${formatNumber(value / 1000, locale, 0)}k`}
               width={50}
             />
             <ChartTooltip

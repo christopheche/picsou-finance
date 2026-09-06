@@ -17,11 +17,16 @@ import java.util.List;
  * Bitcoin HD wallet utilities: BIP32 key derivation, address generation, and input parsing.
  *
  * Supports:
- *   - xpub  (BIP44/BIP49/BIP84 extended public key)
+ *   - xpub  (extended public key, read as a BIP84 account)
  *   - zpub  (BIP84 extended public key — same as xpub with different version bytes)
  *   - Output script descriptors: wpkh([fingerprint/path]xpub.../derivation/*)#checksum
  *
- * All derived addresses are native SegWit P2WPKH (bc1q...).
+ * All derived addresses are native SegWit P2WPKH (bc1q...). That is the only script type
+ * this code can encode, so formats that denote another one — {@code ypub} (BIP49
+ * P2SH-P2WPKH, {@code 3...} addresses), {@code pkh(} (legacy P2PKH, {@code 1...}) and
+ * {@code sh(} (P2SH-wrapped) — are rejected by {@link #rejectUnsupportedScriptType} rather
+ * than derived: probing bc1q addresses such a wallet never used answers "no history" for
+ * every one of them, which reads as a 0 balance — a wrong number, not an error.
  */
 public final class BitcoinKeyUtils {
 
@@ -36,7 +41,6 @@ public final class BitcoinKeyUtils {
     // BIP32 version bytes
     private static final byte[] XPUB_VERSION = {0x04, (byte) 0x88, (byte) 0xb2, 0x1e};
     private static final byte[] ZPUB_VERSION = {0x04, (byte) 0xb2, 0x47, 0x46};
-    private static final byte[] YPUB_VERSION = {0x04, (byte) 0x9d, 0x7c, (byte) 0xb2};
 
     // BIP44 gap limit: stop scanning after this many consecutive unused addresses
     public static final int GAP_LIMIT = 20;
@@ -46,52 +50,87 @@ public final class BitcoinKeyUtils {
 
     // ─── Input detection ──────────────────────────────────────────────────────
 
-    /** Returns true if the input is an extended public key or output descriptor, not a plain address. */
+    /**
+     * Returns true if the input is an extended public key or output descriptor of a script type
+     * this class can derive, not a plain address. Formats of another script type are neither
+     * extended keys here nor plain addresses — see {@link #rejectUnsupportedScriptType}.
+     */
     public static boolean isExtendedKey(String input) {
         String t = input.trim();
         return t.startsWith("xpub")
                 || t.startsWith("zpub")
-                || t.startsWith("ypub")
-                || t.startsWith("wpkh(")
-                || t.startsWith("pkh(");
+                || t.startsWith("wpkh(");
+    }
+
+    /**
+     * Rejects an extended key or descriptor whose script type is not P2WPKH. A {@code ypub}
+     * denotes BIP49 P2SH-wrapped SegWit ({@code 3...}), {@code pkh(} legacy P2PKH ({@code 1...})
+     * and {@code sh(} any P2SH wrapping; none of them can be derived as {@code bc1q}, and
+     * deriving them anyway would scan addresses the wallet never used and report 0 BTC.
+     * Also rejects a {@code wpkh(} descriptor whose embedded key is a {@code ypub}, since the
+     * key and the descriptor then disagree about the script type.
+     *
+     * @throws IllegalArgumentException naming the supported formats; the message never echoes
+     *         the key itself
+     */
+    public static void rejectUnsupportedScriptType(String input) {
+        String t = input.trim();
+        String unsupported = null;
+        if (t.startsWith("ypub")) {
+            unsupported = "ypub (BIP49 P2SH-wrapped SegWit)";
+        } else if (t.startsWith("pkh(")) {
+            unsupported = "pkh( descriptor (legacy P2PKH)";
+        } else if (t.startsWith("sh(")) {
+            unsupported = "sh( descriptor (P2SH-wrapped)";
+        } else if (t.startsWith("wpkh(") && t.contains("ypub")) {
+            unsupported = "wpkh( descriptor around a ypub";
+        }
+        if (unsupported != null) {
+            throw new IllegalArgumentException("Unsupported Bitcoin key format " + unsupported
+                    + ": only native SegWit is derived -- use a plain address, an xpub/zpub (BIP84) "
+                    + "or a wpkh(...) descriptor");
+        }
     }
 
     // ─── Normalization ────────────────────────────────────────────────────────
 
     /**
-     * Normalizes any extended key or descriptor format to a standard xpub string.
+     * Normalizes any supported extended key or descriptor format to a standard xpub string.
      *
      * <ul>
-     *   <li>zpub / ypub → swaps version bytes to xpub format</li>
+     *   <li>zpub → swaps version bytes to xpub format</li>
      *   <li>wpkh([fingerprint/path]xpub.../chain/*)#checksum → extracts the xpub</li>
      * </ul>
+     *
+     * Call {@link #rejectUnsupportedScriptType} first: a ypub or pkh( input is not normalized,
+     * it is refused.
      */
     public static String normalizeToXpub(String input) {
         String t = input.trim();
-        if (t.startsWith("wpkh(") || t.startsWith("pkh(")) {
+        if (t.startsWith("wpkh(")) {
             return extractXpubFromDescriptor(t);
         }
-        if (t.startsWith("zpub") || t.startsWith("ypub")) {
+        if (t.startsWith("zpub")) {
             return swapVersionToXpub(t);
         }
         return t; // already xpub
     }
 
     private static String extractXpubFromDescriptor(String descriptor) {
-        // Find the start of xpub/zpub/ypub inside the descriptor
+        // Find the start of xpub/zpub inside the descriptor
         int start = -1;
-        for (String prefix : List.of("xpub", "zpub", "ypub")) {
+        for (String prefix : List.of("xpub", "zpub")) {
             int idx = descriptor.indexOf(prefix);
             if (idx >= 0 && (start < 0 || idx < start)) start = idx;
         }
-        if (start < 0) throw new IllegalArgumentException("No extended public key found in descriptor");
+        if (start < 0) throw new IllegalArgumentException("No xpub/zpub found in descriptor");
 
         // The key ends at the first non-Base58 character
         int end = start;
         while (end < descriptor.length() && isBase58Char(descriptor.charAt(end))) end++;
 
         String key = descriptor.substring(start, end);
-        if (key.startsWith("zpub") || key.startsWith("ypub")) return swapVersionToXpub(key);
+        if (key.startsWith("zpub")) return swapVersionToXpub(key);
         return key;
     }
 

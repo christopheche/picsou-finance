@@ -68,11 +68,15 @@ class PersistentTokenAuthFilterTest {
     void noOps_whenSecurityContextAlreadySet() throws Exception {
         SecurityContextHolder.getContext().setAuthentication(
             new UsernamePasswordAuthenticationToken("someone", null));
+        request.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "abc:def"));
 
         filter.doFilter(request, response, chain);
 
         verify(chain).doFilter(request, response);
         verifyNoInteractions(persistentSessionService, userRepository, jwtUtil, cookieWriter);
+        // Nothing checked the cookie's hash, so the request must NOT be stamped as validated
+        // -- downstream (login/refresh/logout) relies on the stamp's absence here.
+        assertThat(request.getAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR)).isNull();
     }
 
     @Test
@@ -106,6 +110,7 @@ class PersistentTokenAuthFilterTest {
         verify(cookieWriter).clearPersistent(response);
         verify(chain).doFilter(request, response);
         assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+        assertThat(request.getAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR)).isNull();
     }
 
     @Test
@@ -144,6 +149,7 @@ class PersistentTokenAuthFilterTest {
         verify(chain).doFilter(request, response);
         verify(cookieWriter, never()).clearPersistent(any());
         assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+        assertThat(request.getAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR)).isNull();
     }
 
     // ─── happy paths ─────────────────────────────────────────────────────
@@ -170,6 +176,22 @@ class PersistentTokenAuthFilterTest {
     }
 
     @Test
+    void stampsRequestWithValidatedSeries_onSuccessfulRestore() throws Exception {
+        // The stamp is what AuthController.login/refresh/logout require before treating the
+        // persistent cookie as proof of possession (the series id alone is not a secret).
+        PersistentSession session = setupValidCookieFor(7L, true);
+        when(userRepository.findByIdWithMember(7L)).thenReturn(Optional.of(user));
+        when(mfaService.isEnabled(user)).thenReturn(true);
+        when(jwtUtil.generateAccessToken(user)).thenReturn("a");
+        when(jwtUtil.generateRefreshToken(eq(user), any())).thenReturn("r");
+
+        filter.doFilter(request, response, chain);
+
+        assertThat(request.getAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR))
+            .isEqualTo(session.getSeriesId());
+    }
+
+    @Test
     void authenticates_whenMfaEnabledAndSessionTrusted() throws Exception {
         setupValidCookieFor(7L, true);
         when(userRepository.findByIdWithMember(7L)).thenReturn(Optional.of(user));
@@ -185,16 +207,22 @@ class PersistentTokenAuthFilterTest {
     }
 
     @Test
-    void clearsCookie_whenMfaEnabledButSessionNotTrusted() throws Exception {
-        setupValidCookieFor(7L, false);
+    void clearsCookie_andRevokesRow_whenMfaEnabledButSessionNotTrusted() throws Exception {
+        PersistentSession session = setupValidCookieFor(7L, false);
         when(userRepository.findByIdWithMember(7L)).thenReturn(Optional.of(user));
         when(mfaService.isEnabled(user)).thenReturn(true);
 
         filter.doFilter(request, response, chain);
 
         verify(cookieWriter).clearPersistent(response);
+        // No browser can ever use this series again: revoke the row instead of leaving a
+        // phantom "active session" (with a freshly-bumped last_used_at) in Settings -> Sessions.
+        verify(persistentSessionService).revokeBySeriesId(session.getSeriesId());
         verify(cookieWriter, never()).setAccessAndRefresh(any(), any(), any(), org.mockito.ArgumentMatchers.anyBoolean());
         assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+        // The hash WAS validated on this request, even though no session was restored.
+        assertThat(request.getAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR))
+            .isEqualTo(session.getSeriesId());
         verify(chain).doFilter(request, response);
     }
 
@@ -205,7 +233,7 @@ class PersistentTokenAuthFilterTest {
      * the session service to return a freshly-rotated session for the given
      * user id with the given trusted-for-2fa flag.
      */
-    private void setupValidCookieFor(long userId, boolean trustedFor2fa) {
+    private PersistentSession setupValidCookieFor(long userId, boolean trustedFor2fa) {
         String rawCookie = "abc:def";
         request.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, rawCookie));
 
@@ -226,5 +254,6 @@ class PersistentTokenAuthFilterTest {
             .thenReturn(Optional.of(new PersistentSessionService.ValidationResult(
                 "rotated-cookie-value", session
             )));
+        return session;
     }
 }

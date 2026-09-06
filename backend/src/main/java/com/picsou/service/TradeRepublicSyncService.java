@@ -22,10 +22,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -65,6 +68,7 @@ public class TradeRepublicSyncService {
     private final OpenFigiIsinConverter         isinConverter;
     private final CryptoEncryption              encryption;
     private final TransactionTemplate           txTemplate;
+    private final TradeRepublicSessionWriter    sessionWriter;
 
     public TradeRepublicSyncService(
         TradeRepublicPort trPort,
@@ -75,7 +79,8 @@ public class TradeRepublicSyncService {
         AccountService accountService,
         OpenFigiIsinConverter isinConverter,
         CryptoEncryption encryption,
-        TransactionTemplate txTemplate
+        TransactionTemplate txTemplate,
+        TradeRepublicSessionWriter sessionWriter
     ) {
         this.trPort            = trPort;
         this.sessionRepository = sessionRepository;
@@ -86,6 +91,7 @@ public class TradeRepublicSyncService {
         this.isinConverter     = isinConverter;
         this.encryption        = encryption;
         this.txTemplate        = txTemplate;
+        this.sessionWriter     = sessionWriter;
     }
 
     // --- Auth ---
@@ -126,19 +132,49 @@ public class TradeRepublicSyncService {
 
         String plainToken = tokens.sessionToken();
         Long sessionId = session.getId();
-        CompletableFuture.runAsync(() -> {
+        Runnable backgroundSync = () -> {
             try {
                 txTemplate.executeWithoutResult(status -> {
                     TradeRepublicSession savedSession = sessionRepository.findById(sessionId).orElse(null);
                     syncWithToken(plainToken, savedSession, memberId);
                 });
                 log.info("Trade Republic background sync complete");
-            } catch (Exception ex) {
-                log.error("Trade Republic background sync failed: {}", ex.getMessage());
+            } catch (SyncException ex) {
+                // Expected upstream flakiness (sidecar down, TR rejecting the fresh token): the
+                // message is the whole story, as on the scheduled path.
+                log.warn("Trade Republic background sync failed for member {}: {}", memberId, ex.getMessage());
+            } catch (RuntimeException ex) {
+                // Anything else is a bug. This is the only run of the initial sync and the user
+                // never sees its outcome, so the trace is all an operator gets — the message
+                // alone is "null" for an NPE.
+                log.error("Trade Republic background sync failed for member {}", memberId, ex);
             }
-        }, syncExecutor);
+        };
+        submitAfterCommit(backgroundSync);
 
         return new SessionStatusResponse(true, session.getExpiresAt());
+    }
+
+    /**
+     * Hands the background sync to the executor once this transaction has committed, not
+     * before. The session row above is written by <em>this</em> still-open transaction; the
+     * tr-sync thread opens its own, and submitting inline let it run {@code findById} before the
+     * commit — a {@code null} session, which the expiry path then reads as "no refresh token"
+     * and answers by deleting whatever session {@code findByMemberId} finds: the one that has
+     * just been stored. Outside a transaction (unit tests) there is nothing to wait for and the
+     * hand-off happens inline.
+     */
+    private void submitAfterCommit(Runnable backgroundSync) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            CompletableFuture.runAsync(backgroundSync, syncExecutor);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                CompletableFuture.runAsync(backgroundSync, syncExecutor);
+            }
+        });
     }
 
     // --- Sync ---
@@ -167,7 +203,9 @@ public class TradeRepublicSyncService {
                     return refreshAndRetry(stored, memberId);
                 }
                 log.warn("TR session expired -- no refresh token available, clearing session");
-                sessionRepository.findByMemberId(memberId).ifPresent(sessionRepository::delete);
+                // Through the REQUIRES_NEW writer: this method rethrows out of a @Transactional
+                // boundary on the manual path, and a plain delete here was rolled back with it.
+                sessionWriter.clear(memberId);
                 throw new SyncException(
                     "Your Trade Republic session has expired. Please reconnect from the Trade Republic page.");
             }
@@ -178,18 +216,23 @@ public class TradeRepublicSyncService {
     private List<AccountResponse> refreshAndRetry(TradeRepublicSession stored, Long memberId) {
         try {
             TrTokens newTokens = trPort.refreshSession(encryption.decrypt(stored.getRefreshToken()));
-            stored.setSessionToken(encryption.encrypt(newTokens.sessionToken()));
-            if (newTokens.refreshToken() != null) {
-                stored.setRefreshToken(encryption.encrypt(newTokens.refreshToken()));
-            }
-            stored.setExpiresAt(Instant.now().plus(2, ChronoUnit.HOURS));
-            sessionRepository.save(stored);
+            // Committed on the spot, in the writer's own transaction, and never by mutating the
+            // managed entity: a transient failure on the retry below rethrows out of this
+            // @Transactional class, and the rolled-back tokens were the *old* ones — which TR
+            // had just rotated away, so the next sync cleared the session over a timeout.
+            sessionWriter.storeRefreshedTokens(memberId,
+                encryption.encrypt(newTokens.sessionToken()),
+                newTokens.refreshToken() != null ? encryption.encrypt(newTokens.refreshToken()) : null,
+                Instant.now().plus(2, ChronoUnit.HOURS));
             log.info("TR session refreshed -- retrying sync");
             return syncWithToken(newTokens.sessionToken(), null, memberId); // null = no retry on next expiry
         } catch (SyncException ex) {
             if ("SESSION_EXPIRED".equals(ex.getMessage())) {
                 log.warn("TR refresh rejected -- clearing session");
-                sessionRepository.findByMemberId(memberId).ifPresent(sessionRepository::delete);
+                // REQUIRES_NEW, for the same reason as above: the delete has to survive the
+                // rollback the rethrow triggers, or getSessionStatus keeps saying active and the
+                // user is never offered the re-authentication form.
+                sessionWriter.clear(memberId);
                 throw new SyncException(
                     "Your Trade Republic session has expired and could not be refreshed. Please reconnect.");
             }
@@ -267,8 +310,13 @@ public class TradeRepublicSyncService {
                     .ifPresent(responses::add);
             }
 
-        } catch (Exception ex) {
-            throw new SyncException("Failed to parse CSV: " + ex.getMessage());
+        } catch (IOException ex) {
+            // Only the read itself is a "bad file" problem. Anything upsertAccount throws (a
+            // missing member, a constraint violation) is not a parse error and keeps its own
+            // status; relabelling it here leaked the SQL detail into the 422 the user sees, and
+            // dropping the cause left the log with nothing to diagnose.
+            throw new SyncException("Could not read the CSV file. Please check it is a UTF-8 "
+                + "text file with the columns name,type,balance.", ex);
         }
 
         log.info("TR CSV import complete: {} accounts processed", responses.size());

@@ -38,9 +38,15 @@ export const bankSyncApi = {
       .post<{ requisitionId: string; authLink: string }>('/sync/initiate', { institutionId, institutionName })
       .then(r => r.data),
 
+  // A GET by backend contract but a mutation in practice (it persists the linked
+  // accounts): opt out of the global GET-5xx redirect so BankSyncTab's onError can
+  // render the failure inline instead of losing the OAuth code/state on /error/500.
   complete: (code: string, state?: string | null) =>
     api
-      .get<Account[]>('/sync/complete', { params: { code, state: state ?? undefined } })
+      .get<Account[]>('/sync/complete', {
+        params: { code, state: state ?? undefined },
+        skipGlobalErrorRedirect: true,
+      })
       .then(r => r.data),
 
   getStatus: () =>
@@ -275,9 +281,11 @@ export const finaryApi = {
     return api.post<FinaryPreviewResponse>('/finary/preview', form).then(r => r.data)
   },
 
+  // The TOTP goes in the body, never in the query string: a `?totp=` would land in
+  // reverse-proxy access logs and browser history.
   previewApi: (totp?: string) =>
     api
-      .post<FinaryPreviewResponse>(`/finary/api-sync/preview${totp ? `?totp=${totp}` : ''}`)
+      .post<FinaryPreviewResponse>('/finary/api-sync/preview', totp ? { totp } : {})
       .then(r => r.data),
 
   import: (request: FinaryImportRequest) =>

@@ -37,12 +37,22 @@ public class SyncController {
         this.syncBuckets = syncBuckets;
     }
 
+    /**
+     * Institution typeahead. Uncached: every call is an authenticated fetch from the bank
+     * provider (Germany alone is ~1.4 MB of ASPSPs), unlike {@code /countries} which is served
+     * from a 6-hour cache and is throttled anyway. It gets a typeahead-sized budget rather than
+     * the 10/minute sync one — see {@link RateLimitConfig#createInstitutionSearchBucket()}.
+     */
     @GetMapping("/institutions")
-    public List<BankConnectorPort.InstitutionData> searchInstitutions(
+    public ResponseEntity<?> searchInstitutions(
         @RequestParam(required = false, defaultValue = "") String query,
-        @RequestParam(required = false, defaultValue = BankConnectorPort.DEFAULT_COUNTRY) String country
+        @RequestParam(required = false, defaultValue = BankConnectorPort.DEFAULT_COUNTRY) String country,
+        HttpServletRequest httpReq
     ) {
-        return syncService.searchInstitutions(query, country);
+        if (!checkInstitutionSearchRateLimit(httpReq)) {
+            return tooManyRequests();
+        }
+        return ResponseEntity.ok(syncService.searchInstitutions(query, country));
     }
 
     @GetMapping("/countries")
@@ -107,6 +117,12 @@ public class SyncController {
     public ResponseEntity<Void> deleteRequisition(@PathVariable Long id) {
         syncService.deleteRequisition(id, userContext.currentMemberId());
         return ResponseEntity.noContent().build();
+    }
+
+    private boolean checkInstitutionSearchRateLimit(HttpServletRequest request) {
+        String key = ClientIp.resolve(request) + ":institutions";
+        Bucket bucket = syncBuckets.computeIfAbsent(key, k -> RateLimitConfig.createInstitutionSearchBucket());
+        return bucket.tryConsume(1);
     }
 
     /**

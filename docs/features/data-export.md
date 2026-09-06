@@ -1,6 +1,6 @@
 # Feature: GDPR-friendly data export (JSON + CSV)
 
-> Last updated: 2026-07-20
+> Last updated: 2026-09-06
 > Status: ✅ Implemented
 
 ## Context
@@ -48,7 +48,7 @@ ExportDataDialog (frontend)
    ▼
 MeExportController
    ├─ Bucket4j rate limit (5/h, keyed on userId)         → 429 if exceeded
-   ├─ ReAuthService.verify(currentUser, body.reAuth)     → 401 if mismatch
+   ├─ ReAuthService.verify(currentUser, body.reAuth)     → 401 if mismatch (ProblemDetail, code REAUTH_FAILED)
    ├─ logger.warn("data_export userId={} options={} ip={}")
    └─ return ResponseEntity<StreamingResponseBody>
                  Content-Type: application/zip
@@ -115,7 +115,9 @@ Pretty-printed (2-space indent), camelCase, ISO-8601 UTC timestamps, decimal str
 
 ### Data shape — `csv/` directory
 
-RFC 4180: UTF-8 (no BOM), comma-separated, CRLF line endings, fields containing comma/quote/newline are double-quoted with internal quotes doubled.
+RFC 4180: UTF-8 with a BOM (so Excel detects the encoding), comma-separated, CRLF line endings, fields containing comma/quote/newline are double-quoted with internal quotes doubled.
+
+**Formula injection is neutralised** (OWASP CSV injection): a field starting with `=`, `@`, tab or CR — or with `+`/`-` when it is not a plain signed number — is prefixed with a single quote and quoted, e.g. a transaction label `=HYPERLINK("http://evil";"x")` is written as `"'=HYPERLINK(""http://evil"";""x"")"`. Labels and holding names come from third parties (a counterparty controls a SEPA transfer label), and Excel/LibreOffice would otherwise evaluate them on open. Amounts are `BigDecimal.toPlainString()` so negative numbers keep their sign. This is asymmetric with the importer's `CsvReader`, which does not strip the quote: it is a display escape for spreadsheet apps, not part of the data model, and `data.json` carries the raw value.
 
 | File                           | Source entity                          | Notable columns                                        |
 | ------------------------------ | -------------------------------------- | ------------------------------------------------------ |
@@ -203,20 +205,13 @@ Frontend:
 
 Backend:
 
-- `*ExporterTest` (one per `EntityExporter`) — fixtures → expected JSON node + CSV rows. Each includes a *negative* assertion: the produced bytes do not contain known-secret tokens.
+- `CsvWriterTest` — RFC 4180 quoting, BOM, and formula-injection neutralisation (`=`/`@`/tab/CR, signed formulas vs signed plain numbers).
 - `DataExportServiceTest` — verifies ZIP file list given options, presence/absence of `balance_snapshots.csv` based on toggle, presence of `README.txt`. Wires **all** `EntityExporter` beans (matching production Spring injection, not a subset) with one fixture per entity carrying a unique tripwire literal in every sensitive, non-exported field (e.g. `Requisition.authLink`); asserts none of the tripwires appear anywhere in the archive bytes. **New exporter ⇒ new wiring + new tripwire(s) in this test** — the net only protects what it exercises, and a partial exporter list (as this test shipped with for a while) silently blinds it to whichever exporters are missing.
 - `BalanceSnapshotsExporterTest` — drives the exporter directly (2 accounts × 3 snapshots): asserts CSV/JSON row order (account, then date) and, via `Mockito.verify`, exactly one `balanceSnapshotRepository.findByAccountIdOrderByDateAsc` call per account per pass (2 passes) — never a whole-member collecting call.
-- `MeExportControllerTest` (`@WebMvcTest`) — happy path, re-auth fail (password), re-auth fail (TOTP), missing body, rate-limit exceeded.
-- `DataExportIntegrationTest` (`@SpringBootTest` + H2) — seed an `AppUser` with **all** entity types populated **and** every secret-bearing entity (MFA secret, recovery codes, BoursoSession ciphertext, requisition tokens, persistent session). Hit the endpoint, parse the ZIP in memory, assert:
-  - all expected files present
-  - row counts match seeded entity counts
-  - **raw byte grep**: no occurrence of the seeded `passwordHash`, MFA secret bytes, requisition token bytes, BoursoSession ciphertext bytes, persistent-session token hash bytes
-  - This is the principal GDPR safety net.
+- `MeExportControllerTest` (pure Mockito, per `docs/conventions/testing.md`) — the step-up gate: a failed re-auth (`ReAuthFailedException` → 401 via `GlobalExceptionHandler`) propagates **before** the streaming body is built, so `DataExportService` is never touched; a drained per-user bucket returns 429 without consulting `ReAuthService`; the rate limit is consumed before re-auth so guessing a password/TOTP costs a slot; the happy path streams the authenticated `AppUser` with the requested `ExportContext` and sets `Content-Disposition: attachment; filename="picsou-export-<username>-<UTC stamp>.zip"`.
+- There is **no** end-to-end `@SpringBootTest` seeding every entity and grepping the ZIP bytes: `DataExportServiceTest`'s tripwire net (above) is the GDPR safety net, and per-exporter unit tests exist only for `BalanceSnapshotsExporter`. A new exporter is covered by adding its wiring and tripwire literal to `DataExportServiceTest`.
 
-Frontend:
-
-- `ExportDataDialog.test.tsx` — renders TOTP field if `user.mfaEnabled`, else password; submit calls API with right payload; shows loading state; surfaces 401/429 via `extractErrorMessage`.
-- `useExportData.test.ts` — mutation triggers blob download via `<a download>` (DOM stub).
+Frontend: no unit test yet for `ExportDataDialog` (`frontend/src/pages/settings/security/ExportDataDialog.tsx`); the dialog is exercised manually (TOTP vs password field, 401/429 surfaced through `extractErrorMessage`, blob download).
 
 ## Documentation
 

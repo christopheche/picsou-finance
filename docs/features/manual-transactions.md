@@ -72,7 +72,7 @@ A user-supplied "Nom" always wins over the resolved name. The same logic runs fo
 
 ### Balance derivation (cash accounts)
 
-When a manual transaction is added, edited, or deleted on a **manual** cash account (`account.isManual = true`), `ManualTransactionService` recomputes `account.currentBalance` as the sum of all transaction amounts via a single aggregate query (`sumAmountByAccountId`). It then calls `FinaryPersistenceHelper.reconstructSnapshotsFromDb()` to rebuild the balance history from scratch.
+When a manual transaction is added, edited, or deleted on a **manual** cash account (`account.isManual = true`), `ManualTransactionService` recomputes `account.currentBalance` as the sum of all transaction amounts via a single aggregate query (`sumAmountByAccountId`). It then calls `FinaryPersistenceHelper.reconstructSnapshotsFromDb()` to rebuild the balance history from scratch (each snapshot dated D holds the end-of-day balance, i.e. after D's own transactions — see [finary-import.md](finary-import.md)).
 
 ### Synced accounts
 
@@ -111,6 +111,16 @@ All sync services (`FinaryPersistenceHelper`, `BoursoSyncService`) now call `tra
 
 `DELETE` validates that the transaction is manual (`isManual = true`). Synced transactions cannot be deleted via this endpoint.
 
+`POST` and `PUT` bodies are `@Valid`-checked against `TransactionRequest`, whose `@Size` bounds
+mirror the `transaction` columns exactly — `description` 255, `ticker` 30, `name` 100,
+`currency` 10 — because `ManualTransactionService` copies the fields verbatim: anything longer
+used to fail at INSERT and surface as a generic 500 rather than a 422 naming the field. If a
+column's width changes, the bound must change with it. `currency` also goes through
+`@ValidCurrency`, so an unknown ISO code can no longer be persisted and later crash the
+frontend's currency formatter (issue #9). `quantity` is bounded at zero — `HoldingComputeService`
+negates it itself on a SELL, so a negative one would add to the position instead of removing
+from it — while `amount` stays signed, an expense being negative.
+
 ### Frontend
 
 `AddTransactionModal` is account-type-aware:
@@ -127,7 +137,7 @@ a manual-entry badge and a delete button, both only on manual entries. For manua
 without a name, it combines the `txType` enum with the canonical ticker through frontend i18n.
 Provider descriptions on synced transactions remain unchanged.
 
-After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the `transactions`, `history`, `account`, and `dashboard` queries.
+After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the account's `transactions` and `history` queries plus every net-worth surface through `invalidateWealthQueries()` (`frontend/src/features/accounts/hooks.ts`: `['accounts']`, `['dashboard']`, `['history']`, `['pnl']`, `['net-worth-intraday']`, `['real-estate']`). The same helper backs every sync, snapshot and import mutation, so the dashboard total, chart, P&L header and 24H series never disagree after a change.
 
 ### Key files
 
@@ -145,7 +155,7 @@ After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the 
 | `backend/src/main/java/com/picsou/controller/AccountController.java` | POST/DELETE `/accounts/{id}/transactions` |
 | `backend/src/main/java/com/picsou/repository/TransactionRepository.java` | `deleteByAccountIdAndIsManualFalse`, `sumAmountByAccountId`, `findByAccountIdAndTxTypeInOrderByDateAsc` |
 | `frontend/src/components/shared/AddTransactionModal.tsx` | Account-type-aware form modal |
-| `frontend/src/components/shared/TransactionsList.tsx` | Localized transaction-type fallbacks, date grouping with unambiguous historical years, manual badge, and delete button |
+| `frontend/src/components/shared/TransactionsList.tsx` | Localized transaction-type fallbacks, date grouping with unambiguous historical years, manual badge, delete button, and a `TRANSACTIONS_PAGE_SIZE` (200) window with a "show more" button — the endpoint returns the whole history unpaged |
 | `frontend/src/features/accounts/hooks.ts` | `useAddTransaction`, `useDeleteTransaction` |
 
 ## Technical choices
@@ -166,10 +176,27 @@ After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the 
   the effective name, or the canonical ticker when no name exists. The API already exposes
   `txType`; `TransactionsList` translates that enum for manual ticker rows with no name.
   Cash transactions with no ticker and synced provider descriptions keep their supplied text.
+- **A null `txType` arrives as an absent member, not `null`.** Jackson's `non_null` inclusion
+  omits it, so `TransactionsList` tests `txType == null` (loose) — a strict `=== null` guard never
+  matched and a manual ticker row with no type rendered as `undefined AAPL`. The same holds for
+  every `| null` field in `types/api.ts`.
+- **Bounds live on the DTO, not in the service.** `ManualTransactionService` still rejects
+  negative `fees` itself (a 400 with a message), because that rule reads better as a domain
+  refusal; everything expressible as a column width or a sign belongs on `TransactionRequest`
+  so the caller gets a 422 field map before any row is touched.
+- **The list renders `TRANSACTIONS_PAGE_SIZE` rows at a time.** Filtering and grouping are
+  memoised on `(transactions, search, locale)`; a new search restarts from the first page.
 
 ## Tests
 
+- `TransactionRequestTest` — the bean-validation contract of the request body against the
+  standalone validator: a fully-populated request and one with every optional instrument field
+  null both pass; over-long `description` / `ticker` / `name`, an unknown or over-long
+  `currency` and a negative `quantity` are each rejected on their own field; a negative
+  `amount` passes.
+- `HoldingRequestTest` — the same for `PUT /accounts/{id}/holdings/{ticker}`: zero quantity and
+  a null `averageBuyIn` pass, a null quantity and negative figures are rejected.
 - `HoldingComputeServiceTest` — 11 unit tests: BUY-only, multi-BUY VWAP, BUY+SELL, fully-sold position, null ticker/quantity skipping, multiple tickers, existing holding update, plus position name = newest transaction's name and name-preserved-when-transactions-have-none.
 - `ManualTransactionServiceTest` — 11 unit tests: manual cash add (balance + snapshots recomputed), synced cash add (transaction saved, balance/snapshots untouched), investment add (holdings recomputed, for both manual and synced accounts), non-owned account rejection, manual delete, synced-account delete (no reconstruct), synced-transaction delete rejection, not-found rejection, plus ISIN input → resolved ticker/name/description and plain-ticker uppercased with the user "Nom" winning.
-- `TransactionsList.test.tsx` — localized BUY, SELL, DIVIDEND, and FEE fallbacks, provider-description preservation, localized search, and date-heading behavior.
+- `TransactionsList.test.tsx` — localized BUY, SELL, DIVIDEND, and FEE fallbacks, provider-description preservation, an absent `txType` member keeping the stored description, localized search, date-heading behavior, and the 200-row window ("show more" extends it, a new search resets it).
 - `OpenFigiIsinConverterTest` — 4 unit tests for the `isIsin()` detector: valid ISINs, case/whitespace normalization, rejects tickers/non-ISIN strings, rejects null/blank.

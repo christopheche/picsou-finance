@@ -64,6 +64,18 @@ public interface BankConnectorPort {
 
     record InitiateResult(String requisitionId, String authLink) {}
 
+    /**
+     * One account as the provider reports it.
+     *
+     * @param balance the account's balance, or {@code null} when the provider returned
+     *                <b>no</b> balance for it — an empty {@code balances} list, or entries
+     *                carrying no amount. Null is not zero: {@code SyncService.upsertAccount}
+     *                keeps the account's last known balance and writes no snapshot for the day,
+     *                because a missing balance persisted as {@code 0.00} stamps a permanent dip
+     *                into the net-worth chart that no later sync goes back to fix. Same refusal
+     *                as {@code WalletSyncService} and {@code CryptoExchangeSyncService} make on
+     *                their own write paths.
+     */
     record AccountData(
         String externalId,
         String name,

@@ -8,6 +8,7 @@ import com.picsou.service.PersistentSessionService;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -49,14 +50,15 @@ public class SessionController {
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<Void> revoke(
+    public ResponseEntity<?> revoke(
         @AuthenticationPrincipal AppUser user,
         @PathVariable Long id
     ) {
         // Service returns false when the session doesn't exist OR doesn't belong
         // to this user — both collapse to 404 to avoid leaking other users' ids.
         if (!persistentSessionService.revoke(id, user)) {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, "Session not found"));
         }
         return ResponseEntity.noContent().build();
     }

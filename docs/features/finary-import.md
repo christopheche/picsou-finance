@@ -1,6 +1,6 @@
 # Feature: Finary Import
 
-> Last updated: 2026-07-07
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -22,7 +22,7 @@ The user exports their Finary data as an xlsx file and uploads it via the API. T
 Authenticates directly with Finary via Clerk (their auth provider) and fetches accounts + transactions through the Finary API.
 
 - **Authentication**: `FinaryApiClient.authenticate()` performs a 6-step Clerk OAuth flow: GET environment, GET client, POST sign_ins, (optionally POST TOTP), POST session touch, POST tokens. Returns a JWT for API calls.
-- **TOTP/2FA handling**: When Clerk returns `needs_second_factor`, the backend throws `TotpRequiredException` → HTTP 403. The frontend detects 403 on the preview mutation, shows a TOTP input field, then retries with `?totp={code}` as query parameter.
+- **TOTP/2FA handling**: When Clerk returns `needs_second_factor`, the backend throws `TotpRequiredException` → HTTP 403. The frontend detects 403 on the preview mutation, shows a TOTP input field, then retries with `{"totp": "{code}"}` in the JSON body of the same POST.
 - **Preview**: `preview(totp)` authenticates, fetches accounts from all 10 portfolio categories **plus the dedicated `/loans` endpoint** (loans are not exposed as a portfolio category), fetches transactions (paginated, 200 per page), caches everything with a `syncToken`, returns previews.
 - **Execute**: `execute(syncToken, mappings)` retrieves cached data, applies user mappings, creates/updates accounts, imports transactions.
 
@@ -31,7 +31,7 @@ Authenticates directly with Finary via Clerk (their auth provider) and fetches a
 Both paths present the user with a mapping screen where they choose for each Finary account:
 
 - **SKIP** -- Ignore this account entirely.
-- **MAP_EXISTING** -- Link the Finary account to an existing Picsou account (balance is updated).
+- **MAP_EXISTING** -- Link the Finary account to an existing Picsou account: its balance and currency take the Finary figure, `lastSyncedAt` is stamped and `externalAccountId` is bound to the Finary id (both paths; the xlsx path used to leave the account untouched, so today's snapshot and `currentBalance` disagreed). Only **mappable** accounts qualify -- `FinaryPersistenceHelper.isMappable`: manual accounts that are unbound or already bound to Finary (`finary_` prefix). The preview offers only those, and `execute`/`executeImport` reject any other target with a 400: mapping onto a provider-synced account (Trade Republic, IBKR, Enable Banking...) would rebind its external id (the connector then recreates a duplicate on its next sync), delete its non-manual transactions and wipe its whole snapshot history.
 - **CREATE_NEW** -- Create a new Picsou account with user-specified name, type, provider, and color.
 
 Type suggestions are auto-computed from the Finary category via `FinaryPersistenceHelper.suggestTypeFromDisplayCategory()` or `suggestTypeFromApiCategory()`.
@@ -41,6 +41,7 @@ Type suggestions are auto-computed from the Finary category via `FinaryPersisten
 - `FinaryImportService` uses a `ConcurrentHashMap` with 30-minute expiry (cleaned every 60s by `@Scheduled`).
 - `FinaryApiSyncService` uses a `ConcurrentHashMap` with 10-minute expiry (cleaned every 60s by `@Scheduled`).
 - Cache tokens are UUIDs. The preview+execute must complete within the TTL or the user must re-upload.
+- The xlsx `ParsedFinaryData` carries the previewing `memberId`; `executeImport` rejects a token presented by another member (400), mirroring the account binding of the CSV transaction importer.
 
 ### Auto-sync
 
@@ -122,7 +123,7 @@ Frontend receives 403 → shows TOTP input
 User enters 6-digit TOTP code
         |
         v
-POST /api/finary/api-sync/preview?totp={code}
+POST /api/finary/api-sync/preview   body: {"totp": "{code}"}
         |
         +-- Clerk completes second factor with TOTP
         +-- Fetch accounts from all 10 categories
@@ -179,21 +180,25 @@ POST /api/finary/api-sync/auto
 
 - **TOTP must be disabled for background auto-sync**: `autoSync()` passes `null` for TOTP. If 2FA is enabled on the Finary account, auto-sync returns `TOTP_REQUIRED` and the session is flagged. The user must re-authenticate interactively (via the preview endpoint with TOTP). For interactive sync via the frontend button, the TOTP input is shown and the user retries through the preview flow.
 - **Manual transactions survive Finary re-syncs**: `FinaryPersistenceHelper.importTransactions()` calls `deleteByAccountIdAndIsManualFalse()` instead of `deleteByAccountId()`. Manually-added transactions are preserved across any number of re-syncs.
-- **TOTP is a query parameter**: The TOTP code is sent as `?totp={code}` on the POST preview request. This avoids body parsing complexity but means the code is visible in server access logs.
+- **TOTP travels in the request body, not the query string**: the preview endpoint reads `totp` from the JSON body (`FinaryApiSyncPreviewRequest`), validated as six digits and optional -- the first attempt sends `{}`. It used to be `?totp={code}`, which put a live second factor into nginx/Caddy access logs, browser history and any log-shipping pipeline. Every other connector (DEGIRO, Bourse Direct, Amundi) and the app's own MFA already sent codes in the body.
+- **Every Clerk sign-in is throttled**: `/check-totp`, `/api-sync/preview` and `/api-sync/auto` each run the full 6-step Clerk login with the stored credentials, so they share one per-IP bucket (`finaryAuthBuckets`, 5 attempts / 15 min) and answer 429 with a ProblemDetail past it. Without it the 6-digit second factor is brute-forceable through `preview`, and Clerk sees an unbounded stream of sign-ins from the instance's single IP -- which is what gets that IP blocked for the whole family. `/api-sync/execute` works off the cached preview and authenticates nothing, so it is not on the bucket. The xlsx `/preview` upload shares the sync buckets instead, like every other multipart endpoint.
 - **Preview tokens expire quickly**: XLSX tokens expire after 30 minutes, API sync tokens after 10 minutes. Users must complete the mapping within that window or re-upload.
 - **Clerk API version is hardcoded**: The `__clerk_api_version` and `_clerk_js_version` query parameters are hardcoded in `FinaryApiClient`. If Clerk updates, these may need to be updated.
 - **Account name matching is case-insensitive but exact**: Auto-mapping matches Finary account name to Picsou account name. If the user renamed an account in Picsou, it won't match.
 - **Transactions are per-category**: API sync fetches transactions only from checkings, savings, investments, and credits categories. Other categories (real estate, cryptos) do not have a transactions endpoint.
 - **External IDs use Finary category + ID**: Format is `finary_{category}_{finaryId}`. This means the same Finary account always maps to the same external ID, preventing duplicates across imports.
-- **Loans come from a separate endpoint (issue #11)**: loan/mortgage accounts are *not* returned by the portfolio `credits`/`credit_accounts` categories — they live on the dedicated `/loans` endpoint. The API sync fetches them via `FinaryApiClient.fetchLoans()` and adapts each entry to the common `FinaryAccountDto` under a synthetic `loans` category (external ID `finary_loans_{id}`), so they flow through the normal preview/mapping/execute pipeline and map to `AccountType.LOAN`. The outstanding amount is stored as a **negative** balance (a loan is a liability). Only the balance is imported — the loans payload does not expose the original principal or interest rate, so **no `Debt` row is created**; the imported LOAN account shows a static balance until the user fills in the loan parameters for the amortization view (see [loans.md](loans.md)). The exact `/loans` JSON shape and path are best-effort from the issue's sample (`type`, `name`, `outstanding_amount`, `monthly_repayment`, `start_date`, `end_date`); `FinaryLoanDto` maps the snake_case keys explicitly and accepts camelCase aliases as a fallback.
+- **Loans come from a separate endpoint (issue #11)**: loan/mortgage accounts are *not* returned by the portfolio `credits`/`credit_accounts` categories — they live on the dedicated `/loans` endpoint. The API sync fetches them via `FinaryApiClient.fetchLoans()` and adapts each entry to the common `FinaryAccountDto` under a synthetic `loans` category (external ID `finary_loans_{id}`), so they flow through the normal preview/mapping/execute pipeline and map to `AccountType.LOAN`. The outstanding amount is stored as a **positive** balance -- a loan is a liability, and the LOAN aggregation negates it (`DashboardService` adds LOAN accounts to `totalLiabilities`, `AccountService.signedLiveBalanceEur` flips the sign; see [loans.md](loans.md) and [dashboard-liabilities-separation.md](dashboard-liabilities-separation.md)). Storing it negative would double-negate the liability and *add* the loan to net worth. Only the balance is imported — the loans payload does not expose the original principal or interest rate, so **no `Debt` row is created**; the imported LOAN account shows a static balance until the user fills in the loan parameters for the amortization view (see [loans.md](loans.md)). The exact `/loans` JSON shape and path are best-effort from the issue's sample (`type`, `name`, `outstanding_amount`, `monthly_repayment`, `start_date`, `end_date`); `FinaryLoanDto` maps the snake_case keys explicitly and accepts camelCase aliases as a fallback.
 - **Import mapping wizard type dropdown includes all account types (fix #17)**: The `CREATE_NEW` type selector in `FinaryTab` now uses `ACCOUNT_TYPES` from `@/lib/constants` instead of a hard-coded subset. This ensures `LOAN` and `REAL_ESTATE` are available in the dropdown, so loans imported from `/loans` are no longer forced into `OTHER` when the user overrides the backend suggestion.
 - **Error status codes are differentiated (fix #27)**: `FinaryServiceUnavailableException` returns 502 (Clerk/Finary unreachable), `SyncException` returns 422 (data/sync issue), `TotpRequiredException` returns 403. Previously all sync errors returned 502. The frontend uses a `getFinaryError()` helper to show localized messages per status code.
+- **Reconstructed snapshots are end-of-day figures**: `reconstructSnapshots` / `reconstructSnapshotsFromDb` walk the transactions backwards from the current balance and record, under each transaction date D, the balance *after* D's own flows -- the same meaning as the scheduler's daily row, which `HistoryService` forward-fills from the latest snapshot on or before each date. The pre-history balance (before the earliest transaction) is written under the day before it, so the first deposit reads as a step rather than a ramp. Storing the pre-flow balance under D (the old behaviour) made every deposit land one snapshot late on the chart.
+- **Upstream errors are not echoed to the user**: `FinaryApiClient` and `FinaryApiSyncService` wrap Clerk/Finary failures in `SyncException` with a fixed friendly message ("Could not fetch your Finary accounts (crypto). Please try again later.") and log the HTTP body / socket message at WARN, per the [error-handling convention](../conventions/error-handling.md). Raw Clerk sign-in / TOTP responses are never logged either, even at DEBUG -- they carry the account e-mail and session material.
 - **HTTP calls retry transient failures (fix #27)**: `FinaryApiClient.sendWithRetry()` retries up to 3 times with exponential backoff (1s, 2s) on HTTP 5xx and network errors from Clerk/Finary.
 
 ## Tests
 
-- `FinaryImportServiceTest` -- unit tests for xlsx parsing, type suggestion, mapping
-- `FinaryApiSyncServiceTest` -- unit tests for API sync flow, incl. loans appearing in the preview and being created as LOAN accounts on execute
+- `FinaryImportServiceTest` -- xlsx parsing on a real POI workbook, invalid upload, and `executeImport`: MAP_EXISTING updates balance / binds the Finary id on a member-scoped lookup, foreign or provider-synced target rejected with nothing written, CREATE_NEW sets member/balance/external id from the file, SKIP writes nothing, expired token, token previewed by another member, token consumed after use, preview offers only mappable accounts
+- `FinaryPersistenceHelperTest` -- snapshot dating (end-of-day rule, several flows on one day, flow dated today, DB variant) and `isMappable`
+- `FinaryApiSyncServiceTest` -- unit tests for API sync flow, incl. loans appearing in the preview and being created as LOAN accounts on execute, MAP_EXISTING onto a provider-synced account refused, preview listing only mappable targets
 - `FinaryLoanDtoTest` -- unit tests for parsing the `/loans` payload (snake_case + camelCase aliases)
 - Manual integration testing with real Finary accounts
 

@@ -1,6 +1,6 @@
 # Feature: Ownership shares
 
-> Last updated: 2026-08-10
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -37,7 +37,7 @@ GET /dashboard
             └─> each accountValue x share/100 before it enters any total
 
 PUT /accounts/{id}/ownership
-  └─> requireOwner            a co-owner cannot reallocate shares
+  └─> requireOwner            a co-owner cannot reallocate shares (AccessDeniedException → 403 ProblemDetail)
        ├─ type is REAL_ESTATE or LOAN?   else 422
        ├─ sum <= 100?                    else 422
        ├─ owner present in the split?    else 422
@@ -108,7 +108,17 @@ PUT /accounts/{id}/ownership
   that verifies `sharesFor` is called once and `shareFor` not at all — nothing else fails if
   the per-account form comes back, since the numbers are identical either way.
 - **Write guards are `requireOwner`, read guards are `requireReadable`.** Mixing them up is
-  how a co-owner ends up able to rewrite someone else's net worth.
+  how a co-owner ends up able to rewrite someone else's net worth. The inverse mistake is a
+  read path guarded by `AccountService.getOrThrow` (`findByIdAndMemberId`, the administrative
+  owner only): `getHistory`, `getHoldings`, `getTransactions` and `getLoanSummary` did that and
+  404'd a co-owned mortgage's loan view and balance history for the very member it was shared
+  with, while `GET /accounts/{id}` answered. All four now use `requireReadable`.
+- **A split account cannot be retyped to a type that cannot be split.** `replace` refuses a
+  split on anything but `REAL_ESTATE`/`LOAN`, but `AccountService.update` let the owner change
+  `type` freely with the rows still attached — a 50/50 house retyped to `CHECKING` showed half a
+  checking account and kept the co-owner's read access. `update` now answers 422 when the new
+  type is not splittable and ownership rows exist; clear the split first. `LOAN` ↔
+  `REAL_ESTATE` retypes stay allowed.
 
 ## Tests
 

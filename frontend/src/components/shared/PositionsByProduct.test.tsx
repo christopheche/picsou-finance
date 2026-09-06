@@ -2,6 +2,7 @@ import '@testing-library/jest-dom'
 import { render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import type { ExchangePositionResponse } from '@/types/api'
+import { formatPercent } from '@/lib/utils'
 
 vi.mock('react-i18next', () => ({
   // CurrencyDisplay reads i18n.resolvedLanguage to pick its number format.
@@ -16,6 +17,9 @@ vi.mock('react-i18next', () => ({
 }))
 
 const { PositionsByProduct } = await import('./PositionsByProduct')
+
+/** French percent as testing-library sees it: the NBSP before `%` collapses to a plain space. */
+const frPercent = (ratio: number) => formatPercent(ratio, 'fr-FR').replace(/\s+/g, ' ')
 
 const POSITIONS: ExchangePositionResponse[] = [
   { product: 'SPOT', ticker: 'BTC', quantity: 0.5, principal: null, interest: null, averageBuyIn: 80, currentPriceEur: 100, currentValueEur: 50, costBasisEur: 40, pnlEur: 10, pnlPercent: 25, priceAsOf: '2026-08-01', priceStale: false },
@@ -68,8 +72,9 @@ describe('PositionsByProduct', () => {
     render(<PositionsByProduct positions={POSITIONS} />)
 
     const staking = sectionFor('STAKING')
-    expect(staking.getByText('-16.7%')).toBeInTheDocument()
-    expect(sectionFor('SPOT').getByText('+25.0%')).toBeInTheDocument()
+    // The mock runs the UI in French, so the figure is French too: "25,0 %", not "25.0%".
+    expect(staking.getByText(frPercent(-0.167))).toBeInTheDocument()
+    expect(sectionFor('SPOT').getByText(`+${frPercent(0.25)}`)).toBeInTheDocument()
   })
 
   it('marks a price that is a recorded one rather than a live quote', () => {
@@ -78,7 +83,7 @@ describe('PositionsByProduct', () => {
     render(<PositionsByProduct positions={[{ ...POSITIONS[0], priceStale: true, priceAsOf: '2026-07-31' }]} />)
 
     expect(screen.getByLabelText(/accounts\.priceAsOf/)).toBeInTheDocument()
-    expect(sectionFor('SPOT').getByText('+25.0%')).toBeInTheDocument()
+    expect(sectionFor('SPOT').getByText(`+${frPercent(0.25)}`)).toBeInTheDocument()
   })
 
   it('names the recorded price’s own day, in a time zone behind UTC', () => {

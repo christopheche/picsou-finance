@@ -28,7 +28,9 @@ Auth flow:
   POST /portfolio  {sessionBlob: "..."}
     → {cashEur: 0.0, positions: [{isin, symbol, name, quantity, buyingPrice, currentPrice}]}
 
-Session state is stored in memory only during the auth flow (keyed by processId).
+Session state is stored in memory only during the auth flow (keyed by processId,
+swept every PENDING_SWEEP_SECONDS and refused past _PENDING_TTL — the entry holds
+the plaintext password so the TOTP retry can resubmit it).
 After auth completes, an opaque {sessionId, intAccount} blob is returned to Java
 for encrypted storage. Unlike the other broker sidecars, this session is
 short-lived (DEGIRO times out the cookie after ~30 min of inactivity, no refresh
@@ -38,22 +40,31 @@ unattended re-authentication — see
 docs/decisions/2026-08-05-degiro-session-only-no-stored-totp.md.
 """
 
+import asyncio
 import json
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
-from portfolio_parser import build_positions, build_product_info_map, parse_cash_eur, parse_raw_positions
+from portfolio_parser import (
+    PortfolioFormatError,
+    build_positions,
+    build_product_info_map,
+    describe_product_info,
+    parse_cash_eur,
+    parse_raw_positions,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("degiro-auth")
-
-app = FastAPI()
 
 DEGIRO_BASE = "https://trader.degiro.nl"
 
@@ -62,6 +73,39 @@ DEGIRO_BASE = "https://trader.degiro.nl"
 # enough to retry the login with a TOTP code — never logged, never persisted.
 _pending: dict[str, dict] = {}
 _PENDING_TTL = 300  # 5 minutes — DEGIRO TOTP codes are valid 30s, generous margin for user entry
+# The pending entry is a plaintext password: it must not outlive its TTL just because
+# nobody else logs in. Swept on a timer like the sibling sidecars, not only on the
+# next /initiate.
+PENDING_SWEEP_SECONDS = 30
+# Each pending entry is tiny, but the backend's per-IP throttle does not bound this
+# service in aggregate; cap it like bourso-auth does.
+MAX_PENDING = 16
+
+
+async def _pending_sweeper() -> None:
+    while True:
+        await asyncio.sleep(PENDING_SWEEP_SECONDS)
+        try:
+            _clean_pending()
+        except Exception:
+            log.warning("DEGIRO pending sweep failed", exc_info=True)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    sweeper = asyncio.create_task(_pending_sweeper())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        try:
+            await sweeper
+        except asyncio.CancelledError:
+            pass
+        _pending.clear()
+
+
+app = FastAPI(lifespan=lifespan)
 
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -73,6 +117,11 @@ _REDACTED_KEYS = {
     "sessionid", "password", "onetimepassword", "token", "accesstoken", "refreshtoken",
     "email", "emailaddress", "username", "firstcontact", "address", "phonenumber",
     "mobilephonenumber", "cellphonenumber", "bankaccount", "iban",
+    # /pa/secure/client carries the holder's identity at the top level of `data`, not
+    # only under `firstContact`: the display name, the member code, the client id and
+    # the Flatex bank account block.
+    "displayname", "membercode", "flatexbankaccount", "id", "firstname", "lastname",
+    "dateofbirth",
 }
 
 
@@ -99,11 +148,23 @@ def _safe_body(payload) -> str:
     return json.dumps(_redact(payload))[:500]
 
 
+def _is_expired(state: dict, now: Optional[float] = None) -> bool:
+    reference = time.time() if now is None else now
+    return reference - state.get("created_at", 0) > _PENDING_TTL
+
+
 def _clean_pending():
     now = time.time()
-    expired = [k for k, v in _pending.items() if now - v.get("created_at", 0) > _PENDING_TTL]
+    expired = [k for k, v in _pending.items() if _is_expired(v, now)]
     for k in expired:
         _pending.pop(k, None)
+
+
+def _store_pending(process_id: str, state: dict) -> None:
+    if len(_pending) >= MAX_PENDING:
+        log.warning("DEGIRO pending capacity reached (%d)", len(_pending))
+        raise HTTPException(status_code=503, detail="UPSTREAM_UNAVAILABLE")
+    _pending[process_id] = state
 
 
 def _client() -> httpx.AsyncClient:
@@ -207,15 +268,43 @@ async def _fetch_portfolio(client: httpx.AsyncClient, session_id: str, int_accou
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail="Could not fetch DEGIRO portfolio")
 
-    data = resp.json()
-    cash_eur = parse_cash_eur(data.get("cashFunds", {}).get("value", []))
-    raw_positions = parse_raw_positions(data.get("portfolio", {}).get("value", []))
+    # Completeness gate. Java trusts this payload — it books cash + Σ size × price as
+    # the account value, writes a daily snapshot and replaces every holding — so a
+    # reshaped 200 (renamed block, moved field) must fail the sync rather than come
+    # back as cash=0 / no positions and wipe the last good holdings. Same discipline
+    # as the 401 → SESSION_EXPIRED rule in the DEGIRO ADR.
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        log.warning("DEGIRO portfolio response is not JSON")
+        raise HTTPException(status_code=502, detail="UPSTREAM_FORMAT_CHANGED") from exc
+    if not isinstance(data, dict):
+        log.warning("DEGIRO portfolio response is not an object")
+        raise HTTPException(status_code=502, detail="UPSTREAM_FORMAT_CHANGED")
+    try:
+        cash_eur = parse_cash_eur(_block_rows(data, "cashFunds"))
+        raw_positions = parse_raw_positions(_block_rows(data, "portfolio"))
+    except PortfolioFormatError as exc:
+        # The message names the block/field, never a value.
+        log.warning("DEGIRO portfolio response rejected: %s (top-level keys=%s)", exc, sorted(data.keys()))
+        raise HTTPException(status_code=502, detail="UPSTREAM_FORMAT_CHANGED") from exc
     product_ids = [p["productId"] for p in raw_positions if p["productId"] is not None]
 
     products = await _fetch_product_info(client, session_id, int_account, product_ids) if product_ids else {}
     positions = build_positions(raw_positions, products)
 
     return {"cashEur": cash_eur, "positions": positions}
+
+
+def _block_rows(data: dict, key: str):
+    """Returns `data[key]["value"]` — the rows of one /update block — or None when
+    the block is absent or not shaped as expected, which the parsers treat as a
+    format change rather than an empty block."""
+    block = data.get(key)
+    if not isinstance(block, dict):
+        return None
+    rows = block.get("value")
+    return rows if isinstance(rows, list) else None
 
 
 async def _fetch_product_info(client: httpx.AsyncClient, session_id: str, int_account: int, product_ids: list) -> dict:
@@ -235,10 +324,10 @@ async def _fetch_product_info(client: httpx.AsyncClient, session_id: str, int_ac
         if resp.status_code != 200:
             return {}
         data = resp.json().get("data", {})
-        # No truncation here (unlike the login/account logs above): this is DEGIRO's
-        # own market/product data, not a credential, and the previous 1000-char cap
-        # cut the dump off before reaching later product ids in the batch.
-        log.info("DEGIRO product info response for %s: %s", product_ids, json.dumps(data))
+        # Shape only: the full dump is the user's whole portfolio composition (every
+        # ISIN, name and price held), which no sidecar logs. Key names and counts are
+        # what a DEGIRO shape change needs to be debugged.
+        log.info("DEGIRO product info response for %d ids: %s", len(product_ids), describe_product_info(data))
         products = build_product_info_map(data)
         return products
     except Exception as ex:
@@ -249,17 +338,37 @@ async def _fetch_product_info(client: httpx.AsyncClient, session_id: str, int_ac
 # ─── Request/response models ───────────────────────────────────────────────
 
 class InitiateRequest(BaseModel):
-    username: str
-    password: str
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=100)
 
 
 class CompleteRequest(BaseModel):
-    processId: str
-    code: str
+    model_config = ConfigDict(extra="forbid")
+
+    processId: str = Field(min_length=1, max_length=100)
+    code: str = Field(pattern=r"^\d{6}$")
 
 
 class PortfolioRequest(BaseModel):
-    sessionBlob: str
+    model_config = ConfigDict(extra="forbid")
+
+    sessionBlob: str = Field(min_length=2, max_length=10_000)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    _: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    fields = {
+        str(error["loc"][-1])
+        for error in exc.errors()
+        if error.get("loc")
+    }
+    detail = "INVALID_OTP" if "code" in fields else "INVALID_DATA"
+    return JSONResponse(status_code=400, content={"detail": detail})
 
 
 # ─── Routes ─────────────────────────────────────────────────────────────────
@@ -283,7 +392,7 @@ async def initiate(req: InitiateRequest):
 
     if result.get("needsTotp"):
         await client.aclose()
-        _pending[process_id] = {"username": req.username, "password": req.password, "created_at": time.time()}
+        _store_pending(process_id, {"username": req.username, "password": req.password, "created_at": time.time()})
         return {"processId": process_id, "totpRequired": True}
 
     try:
@@ -298,8 +407,10 @@ async def initiate(req: InitiateRequest):
 @app.post("/complete")
 async def complete(req: CompleteRequest):
     state = _pending.pop(req.processId, None)
-    if not state:
-        raise HTTPException(status_code=404, detail="processId not found or expired — please re-authenticate")
+    if not state or _is_expired(state):
+        # Enforced here too, not only by the sweeper: a stale entry must never spend a
+        # DEGIRO login attempt with a password past its TTL. 410 like the siblings.
+        raise HTTPException(status_code=410, detail="AUTH_ATTEMPT_EXPIRED")
 
     log.info("DEGIRO TOTP complete for processId %s", req.processId)
     client = _client()

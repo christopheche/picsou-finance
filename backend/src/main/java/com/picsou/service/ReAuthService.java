@@ -23,22 +23,24 @@ public class ReAuthService {
     }
 
     public void verify(AppUser user, ReAuthDto reAuth) {
+        // Messages are user-facing sentences (error-handling.md "Backend message language");
+        // the machine-readable marker is the REAUTH_FAILED code set by GlobalExceptionHandler.
         if (reAuth == null) {
-            throw new ReAuthFailedException("re-auth payload missing");
+            throw new ReAuthFailedException("Please confirm your identity to continue.");
         }
         if (mfaService.isEnabled(user)) {
             if (reAuth.totpCode() == null || reAuth.totpCode().isBlank()) {
-                throw new ReAuthFailedException("totp required");
+                throw new ReAuthFailedException("A verification code is required.");
             }
             if (!mfaService.verifyTotp(user, reAuth.totpCode())) {
-                throw new ReAuthFailedException("invalid totp");
+                throw new ReAuthFailedException("The verification code is incorrect.");
             }
         } else {
             if (reAuth.password() == null || reAuth.password().isBlank()) {
-                throw new ReAuthFailedException("password required");
+                throw new ReAuthFailedException("Your password is required.");
             }
             if (!passwordEncoder.matches(reAuth.password(), user.getPasswordHash())) {
-                throw new ReAuthFailedException("invalid password");
+                throw new ReAuthFailedException("Your password is incorrect.");
             }
         }
     }

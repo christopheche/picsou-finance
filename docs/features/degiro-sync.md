@@ -1,11 +1,14 @@
 # Feature: DEGIRO sync
 
-> Last updated: 2026-08-05
+> Last updated: 2026-09-06
 > Status: ✅ **Active — validated end-to-end against a live DEGIRO account**
 > (login incl. TOTP, portfolio sync, holdings resolution). Wired into both
 > the DEGIRO tab in `SyncPage` and the unified "Add account" modal
 > (`AddAccountModal` → `DegiroPanel`, mirroring `BourseDirectPanel`).
-> `degiro-auth` must be enabled in `docker-compose.yml` (uncommented) to run.
+> `degiro-auth` ships enabled in both compose files (root `docker-compose.yml`
+> and the GHCR release stack `docker/docker-compose.yml`), is published as
+> `ghcr.io/zoeille/picsou-finance/degiro-auth`, and its parser tests run in CI
+> (`degiro-sidecar` job).
 > See "Known limitations" below for the couple of things still worth
 > double-checking, and "Fixed during live testing" for what a first real
 > account run actually caught.
@@ -42,6 +45,25 @@ browser-automation one.
    `GET /pa/secure/client` to resolve `intAccount`. Returns an opaque
    `{sessionId, intAccount}` blob, which Java encrypts via `CryptoEncryption`
    into `DegiroSession.sessionBlob` — Java never parses this blob's contents.
+
+Both auth calls share the per-IP `degiroAuthBuckets` (5 per 15 min); `/complete`
+is throttled for the same reason as `/initiate` — the TOTP space is only 1M, so
+an unthrottled verify endpoint is brute-forceable once a `processId` is known.
+`POST /api/degiro/sync` is throttled too, on the shared per-IP `syncBuckets`
+(10/minute), because every call decrypts the stored session and performs a live
+portfolio fetch from the instance's IP, which DEGIRO itself throttles. The two
+budgets are separate, so exhausting sync never locks the member out of
+re-authenticating.
+
+Between the two calls the sidecar keeps the plaintext credentials in memory
+(they are re-submitted with the TOTP code). That entry lives at most
+`_PENDING_TTL` (5 min): a 30 s sweeper task (`lifespan`) drops expired entries
+on its own, `/complete` refuses a stale or unknown `processId` with
+`410 AUTH_ATTEMPT_EXPIRED` before spending a DEGIRO login attempt, and the
+store is capped at `MAX_PENDING` (`503 UPSTREAM_UNAVAILABLE` beyond it) — the
+same lifecycle as the Bourso/Amundi/Bourse Direct sidecars. Request bodies are
+validated like the siblings' (`extra="forbid"`, bounded lengths, 6-digit
+`code`), answered with `400 INVALID_DATA` / `INVALID_OTP`.
 
 ### Session lifetime — the one thing genuinely different from other integrations
 
@@ -84,12 +106,75 @@ Direct made — a user who wants historical trades can backfill them through the
 generic CSV importer ([csv-transaction-import.md](csv-transaction-import.md))
 using DEGIRO's own transaction export.
 
+### Fail-closed portfolio contract
+
+Java trusts `/portfolio`'s payload outright: `DegiroSyncService.upsertAccount`
+books `cashEur + Σ quantity × currentPrice` as the account balance, writes
+today's snapshot and replaces every holding. A reshaped DEGIRO response must
+therefore fail the sync rather than come back as a plausible-but-wrong
+portfolio — the same discipline the [session-only ADR](../decisions/2026-08-05-degiro-session-only-no-stored-totp.md)
+applies to a 401. `portfolio_parser` raises `PortfolioFormatError`, and
+`/portfolio` answers `502 UPSTREAM_FORMAT_CHANGED` (which `DegiroAdapter` maps
+to a `SyncException`, leaving the stored account and holdings untouched), when:
+
+- the `/update` body is not JSON / not an object, or lacks the `cashFunds` or
+  `portfolio` block;
+- `cashFunds` has no EUR row, or its `value` is missing / non-numeric — a
+  French DEGIRO account always carries its EUR base-currency row (confirmed
+  live, even at 0), so "no EUR row" means the shape moved, not "no cash";
+- a real-instrument row (numeric product id) has a missing or non-numeric
+  `size` or `price`. Pseudo-positions such as `FLATEX_EUR` are skipped before
+  their fields are required, and a `size` of 0 is still a legitimately closed
+  line.
+
+An empty `portfolio.value` list stays a legitimate all-sold portfolio. The
+`totalPortfolio` block DEGIRO returns alongside is requested but not yet
+reconciled against `cash + Σ size × price`: its fields (`reportPortfValue`,
+`reportNetliq`, …) have not been captured live and may be end-of-day figures,
+so a tolerance check against them cannot be written without a real capture —
+tracked under "Known limitations".
+
+Log hygiene: `/pa/secure/client` bodies are logged through `_safe_body`, which
+now also masks the holder's `displayName`, `memberCode`, `id`, `firstName`,
+`lastName`, `dateOfBirth` and `flatexBankAccount`; the product-info response
+is logged shape-only (`describe_product_info`: count + field names, never an
+ISIN, name or price), since the full dump is the user's whole portfolio
+composition.
+
 Position ISIN resolution reuses the existing `OpenFigiIsinConverter` pipeline
 (shared with manual transactions, CSV import, Bourso) — the sidecar resolves
 DEGIRO's internal `productId` to an ISIN via
 `POST /product_search/secure/v5/products/info` before Java ever sees the
 position. Holdings that resolve to the same ticker are merged with
 `HoldingDedup.vwapMerge` (shared with Bourso/IBKR/TR).
+
+A position with **neither ISIN nor symbol** cannot be keyed as a holding.
+`DegiroAdapter` reads the sidecar's text fields through `textOrNull`, so an
+absent key, a JSON `null` (what the sidecar sends after sanitising DEGIRO's
+literal `"NULL"`) and a blank string all reach the service as `null` — Jackson's
+`asText()` alone answers the *string* `"null"` for a JSON null, and every such
+position used to collapse into one `account_holding` keyed `""` or `"null"`,
+VWAP-blended across unrelated instruments. `upsertAccount` now skips the
+holding with a WARN naming the instrument, but keeps DEGIRO's own
+`quantity × currentPrice` for it in the account total: that money is real, and
+dropping it would understate the balance and the day's snapshot.
+
+`upsertAccount` also refuses to rebuild a **soft-deleted** account
+(`existsSoftDeletedByExternalAccountIdAndMemberId`, the guard every other
+connector already had — see the
+[account-deletion ADR](../decisions/2026-08-11-account-deletion-removes-its-connection.md)).
+Deleting the DEGIRO account clears the session with it, so hitting the guard
+means a sync raced the deletion; it throws `SyncException` rather than insert a
+live duplicate sharing the external id with the deleted row's history.
+
+The **post-auth sync** (`storeSessionAndSync`) is the one run the user never
+sees the result of: `completeAuth` returns the session status. A
+`SyncException` there (sidecar down, DEGIRO refusing `/portfolio`) is logged at
+WARN, anything else at ERROR with its trace, and both record
+`last_error = INITIAL_SYNC_FAILED` on the row. The status deliberately stays
+`ACTIVE`: the session itself is valid, `FAILED` renders as "not connected" in
+`DegiroPanel` and would send the user back through TOTP over a transient
+failure, and the real message resurfaces on the next manual sync.
 
 ### Key files
 
@@ -207,6 +292,11 @@ public-reference-based guesses got wrong or missed entirely:
   (e.g. for other currencies or account types) — `is_real_product_id`'s
   numeric-only filter should catch any of them the same way, but none besides
   `FLATEX_EUR` have been observed yet.
+- The `totalPortfolio` block is requested but not reconciled (see "Fail-closed
+  portfolio contract"): once a live capture confirms which of its fields is the
+  live total, `cash + Σ size × price` should be checked against it with the
+  `max(0.05 €, 0.1 %)` tolerance the other sidecars use, answering
+  `PORTFOLIO_INCOMPLETE` on a mismatch.
 
 These remaining items are minor relative to the confirmed end-to-end success —
 the status banner at the top of this file already reflects that — but worth
@@ -217,16 +307,33 @@ keeping an eye on across future syncs, especially the 2FA response shape.
 - `services/degiro-auth/test_portfolio_parser.py` — pure parsing logic
   (value-pair flattening, cash/position extraction, product-info merge with
   graceful fallback, `FLATEX_EUR`-style pseudo-position filtering, `"NULL"`
-  literal sanitization, `closePrice`/`breakEvenPrice` sourcing, and an
+  literal sanitization, `closePrice`/`breakEvenPrice` sourcing, the
+  fail-closed cases — missing block, no EUR row, row without `size`/`price`,
+  non-numeric values — the shape-only product-info description, and an
   end-to-end regression test for the int/string product-id key mismatch that
-  caused every "NULL" ticker seen live), run with `python3 -m unittest` —
-  30/30 passing.
+  caused every "NULL" ticker seen live), run with `python3 -m unittest`.
+- `services/degiro-auth/test_main.py` — the HTTP contract with DEGIRO answered
+  by an `httpx.MockTransport`: a live-shaped `/update` body parsed and
+  enriched, an all-sold portfolio, a renamed `cashFunds` / missing `portfolio`
+  block and a row without a price all refused with `UPSTREAM_FORMAT_CHANGED`,
+  a 401 still surfacing as 401, product-info failure keeping the positions;
+  pending-credential lifecycle (sweep, stale `/complete` → 410, `MAX_PENDING`);
+  request validation (`INVALID_DATA` / `INVALID_OTP`); log redaction of the
+  holder's identity.
+
+  Both modules run on every PR by the `degiro-sidecar` job in
+  `.github/workflows/ci.yml`, inside the built sidecar image like the other
+  sidecars.
 - `backend/src/test/java/com/picsou/service/DegiroSyncServiceTest.java` —
   auth flow, sync upsert + holding dedup, expired-session → `REAUTH_REQUIRED`
   transition (asserted through `DegiroSessionStatusWriter`, since an
   in-transaction write would be rolled back by the rethrow), the non-expiry
-  failure path leaving the status alone, and the status/clear endpoints. Run
-  with `mvn test -Dtest=DegiroSyncServiceTest` — 10/10 passing. The full
+  failure path leaving the status alone, positions without ISIN or symbol kept
+  in the balance but not persisted as a holding, the soft-deleted account
+  guard, a failed post-auth sync recorded as `INITIAL_SYNC_FAILED` on a still
+  `ACTIVE` session, and the status/clear endpoints. Run with
+  `mvn test -Dtest=DegiroSyncServiceTest`. `DegiroAdapterTest` pins
+  `textOrNull` (JSON null → `null`, never the string `"null"`). The full
   backend suite (`mvn test`) is the CI gate; no absolute count is recorded here
   because it drifts with every unrelated PR.
 - Frontend: `tsc --noEmit` and `eslint .` both clean; no dedicated

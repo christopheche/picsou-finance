@@ -35,15 +35,34 @@ api.interceptors.request.use((config) => {
 })
 
 let isRefreshing = false
-let refreshSubscribers: Array<() => void> = []
 
-function subscribeToRefresh(cb: () => void) {
-  refreshSubscribers.push(cb)
+/**
+ * Requests that 401'd while a refresh was already in flight. Each entry settles the
+ * caller's promise both ways: `resolve` replays it once the refresh succeeds, `reject`
+ * fails it with its own 401 when the refresh dies. A resolve-only queue used to leave
+ * every queued caller pending forever on a failed refresh (TanStack queries stuck in
+ * `pending`) and replayed those stale requests — old `?memberId`, old body — on the
+ * next successful refresh, possibly under a different user's session.
+ */
+type RefreshSubscriber = { resolve: () => void; reject: () => void }
+let refreshSubscribers: RefreshSubscriber[] = []
+
+function subscribeToRefresh(subscriber: RefreshSubscriber) {
+  refreshSubscribers.push(subscriber)
+}
+
+function drainRefreshSubscribers(): RefreshSubscriber[] {
+  const subscribers = refreshSubscribers
+  refreshSubscribers = []
+  return subscribers
 }
 
 function notifyRefreshSubscribers() {
-  refreshSubscribers.forEach(cb => cb())
-  refreshSubscribers = []
+  drainRefreshSubscribers().forEach(s => s.resolve())
+}
+
+function rejectRefreshSubscribers() {
+  drainRefreshSubscribers().forEach(s => s.reject())
 }
 
 export function isSetupRequiredResponse(status: number | undefined, data: unknown): boolean {
@@ -65,12 +84,43 @@ api.interceptors.response.use(
     return res
   },
   async error => {
-    const originalRequest = error.config as typeof error.config & { _retry?: boolean }
+    const originalRequest = error.config as typeof error.config & {
+      _retry?: boolean
+      _impersonationRetry?: boolean
+    }
 
     // Network error detection (no response at all, or CORS-blocked)
     if (!error.response && !error.config?.url?.includes('/auth/')) {
       if (!useAppStore.getState().demoMode) {
         useConnectivityStore.getState().setConnected(false)
+      }
+    }
+
+    // 403 on a GET that carried the admin's persisted impersonation target: the
+    // backend refuses `?memberId=X` once member X has activated their own login
+    // (UserContext.getMemberIdOverride). `activeMemberId` lives in localStorage and
+    // is only cleared at login/logout, so without this the admin was thrown to
+    // /error/403 on every page load — before the sidebar switcher (the only in-app
+    // way to clear the target) could render. Drop the stale target and replay the
+    // request under the admin's own scope instead. GETs only: replaying a mutation
+    // under a different member would silently write to the wrong profile.
+    if (
+      error.response?.status === 403 &&
+      error.config?.method === 'get' &&
+      !originalRequest._impersonationRetry
+    ) {
+      const { activeMemberId } = useProfileStore.getState()
+      const isAdmin = useAuthStore.getState().user?.role === 'ADMIN'
+      const sentMemberId = originalRequest.params?.memberId
+      if (isAdmin && activeMemberId != null && sentMemberId === activeMemberId) {
+        useProfileStore.getState().reset()
+        originalRequest._impersonationRetry = true
+        // The request interceptor already spread `memberId` into `params`; the store
+        // is null now, so it won't be re-added, but the copy on the config must go.
+        const params = { ...originalRequest.params }
+        delete params.memberId
+        originalRequest.params = params
+        return api(originalRequest)
       }
     }
 
@@ -113,8 +163,15 @@ api.interceptors.response.use(
       !originalRequest.url?.includes('/auth/')
     ) {
       if (isRefreshing) {
-        return new Promise(resolve => {
-          subscribeToRefresh(() => resolve(api(originalRequest!)))
+        return new Promise((resolve, reject) => {
+          subscribeToRefresh({
+            resolve: () => {
+              // A replay that 401s again must fail, not start another refresh cycle.
+              originalRequest._retry = true
+              resolve(api(originalRequest!))
+            },
+            reject: () => reject(error),
+          })
         })
       }
 
@@ -131,6 +188,7 @@ api.interceptors.response.use(
         // sees `isAuthenticated=true` and bounces back to "/", which fires
         // /family/members → 401 → refresh → 401 → redirect → … infinite loop.
         useAuthStore.getState().logout()
+        rejectRefreshSubscribers()
         if (window.location.pathname !== '/login') {
           window.location.href =
             '/login?redirect=' +

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { cn, formatCurrency, formatDate, formatPercent, freshnessLevel, localeFromLanguage, parseDate, todayLabel } from './utils'
+import { cn, formatCurrency, formatDate, formatPercent, formatTimeAgo, freshnessLevel, localeFromLanguage, parseDate, safeRedirect, todayLabel } from './utils'
 
 describe('cn', () => {
   it('merges class names', () => {
@@ -203,5 +203,61 @@ describe('freshnessLevel', () => {
   /** Server clock ahead of the browser: an age below zero is as fresh as it gets, not old. */
   it('treats a future date as fresh', () => {
     expect(freshnessLevel(ago(-DAY), bounds, NOW)).toBe('fresh')
+  })
+})
+
+describe('formatTimeAgo', () => {
+  // Same reason as the formatDate block: a date-only value is a calendar day, and it must be
+  // anchored at local midnight like `freshnessLevel` (which decides the bucket the card shows
+  // next to this label) — otherwise the two disagree by the local UTC offset.
+  beforeEach(() => {
+    vi.stubEnv('TZ', 'America/New_York')
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-29T14:00:00Z')) // 10:00 in New York
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllEnvs()
+  })
+
+  it('anchors a date-only value at local midnight', () => {
+    expect(formatTimeAgo('2026-08-29', 'en-US')).toBe('10 hours ago')
+  })
+
+  it('agrees with freshnessLevel on a date-only value exactly 7 local days old', () => {
+    const bounds = { fresh: 24 * 3_600_000, recent: 3 * 24 * 3_600_000, stale: 7 * 24 * 3_600_000 }
+    expect(freshnessLevel('2026-08-22', bounds)).toBe('old')
+    expect(formatTimeAgo('2026-08-22', 'en-US')).toBe('7 days ago')
+  })
+
+  it('still honours the offset of a value that carries a time', () => {
+    expect(formatTimeAgo('2026-08-29T13:30:00Z', 'en-US')).toBe('30 minutes ago')
+  })
+
+  it('returns a dash for a missing value', () => {
+    expect(formatTimeAgo(null)).toBe('—')
+  })
+})
+
+describe('safeRedirect', () => {
+  it('keeps a same-origin path with its query string', () => {
+    expect(safeRedirect('/accounts/3?x=1')).toBe('/accounts/3?x=1')
+  })
+
+  it('falls back on empty or absolute URLs', () => {
+    expect(safeRedirect(null)).toBe('/')
+    expect(safeRedirect('')).toBe('/')
+    expect(safeRedirect('https://evil.example/phish')).toBe('/')
+    expect(safeRedirect('accounts')).toBe('/')
+  })
+
+  it('rejects protocol-relative and backslash-normalised host redirects', () => {
+    expect(safeRedirect('//evil.example')).toBe('/')
+    expect(safeRedirect('//evil.example/phish')).toBe('/')
+    expect(safeRedirect('/\\evil.example')).toBe('/')
+  })
+
+  it('honours a custom fallback', () => {
+    expect(safeRedirect('//evil.example', '/settings')).toBe('/settings')
   })
 })

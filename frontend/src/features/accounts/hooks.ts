@@ -1,4 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query'
+import type { TFunction } from 'i18next'
 import { accountsApi, realEstateApi } from './api'
 import type { AccountRequest, Account, DebtRequest, HoldingResponse, OwnershipRequest, RealEstateMetadataRequest, TransactionImportRequest, TransactionRequest } from '@/types/api'
 import { QUERY_STALE_TIMES } from '@/lib/constants'
@@ -11,7 +12,11 @@ export interface HoldingWithAccount extends HoldingResponse {
 
 export interface PortfolioLine {
   id: string
+  /** Backend-provided instrument name. For the aggregated cash line this is the bare
+   *  currency code — render lines through `portfolioLineLabel()` so it gets translated. */
   name: string
+  /** The single aggregated cash line (`id: 'cash-aggregated'`), labelled client-side. */
+  isCash: boolean
   ticker: string | null
   quantity: number
   accountName: string
@@ -27,6 +32,40 @@ export interface PortfolioLine {
 }
 
 const HOLDING_ACCOUNT_TYPES: Account['type'][] = ['PEA', 'COMPTE_TITRES', 'CRYPTO', 'EMPLOYEE_SAVINGS']
+
+/**
+ * User-visible name of a portfolio line. The data hook stays locale-agnostic: the cash
+ * line used to carry a hardcoded French "Euros" that reached every locale untranslated
+ * (and made the search box match only that word).
+ */
+export function portfolioLineLabel(line: PortfolioLine, t: TFunction): string {
+  return line.isCash ? t('portfolio.cash') : line.name
+}
+
+/**
+ * Every query built from account balances. A sync, a transaction, a snapshot or an
+ * import moves the net worth, and the dashboard renders it from several keys at once —
+ * the headline total (`['dashboard']`), the chart (`['history']`), the P&L header
+ * (`['pnl']`), the 24H series (`['net-worth-intraday']`) and the property roll-up
+ * (`['real-estate']`). Invalidating only `['accounts']` + `['dashboard']` left the same
+ * screen showing two different net-worth figures until `QUERY_STALE_TIMES.dashboard`
+ * elapsed. Keys are listed here rather than imported from each feature's hooks file so
+ * the accounts → history/dashboard dependency stays one-way.
+ */
+export const WEALTH_QUERY_KEYS = [
+  ['accounts'],
+  ['dashboard'],
+  ['history'],
+  ['pnl'],
+  ['net-worth-intraday'],
+  ['real-estate'],
+] as const
+
+export function invalidateWealthQueries(queryClient: QueryClient) {
+  for (const queryKey of WEALTH_QUERY_KEYS) {
+    void queryClient.invalidateQueries({ queryKey: [...queryKey] })
+  }
+}
 
 // Single source of truth: recompute the (value, cost, pnl, pct) trio from a live price.
 // Keeps all four derived numbers consistent with the same price snapshot.
@@ -64,6 +103,7 @@ export function usePortfolio() {
           return holdings.map(h => ({
             id: `${account.id}-${h.ticker}`,
             name: h.name ?? h.ticker,
+            isCash: false,
             ticker: h.ticker,
             quantity: h.quantity,
             accountName: account.name,
@@ -109,12 +149,13 @@ export function usePortfolio() {
         }
       })
 
-      // Cash accounts — aggregate into a single "Euros" line (exclude LOAN accounts)
+      // Cash accounts — aggregate into a single cash line (exclude LOAN accounts)
       const cashAccounts = accounts.filter(a => !HOLDING_ACCOUNT_TYPES.includes(a.type) && a.type !== 'LOAN')
       if (cashAccounts.length > 0) {
         enriched.push({
           id: 'cash-aggregated',
-          name: 'Euros',
+          name: 'EUR',
+          isCash: true,
           ticker: 'EUR',
           quantity: 0,
           accountName: cashAccounts.map(a => a.name).join(', '),
@@ -260,18 +301,30 @@ export function useAccountDeletionImpact(accountId: number | null) {
   })
 }
 
+/**
+ * Deleting an account also removes the connection feeding it once no live account is
+ * left on it (ADR 2026-08-11), so every sync-status list must refetch too — `['sync']`
+ * is `syncKeys.all` from `features/sync/hooks.ts`, spelled out here to keep the
+ * accounts → sync dependency one-way (pinned by a test).
+ */
 export function useDeleteAccount() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => accountsApi.delete(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+    onSuccess: (_data, id) => {
+      invalidateWealthQueries(queryClient)
       queryClient.invalidateQueries({ queryKey: ['goals'] })
+      queryClient.invalidateQueries({ queryKey: ['sync'] })
+      queryClient.invalidateQueries({ queryKey: ['loan-summary', id] })
     },
   })
 }
 
+/**
+ * A snapshot dated on or after the latest one rewrites the account balance server-side
+ * (`AccountService.addManualSnapshot`), so the list, the dashboard and the history
+ * chart all move — not just the detail page.
+ */
 export function useAddSnapshot() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -280,6 +333,7 @@ export function useAddSnapshot() {
     onSuccess: (_, { id }) => {
       queryClient.invalidateQueries({ queryKey: ['accounts', id, 'history'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', id] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -391,7 +445,7 @@ export function useAddTransaction(accountId: number) {
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'transactions'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'history'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -404,7 +458,7 @@ export function useDeleteTransaction(accountId: number) {
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'transactions'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'history'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -419,7 +473,7 @@ export function useUpdateTransaction(accountId: number) {
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'holdings'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'history'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -432,7 +486,7 @@ export function useUpdateHolding(accountId: number) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'holdings'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -444,7 +498,7 @@ export function useDeleteHolding(accountId: number) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'holdings'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -469,7 +523,7 @@ export function useExecuteImport(accountId: number) {
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'history'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId, 'realized-pnl'] })
       queryClient.invalidateQueries({ queryKey: ['accounts', accountId] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }

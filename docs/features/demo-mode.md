@@ -49,10 +49,13 @@ VITE_DEMO_MODE=true
 ## Gotchas / Pitfalls
 
 - **`/login` redirects to `/` in demo mode** — `PublicOnly` redirects immediately. To see the login page, disable `VITE_DEMO_MODE`.
-- **Mock handlers are keyed by exact route** — the key is `METHOD /path` with no query string or trailing slash. Any new API route needs a handler added in `frontend/src/demo/index.ts`, otherwise the call returns `{}` silently — and components that `.map()`/`.filter()` the payload crash the page. This bit the dashboard (`GET /history`), `GET /history/pnl`, intraday, access keys, MFA status, sessions, and family members until handlers were added (2026-07-07). Query params (e.g. `?split=true` on `/history`) are read from `config.params` inside the handler.
+- **Mock handlers are keyed by exact route** — the key is `METHOD /path` with no query string or trailing slash. Any new API route needs a handler added in `frontend/src/demo/index.ts`, otherwise the call returns `{}` silently — and components that `.map()`/`.filter()` the payload crash the page. This bit the dashboard (`GET /history`), `GET /history/pnl`, intraday, access keys, MFA status, sessions, and family members until handlers were added (2026-07-07), then the connector status routes (`GET /finary/status` was still keyed on the retired `/finary/configured`, DEGIRO and Bourse Direct had none) and `GET /accounts/{id}/holdings` for non-investment accounts (2026-09-06). Query params (e.g. `?split=true` on `/history`) are read from `config.params` inside the handler.
+- **Type the mocks against the real DTOs** — handlers return `unknown`, so a member added to a backend response (e.g. `Account.logoKey`) is invisible here unless the mock is annotated (`satisfies Account`, `: FinaryPreviewResponse`, `Awaited<ReturnType<typeof bankSyncApi.getStatus>>` for `mockRequisitions`). Do that for every new inline object; `bun run typecheck` then catches the drift. Import the API modules as `import type` only — a value import from `demo/data/*` would create an `api-client → demo → sync/api → api-client` cycle.
 - **Artificial delay of 200–600 ms** — intentional, to simulate network latency. Do not remove it for visual testing.
 - **`demoMode` is not persisted** — intentional. Do not add it to `partialize` without understanding the implications (see above).
 
 ## Tests
 
 The Playwright suite (`frontend/e2e/*.spec.ts`, `bun run test:e2e`) runs entirely against demo mode — it is the de-facto regression net for the handler table. Not run in CI; run it locally against a dev server started with `VITE_DEMO_MODE=true`.
+
+`frontend/src/demo/index.test.ts` (Vitest) pins the routes that drifted once: every connector `GET */status` route read by `features/sync/api.ts`, `GET /accounts/{id}/holdings` for every mock account, the `fileToken` field of the Finary API-sync preview, the `logoUrl`/`logoKey` members on created/linked accounts, and the warn-and-`{}` fallback for an unregistered route.

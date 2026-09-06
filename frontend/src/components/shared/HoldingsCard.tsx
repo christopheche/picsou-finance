@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { usePortfolio, type PortfolioLine } from '@/features/accounts/hooks'
+import { portfolioLineLabel, usePortfolio, type PortfolioLine } from '@/features/accounts/hooks'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
 import {
   Card,
@@ -41,16 +41,17 @@ const FILTER_TABS: { value: FilterType; labelKey: string; match: (type: Account[
 
 function HoldingsItem({ line, onClick }: { line: PortfolioLine; onClick: () => void }) {
   const { t } = useTranslation()
+  const name = portfolioLineLabel(line, t)
 
   return (
     <Item variant="muted" className="cursor-pointer hover:bg-muted/50 transition-colors" onClick={onClick}>
       <ItemMedia>
         <div className="flex size-12 items-center justify-center rounded-lg border text-sm font-semibold">
-          {line.ticker ? line.ticker.slice(0, 4) : line.name.slice(0, 3).toUpperCase()}
+          {line.ticker ? line.ticker.slice(0, 4) : name.slice(0, 3).toUpperCase()}
         </div>
       </ItemMedia>
       <ItemContent>
-        <ItemTitle>{line.name}</ItemTitle>
+        <ItemTitle>{name}</ItemTitle>
         <ItemDescription className="text-sm">
           {line.quantity > 0
             ? `${line.quantity.toLocaleString()} ${t('dashboard.shares')} · ${line.accountName}`
@@ -101,13 +102,13 @@ export function HoldingsCard() {
     if (search) {
       const q = search.toLowerCase()
       result = result.filter(l =>
-        l.name.toLowerCase().includes(q) ||
+        portfolioLineLabel(l, t).toLowerCase().includes(q) ||
         (l.ticker ?? '').toLowerCase().includes(q) ||
         l.accountName.toLowerCase().includes(q),
       )
     }
     return result.sort((a, b) => b.valueEur - a.valueEur)
-  }, [lines, filter, search])
+  }, [lines, filter, search, t])
 
   if (isLoading) {
     return (

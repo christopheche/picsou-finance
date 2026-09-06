@@ -84,7 +84,10 @@ down the Accounts page.
 Used by:
 
 - `frontend/src/pages/sync/BankSyncTab.tsx` — replaces hand-written extraction in
-  `completeMutation.onError` and `initiateMutation.onError`.
+  `completeMutation.onError` and `initiateMutation.onError`. `bankSyncApi.complete`
+  is a GET by backend contract but a mutation in practice, so it sets
+  `skipGlobalErrorRedirect: true`; without it a 5xx during OAuth completion hit the
+  global GET-5xx redirect to `/error/500` and `onError` never ran.
 - `frontend/src/pages/sync/TradeRepublicTab.tsx` — `formatAuthError` fallback.
 - `frontend/src/pages/sync/BoursoTab.tsx` — `formatError` fallback.
 - `frontend/src/pages/sync/FinaryTab.tsx` — replaces `err instanceof Error ? err.message : ...`.

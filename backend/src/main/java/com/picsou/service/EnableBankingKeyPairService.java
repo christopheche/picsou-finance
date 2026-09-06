@@ -1,5 +1,6 @@
 package com.picsou.service;
 
+import com.picsou.exception.InvalidKeyMaterialException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -8,6 +9,7 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.KeyFactory;
@@ -33,15 +35,18 @@ import java.util.Set;
  * signs. A "Rotate key pair" flow (out of scope here) is the only legitimate
  * way to replace the pair.
  *
- * <p>Private key is written with POSIX 0600 permissions on systems that
- * support them (Linux containers) and plain open-on-Windows dev hosts. The
- * containing directory is created with 0700.
+ * <p>Private key is <em>created</em> with POSIX 0600 permissions on systems that
+ * support them (Linux containers) — never widened by the umask, not even
+ * transiently — and plain open-on-Windows dev hosts. The containing directory
+ * is created with 0700.
  */
 @Service
 public class EnableBankingKeyPairService {
 
     private static final Logger log = LoggerFactory.getLogger(EnableBankingKeyPairService.class);
     private static final int RSA_BITS = 2048;
+    private static final Set<PosixFilePermission> OWNER_ONLY =
+        EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
 
     private final Path privateKeyPath;
 
@@ -97,17 +102,17 @@ public class EnableBankingKeyPairService {
      */
     public String importPrivateKey(String pemContent) {
         if (pemContent == null || pemContent.isBlank()) {
-            throw new IllegalArgumentException("The key file is empty. Paste your private key and try again.");
+            throw new InvalidKeyMaterialException("The key file is empty. Paste your private key and try again.");
         }
         String trimmed = pemContent.strip();
         if (trimmed.contains("-----BEGIN RSA PRIVATE KEY-----")) {
-            throw new IllegalArgumentException(
+            throw new InvalidKeyMaterialException(
                 "PKCS#1 format (BEGIN RSA PRIVATE KEY) is not supported. " +
                 "Convert to PKCS#8 first: openssl pkcs8 -topk8 -nocrypt -in key.pem -out key-pkcs8.pem"
             );
         }
         if (!trimmed.contains("-----BEGIN PRIVATE KEY-----")) {
-            throw new IllegalArgumentException(
+            throw new InvalidKeyMaterialException(
                 "Not a valid PKCS#8 private key PEM (expected -----BEGIN PRIVATE KEY-----)."
             );
         }
@@ -127,14 +132,63 @@ public class EnableBankingKeyPairService {
         writePemToDisk(toPem(key, "PRIVATE KEY"));
     }
 
+    /**
+     * The private key is never on disk with anything but owner-only permissions:
+     * the PEM is written to a temp file <em>created</em> 0600 in the target
+     * directory (so the process umask never widens it) and then atomically moved
+     * into place. A plain {@code Files.writeString} followed by {@code chmod}
+     * would leave a world-readable window on a 022 umask, and a failed chmod
+     * would leave it readable for good.
+     */
     private void writePemToDisk(String pem) throws IOException {
-        Path parent = privateKeyPath.getParent();
-        if (parent != null && !Files.exists(parent)) {
-            Files.createDirectories(parent);
-            trySetPosix(parent, PosixFilePermissions.fromString("rwx------"));
+        Path parent = privateKeyPath.toAbsolutePath().getParent();
+        boolean posix = supportsPosix(parent);
+        if (!Files.exists(parent)) {
+            if (posix) {
+                Files.createDirectories(parent, PosixFilePermissions.asFileAttribute(
+                    PosixFilePermissions.fromString("rwx------")));
+            } else {
+                Files.createDirectories(parent);
+            }
         }
-        Files.writeString(privateKeyPath, pem);
-        trySetPosix(privateKeyPath, EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
+        Path tmp = posix
+            ? Files.createTempFile(parent, "enablebanking-", ".pem.tmp",
+                PosixFilePermissions.asFileAttribute(OWNER_ONLY))
+            : Files.createTempFile(parent, "enablebanking-", ".pem.tmp");
+        try {
+            Files.writeString(tmp, pem);
+            Files.move(tmp, privateKeyPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException | RuntimeException ex) {
+            Files.deleteIfExists(tmp);
+            throw ex;
+        }
+        if (posix) {
+            enforceOwnerOnly(privateKeyPath);
+        }
+    }
+
+    private static boolean supportsPosix(Path dir) {
+        try {
+            Path probe = dir;
+            while (probe != null && !Files.exists(probe)) {
+                probe = probe.getParent();
+            }
+            return probe != null && Files.getFileStore(probe).supportsFileAttributeView("posix");
+        } catch (IOException ex) {
+            return false;
+        }
+    }
+
+    /** Belt and braces after the atomic move; on POSIX a failure here is worth a WARN, not silence. */
+    private static void enforceOwnerOnly(Path path) {
+        try {
+            if (!OWNER_ONLY.equals(Files.getPosixFilePermissions(path))) {
+                Files.setPosixFilePermissions(path, OWNER_ONLY);
+            }
+        } catch (UnsupportedOperationException | IOException ex) {
+            log.warn("Could not restrict permissions on {} to owner-only ({}); tighten them manually",
+                path, ex.toString());
+        }
     }
 
     private static void validatePkcs8Pem(String pem) {
@@ -146,8 +200,11 @@ public class EnableBankingKeyPairService {
             byte[] der = Base64.getDecoder().decode(cleaned);
             KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(der));
         } catch (Exception ex) {
-            throw new IllegalArgumentException(
-                "The PEM could not be parsed as a valid RSA PKCS#8 private key: " + ex.getMessage(), ex
+            // Fixed message: the JDK's text ("java.security.spec.InvalidKeySpecException: …")
+            // is kept as the cause for the log, never shown to the operator.
+            throw new InvalidKeyMaterialException(
+                "The PEM could not be parsed as an RSA PKCS#8 private key. " +
+                "Check that you pasted the complete, unencrypted key file.", ex
             );
         }
     }
@@ -190,11 +247,4 @@ public class EnableBankingKeyPairService {
         return sb.toString();
     }
 
-    private static void trySetPosix(Path path, Set<PosixFilePermission> perms) {
-        try {
-            Files.setPosixFilePermissions(path, perms);
-        } catch (UnsupportedOperationException | IOException ignored) {
-            // Non-POSIX filesystem (Windows dev host) — best effort.
-        }
-    }
 }

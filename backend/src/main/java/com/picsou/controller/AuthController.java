@@ -406,15 +406,19 @@ public class AuthController {
         AppUser user = userRepository.findByActivationToken(token)
             .orElseThrow(() -> new BadCredentialsException("Invalid activation token"));
 
+        // ProblemDetail, not an ad-hoc {"error": …} map: the frontend reads `detail`
+        // (error-handling.md "Frontend display"), so anything else shows as a generic error.
         if (user.getActivationTokenExpires() != null &&
             user.getActivationTokenExpires().isBefore(Instant.now())) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(Map.of("error", "Activation token has expired"));
+                .body(ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST,
+                    "This activation link has expired. Ask your administrator for a new one."));
         }
 
         if (!req.acknowledgedWarning()) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(Map.of("error", "You must acknowledge the data access warning"));
+                .body(ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST,
+                    "You must acknowledge the data access warning."));
         }
 
         user.setPasswordHash(passwordEncoder.encode(req.password()));

@@ -7,7 +7,14 @@ RuntimeException
   +-- ResourceNotFoundException      404 NOT_FOUND
   +-- SyncException                  422 UNPROCESSABLE_ENTITY
   +-- WalletRpcException             422 UNPROCESSABLE_ENTITY (adapter-level, see below)
+  +-- InvalidKeyMaterialException    422 UNPROCESSABLE_ENTITY (operator-supplied PEM rejected)
+  +-- MfaException                   400 BAD_REQUEST
+  +-- TotpRequiredException          403 FORBIDDEN
+  +-- MissingScopeException          403 FORBIDDEN      (MCP access-key scope)
+  +-- AccessDeniedException          403 FORBIDDEN      (Spring Security — "may read, not write")
   +-- BadCredentialsException        401 UNAUTHORIZED   (Spring Security)
+  +-- ReAuthService.ReAuthFailedException 401 UNAUTHORIZED (code REAUTH_FAILED)
+  +-- FinaryServiceUnavailableException 502 BAD_GATEWAY
   +-- IllegalArgumentException       400 BAD_REQUEST
   +-- MethodArgumentNotValidException 422 UNPROCESSABLE_ENTITY (via @Valid)
 
@@ -33,12 +40,45 @@ A `@RestControllerAdvice` that extends `ResponseEntityExceptionHandler`. Returns
 | Handler method | Exception | Status | Detail |
 |---------------|-----------|--------|--------|
 | `handleNotFound` | `ResourceNotFoundException` | 404 | `ex.getMessage()` |
+| `handleTotpRequired` | `TotpRequiredException` | 403 | `ex.getMessage()` (logged at INFO) |
+| `handleFinaryUnavailable` | `FinaryServiceUnavailableException` | 502 | generic `"Finary service is temporarily unavailable…"` (logged at WARN) |
 | `handleSync` | `SyncException` | 422 | `ex.getMessage()` plus optional stable `code` (logged at WARN) |
 | `handleWalletRpc` | `WalletRpcException` | 422 | generic `"Could not reach the blockchain network…"` (logged at WARN) |
 | `handleBadCredentials` | `BadCredentialsException` | 401 | `"Invalid credentials"` |
+| `handleAccessDenied` | `AccessDeniedException` (Spring Security) | 403 | `ex.getMessage()` (logged at WARN, no stack trace) |
+| `handleInvalidKeyMaterial` | `InvalidKeyMaterialException` | 422 | fixed operator-facing message; the parser cause is logged at WARN |
 | `handleIllegalArgument` | `IllegalArgumentException` | 400 | `ex.getMessage()` |
+| `handleMfa` | `MfaException` | 400 | `ex.getMessage()` |
+| `handleMissingScope` | `MissingScopeException` | 403 | `ex.getMessage()` |
+| `handleReAuthFailed` | `ReAuthService.ReAuthFailedException` | 401 | `ex.getMessage()` plus `code: "REAUTH_FAILED"` (title stays `"Unauthorized"`) |
 | `handleMethodArgumentNotValid` | `MethodArgumentNotValidException` | 422 | Field map under `"errors"` key |
 | `handleGeneric` | `Exception` (fallback) | 500 | `"An unexpected error occurred"` |
+
+### Authorization refusals: 403 vs 404
+
+Services raise Spring Security's `AccessDeniedException` only for a caller who **may
+read but not write** the resource (a co-owner editing an account's ownership split or
+refreshing its valuation, a non-owner asking for a shared goal's contributions). A
+caller with no access at all gets `ResourceNotFoundException` (404), so the answer
+cannot be used to probe which ids exist — see `AccountAccessResolver.requireOwner`.
+The handler exists because an exception thrown inside the `DispatcherServlet` is
+resolved by the advice and never reaches `ExceptionTranslationFilter`; without it the
+refusal fell into `handleGeneric` as a 500 with a stack trace at ERROR.
+
+### Filter-level errors (Spring Security)
+
+Errors raised **before** the `DispatcherServlet` never reach the advice; `SecurityConfig`
+writes the same `application/problem+json` shape by hand:
+
+| Situation | Status | Body |
+|-----------|--------|------|
+| No / invalid credentials (`authenticationEntryPoint`) | 401 | `{"status":401,"title":"Unauthorized","detail":"Authentication required"}` |
+| Authenticated but not allowed, e.g. non-admin on `/api/admin/**` (`accessDeniedHandler`) | 403 | `{"status":403,"title":"Forbidden","detail":"You do not have permission to perform this action"}` |
+| Setup not complete (`SetupFilter`) | 503 | `{"status":503,"title":"Setup Required","code":"setup_required",…}` |
+
+Never leave a Spring Security handler at its default: `sendError()` lands in Boot's
+`BasicErrorController`, whose `{"timestamp","status","error","path"}` body has no `detail`
+for the frontend to display.
 
 ### Validation error shape (422)
 

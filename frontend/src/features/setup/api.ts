@@ -93,8 +93,9 @@ export const setupApi = {
     setupClient.post<EnableBankingTestResponse>('/integrations/enablebanking/test')
       .then(r => r.data),
 
+  // POST: a successful probe enables the integration server-side (an action, not a read).
   checkBoursoBankSidecar: () =>
-    setupClient.get<BoursoBankHealthResponse>('/integrations/boursobank/health')
+    setupClient.post<BoursoBankHealthResponse>('/integrations/boursobank/test')
       .then(r => r.data),
 
   generateCryptoKey: () =>

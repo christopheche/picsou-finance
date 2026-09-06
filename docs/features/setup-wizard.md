@@ -40,8 +40,12 @@ Backend:
   `setup_audit` table writes; swallows its own errors so audit failure never blocks a
   controller response.
 - `backend/src/main/java/com/picsou/service/EnableBankingKeyPairService.java` —
-  idempotent RSA-2048 PEM generation at `/data/keys/enablebanking-private.pem` (POSIX
-  `0600`).
+  idempotent RSA-2048 PEM generation at `/data/keys/enablebanking-private.pem`. The PEM
+  is written to a temp file *created* with POSIX `0600` in the same directory and moved
+  into place atomically, so the umask never widens it, not even transiently; a failed
+  permission fix-up on POSIX is logged at WARN rather than swallowed. Imported PEMs that
+  cannot be parsed raise `InvalidKeyMaterialException` (422, fixed message — the JDK
+  parser text stays in the log).
 - `backend/src/main/java/com/picsou/service/CryptoKeyGeneratorService.java` —
   idempotent AES-256 key checker/writer. If `CRYPTO_ENCRYPTION_KEY` is already present
   in the running process (the normal bare-metal `.env.local` flow), the wizard treats
@@ -94,7 +98,7 @@ User opens http://host:8080  ──► RequireSetup redirects /login → /setup
 Hello greeting → Admin → Security → Integration picker
     │                                    │
     │                                    ├─ Enable Banking: 5 substeps
-    │                                    ├─ BoursoBank: sidecar ping
+    │                                    ├─ BoursoBank: sidecar ping (POST /integrations/boursobank/test — it enables the integration, so not a GET)
     │                                    ├─ Bourse Direct: post-setup login acknowledgement
     │                                    ├─ Trade Republic: ack
     │                                    ├─ Finary: ack

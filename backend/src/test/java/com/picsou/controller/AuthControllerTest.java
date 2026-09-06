@@ -378,6 +378,45 @@ class AuthControllerTest {
         verify(persistentSessionService).revokeAllForUser(11L);
     }
 
+    @Test
+    void activate_expiredToken_isA400ProblemDetail_withAReadableDetail() {
+        // ProblemDetail, not {"error": …}: the frontend reads `detail`, so an ad-hoc map
+        // would have shown the generic fallback instead of "the link expired".
+        AppUser member = AppUser.builder()
+            .id(11L).username("bob").role(UserRole.MEMBER).passwordHash("").activated(false)
+            .activationToken("tok")
+            .activationTokenExpires(Instant.now().minus(1, ChronoUnit.HOURS))
+            .build();
+        when(userRepository.findByActivationToken("tok")).thenReturn(Optional.of(member));
+
+        ResponseEntity<?> res = controller.activate(
+            "tok", new ActivationRequest("new-password-123", true), httpReq);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(res.getBody()).isInstanceOf(ProblemDetail.class);
+        assertThat(((ProblemDetail) res.getBody()).getDetail()).containsIgnoringCase("expired");
+        assertThat(member.isActivated()).isFalse();
+        verify(userRepository, never()).save(any());
+    }
+
+    @Test
+    void activate_withoutAcknowledgement_isA400ProblemDetail() {
+        AppUser member = AppUser.builder()
+            .id(11L).username("bob").role(UserRole.MEMBER).passwordHash("").activated(false)
+            .activationToken("tok")
+            .activationTokenExpires(Instant.now().plus(1, ChronoUnit.HOURS))
+            .build();
+        when(userRepository.findByActivationToken("tok")).thenReturn(Optional.of(member));
+
+        ResponseEntity<?> res = controller.activate(
+            "tok", new ActivationRequest("new-password-123", false), httpReq);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(res.getBody()).isInstanceOf(ProblemDetail.class);
+        assertThat(((ProblemDetail) res.getBody()).getDetail()).containsIgnoringCase("acknowledge");
+        verify(userRepository, never()).save(any());
+    }
+
     // ─── mfa/verify ──────────────────────────────────────────────────────
 
     @Test

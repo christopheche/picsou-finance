@@ -48,7 +48,7 @@ ExportDataDialog (frontend)
    ▼
 MeExportController
    ├─ Bucket4j rate limit (5/h, keyed on userId)         → 429 if exceeded
-   ├─ ReAuthService.verify(currentUser, body.reAuth)     → 401 if mismatch
+   ├─ ReAuthService.verify(currentUser, body.reAuth)     → 401 if mismatch (ProblemDetail, code REAUTH_FAILED)
    ├─ logger.warn("data_export userId={} options={} ip={}")
    └─ return ResponseEntity<StreamingResponseBody>
                  Content-Type: application/zip

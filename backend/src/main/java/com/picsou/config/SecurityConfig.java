@@ -17,6 +17,7 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.access.AccessDeniedHandler;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
 import org.springframework.security.config.Customizer;
@@ -78,6 +79,22 @@ public class SecurityConfig {
     private boolean hstsEnabled() {
         return parseHstsEnabled(hstsEnabledRaw);
     }
+
+    /**
+     * Filter-level 403 (an authenticated non-admin on {@code /api/admin/**}) as
+     * {@code application/problem+json}, like the 401 entry point next to it. Without
+     * it Spring Security's default {@code sendError(403)} lands in Boot's
+     * {@code BasicErrorController}, whose {@code {"timestamp","status","error","path"}}
+     * body is the one non-ProblemDetail error in the API. Denials raised inside the
+     * DispatcherServlet go through {@code GlobalExceptionHandler} instead.
+     */
+    static final AccessDeniedHandler PROBLEM_DETAIL_ACCESS_DENIED_HANDLER = (req, res, deniedEx) -> {
+        res.setStatus(403);
+        res.setContentType("application/problem+json");
+        res.getWriter().write("""
+            {"status":403,"title":"Forbidden","detail":"You do not have permission to perform this action"}
+            """);
+    };
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http,
@@ -147,6 +164,7 @@ public class SecurityConfig {
                         {"status":401,"title":"Unauthorized","detail":"Authentication required"}
                         """);
                 })
+                .accessDeniedHandler(PROBLEM_DETAIL_ACCESS_DENIED_HANDLER)
             );
 
         return http.build();

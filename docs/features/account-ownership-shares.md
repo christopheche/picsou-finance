@@ -37,7 +37,7 @@ GET /dashboard
             └─> each accountValue x share/100 before it enters any total
 
 PUT /accounts/{id}/ownership
-  └─> requireOwner            a co-owner cannot reallocate shares
+  └─> requireOwner            a co-owner cannot reallocate shares (AccessDeniedException → 403 ProblemDetail)
        ├─ type is REAL_ESTATE or LOAN?   else 422
        ├─ sum <= 100?                    else 422
        ├─ owner present in the split?    else 422

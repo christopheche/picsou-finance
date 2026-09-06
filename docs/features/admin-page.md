@@ -46,7 +46,9 @@ Backend:
   `GET /settings`, `PUT /settings/security`, `PUT /settings/enablebanking`,
   `PATCH /settings/integrations/{key}?enabled=...`, plus EB keypair management
   `POST /settings/enablebanking/keypair` (idempotent generate) and
-  `/keypair/import` (422 on a bad PEM). `GET /settings` reads EB credentials from
+  `/keypair/import` (422 on a bad PEM — `EnableBankingKeyPairService` throws
+  `InvalidKeyMaterialException`, mapped by `GlobalExceptionHandler`; the controller has
+  no try/catch). `GET /settings` reads EB credentials from
   the *resolved* `EnableBankingConfigProvider` (DB-then-env), not raw DB rows, so
   env-configured installs report their real values rather than blanks.
 - `backend/src/main/java/com/picsou/dto/AdminSettingsResponse.java` — record with

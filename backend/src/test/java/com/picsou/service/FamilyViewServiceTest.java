@@ -5,6 +5,7 @@ import com.picsou.model.Account;
 import com.picsou.model.AccountType;
 import com.picsou.model.FamilyMember;
 import com.picsou.model.Goal;
+import com.picsou.model.GoalManualContribution;
 import com.picsou.model.SharedResource;
 import com.picsou.model.SharingLevel;
 import com.picsou.model.SharingSettings;
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.security.access.AccessDeniedException;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -27,7 +29,9 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
@@ -252,5 +256,122 @@ class FamilyViewServiceTest {
         assertThat(response.totalSharedNetWorth()).isEqualByComparingTo("600");
         verify(accessResolver, times(1)).sharesFor(any(), eq(2L));
         verify(accessResolver, never()).shareFor(any(), any());
+    }
+
+    // ─── getGoalContributions: the sharing gate ──────────────────────────────
+    // The goal is loaded by id WITHOUT a member filter (the viewer is not the owner by design),
+    // so the in-method check is the only thing keeping a private goal's contributions private.
+
+    private static final FamilyMember VIEWER = FamilyMember.builder().id(1L).displayName("Viewer").build();
+    private static final FamilyMember OWNER = FamilyMember.builder().id(2L).displayName("Owner").build();
+
+    private static Goal ownersGoal() {
+        return Goal.builder()
+            .id(20L)
+            .name("Private goal")
+            .targetAmount(new BigDecimal("1200"))
+            .deadline(LocalDate.now().plusMonths(6))
+            .accounts(List.of())
+            .member(OWNER)
+            .build();
+    }
+
+    private static GoalManualContribution contribution(FamilyMember member, String amount) {
+        GoalManualContribution c = new GoalManualContribution();
+        c.setMember(member);
+        c.setYearMonth("2026-06");
+        c.setAmount(new BigDecimal(amount));
+        return c;
+    }
+
+    @Test
+    void getGoalContributions_owner_alwaysAllowed_withoutConsultingSharing() {
+        when(goalRepository.findById(20L)).thenReturn(Optional.of(ownersGoal()));
+        when(contributionRepository.findByGoalIdAndMemberId(20L, 1L)).thenReturn(List.of());
+        when(contributionRepository.findByGoalIdAndMemberId(20L, 2L))
+            .thenReturn(List.of(contribution(OWNER, "100"), contribution(OWNER, "50")));
+
+        var result = familyViewService.getGoalContributions(20L, 2L, List.of(VIEWER, OWNER));
+
+        assertThat(result).hasSize(1);
+        assertThat(result.getFirst().memberName()).isEqualTo("Owner");
+        assertThat(result.getFirst().amount()).isEqualByComparingTo("150");
+        verifyNoInteractions(sharingSettingsRepository, sharedResourceRepository);
+    }
+
+    @Test
+    void getGoalContributions_unsharedGoal_otherMember_throwsAccessDenied() {
+        when(goalRepository.findById(20L)).thenReturn(Optional.of(ownersGoal()));
+        when(sharingSettingsRepository.findByMemberIdAndResourceType(2L, "GOAL"))
+            .thenReturn(Optional.of(new SharingSettings(null, OWNER, "GOAL", SharingLevel.NONE)));
+
+        assertThatThrownBy(() -> familyViewService.getGoalContributions(20L, 1L, List.of(VIEWER, OWNER)))
+            .isInstanceOf(AccessDeniedException.class);
+
+        verifyNoInteractions(contributionRepository);
+    }
+
+    @Test
+    void getGoalContributions_noSharingSettings_otherMember_throwsAccessDenied() {
+        when(goalRepository.findById(20L)).thenReturn(Optional.of(ownersGoal()));
+        when(sharingSettingsRepository.findByMemberIdAndResourceType(2L, "GOAL"))
+            .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> familyViewService.getGoalContributions(20L, 1L, List.of(VIEWER, OWNER)))
+            .isInstanceOf(AccessDeniedException.class);
+
+        verifyNoInteractions(contributionRepository);
+    }
+
+    @Test
+    void getGoalContributions_sharedAll_otherMember_allowed() {
+        when(goalRepository.findById(20L)).thenReturn(Optional.of(ownersGoal()));
+        when(sharingSettingsRepository.findByMemberIdAndResourceType(2L, "GOAL"))
+            .thenReturn(Optional.of(new SharingSettings(null, OWNER, "GOAL", SharingLevel.ALL)));
+        when(contributionRepository.findByGoalIdAndMemberId(20L, 1L))
+            .thenReturn(List.of(contribution(VIEWER, "30")));
+        when(contributionRepository.findByGoalIdAndMemberId(20L, 2L))
+            .thenReturn(List.of(contribution(OWNER, "100")));
+
+        var result = familyViewService.getGoalContributions(20L, 1L, List.of(VIEWER, OWNER));
+
+        assertThat(result).extracting(r -> r.memberName()).containsExactly("Viewer", "Owner");
+        verifyNoInteractions(sharedResourceRepository);
+    }
+
+    @Test
+    void getGoalContributions_manualShare_onlyListedGoalVisible() {
+        when(goalRepository.findById(20L)).thenReturn(Optional.of(ownersGoal()));
+        when(sharingSettingsRepository.findByMemberIdAndResourceType(2L, "GOAL"))
+            .thenReturn(Optional.of(new SharingSettings(null, OWNER, "GOAL", SharingLevel.MANUAL)));
+        when(sharedResourceRepository.existsByOwnerMemberIdAndResourceTypeAndResourceId(2L, "GOAL", 20L))
+            .thenReturn(false);
+
+        assertThatThrownBy(() -> familyViewService.getGoalContributions(20L, 1L, List.of(VIEWER, OWNER)))
+            .isInstanceOf(AccessDeniedException.class);
+        verifyNoInteractions(contributionRepository);
+
+        when(sharedResourceRepository.existsByOwnerMemberIdAndResourceTypeAndResourceId(2L, "GOAL", 20L))
+            .thenReturn(true);
+        when(contributionRepository.findByGoalIdAndMemberId(20L, 1L)).thenReturn(List.of());
+        when(contributionRepository.findByGoalIdAndMemberId(20L, 2L))
+            .thenReturn(List.of(contribution(OWNER, "100")));
+
+        var result = familyViewService.getGoalContributions(20L, 1L, List.of(VIEWER, OWNER));
+
+        assertThat(result).hasSize(1);
+        assertThat(result.getFirst().memberName()).isEqualTo("Owner");
+    }
+
+    @Test
+    void getGoalContributions_omitsMembersWithZeroTotal() {
+        when(goalRepository.findById(20L)).thenReturn(Optional.of(ownersGoal()));
+        when(contributionRepository.findByGoalIdAndMemberId(20L, 1L)).thenReturn(List.of());
+        when(contributionRepository.findByGoalIdAndMemberId(20L, 2L))
+            .thenReturn(List.of(contribution(OWNER, "0")));
+
+        var result = familyViewService.getGoalContributions(20L, 2L, List.of(VIEWER, OWNER));
+
+        assertThat(result).isEmpty();
     }
 }

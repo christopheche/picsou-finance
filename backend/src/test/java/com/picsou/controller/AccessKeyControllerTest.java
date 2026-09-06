@@ -43,7 +43,8 @@ import static org.mockito.Mockito.when;
  * Pins the self-service management contract: a member lists/creates/revokes ONLY their own keys, the
  * raw secret is returned exactly once on create, creation is rate-limited per member, an unknown scope
  * bubbles as {@link IllegalArgumentException} (→ 400 via the global handler), and revoking a key that
- * isn't the caller's yields 404.
+ * isn't the caller's yields 404. Every operation resolves {@link UserContext#ownMemberId()} — the
+ * admin impersonation override never applies to keys, which are bound to the login that created them.
  */
 @ExtendWith(MockitoExtension.class)
 class AccessKeyControllerTest {
@@ -64,7 +65,7 @@ class AccessKeyControllerTest {
 
     @Test
     void list_returnsCurrentMembersKeysMappedToSafeResponses() {
-        when(userContext.currentMemberId()).thenReturn(MEMBER_ID);
+        when(userContext.ownMemberId()).thenReturn(MEMBER_ID);
         Instant created = Instant.parse("2026-06-01T10:00:00Z");
         Instant used = Instant.parse("2026-06-02T08:30:00Z");
         AccessKey key = sampleKey(42L, "Claude Desktop",
@@ -88,7 +89,7 @@ class AccessKeyControllerTest {
 
     @Test
     void create_returnsSecretOnceWithMetadataAnd201() {
-        when(userContext.currentMemberId()).thenReturn(MEMBER_ID);
+        when(userContext.ownMemberId()).thenReturn(MEMBER_ID);
         AppUser owner = AppUser.builder().build();
         when(userContext.currentUser()).thenReturn(owner);
         Set<String> scopes = new LinkedHashSet<>(List.of("goals:read", "accounts:read"));
@@ -111,7 +112,7 @@ class AccessKeyControllerTest {
 
     @Test
     void create_passesOptionalExpiryThroughToService() {
-        when(userContext.currentMemberId()).thenReturn(MEMBER_ID);
+        when(userContext.ownMemberId()).thenReturn(MEMBER_ID);
         AppUser owner = AppUser.builder().build();
         when(userContext.currentUser()).thenReturn(owner);
         Instant expiry = Instant.parse("2026-12-31T23:59:59Z");
@@ -128,7 +129,7 @@ class AccessKeyControllerTest {
 
     @Test
     void create_returns429_whenPerMemberRateLimitIsDrained() {
-        when(userContext.currentMemberId()).thenReturn(MEMBER_ID);
+        when(userContext.ownMemberId()).thenReturn(MEMBER_ID);
         Bucket drained = Bucket.builder()
             .addLimit(Bandwidth.builder().capacity(1).refillIntervally(1, Duration.ofHours(1)).build())
             .build();
@@ -145,7 +146,7 @@ class AccessKeyControllerTest {
 
     @Test
     void create_propagatesUnknownScopeAsIllegalArgumentForA400() {
-        when(userContext.currentMemberId()).thenReturn(MEMBER_ID);
+        when(userContext.ownMemberId()).thenReturn(MEMBER_ID);
         AppUser owner = AppUser.builder().build();
         when(userContext.currentUser()).thenReturn(owner);
         Set<String> scopes = Set.of("bogus:scope");
@@ -160,7 +161,7 @@ class AccessKeyControllerTest {
 
     @Test
     void delete_revokesAndReturns204_whenKeyBelongsToCaller() {
-        when(userContext.currentMemberId()).thenReturn(MEMBER_ID);
+        when(userContext.ownMemberId()).thenReturn(MEMBER_ID);
         when(accessKeyService.revoke(5L, MEMBER_ID)).thenReturn(true);
 
         ResponseEntity<Void> response = controller.delete(5L);
@@ -171,12 +172,44 @@ class AccessKeyControllerTest {
 
     @Test
     void delete_returns404_whenKeyIsNotTheCallers() {
-        when(userContext.currentMemberId()).thenReturn(MEMBER_ID);
+        when(userContext.ownMemberId()).thenReturn(MEMBER_ID);
         when(accessKeyService.revoke(99L, MEMBER_ID)).thenReturn(false);
 
         assertThatThrownBy(() -> controller.delete(99L))
             .isInstanceOf(ResponseStatusException.class)
             .matches(ex -> ((ResponseStatusException) ex).getStatusCode() == HttpStatus.NOT_FOUND);
+    }
+
+    // ─── impersonation never applies to keys ─────────────────────────────────
+
+    /**
+     * An admin viewing a managed profile (?memberId=X) still manages their OWN keys: create binds
+     * the key to the admin's AppUser, so list/throttle/revoke must resolve the same non-overridable
+     * identity — otherwise the key just created is invisible and cannot be revoked from that view.
+     */
+    @Test
+    void listCreateDelete_useOwnMemberId_neverTheImpersonationOverride() {
+        when(userContext.ownMemberId()).thenReturn(MEMBER_ID);
+        AppUser owner = AppUser.builder().build();
+        when(userContext.currentUser()).thenReturn(owner);
+        Set<String> scopes = Set.of("goals:read");
+        AccessKey saved = sampleKey(3L, "Own", new LinkedHashSet<>(scopes),
+            Instant.parse("2026-06-04T00:00:00Z"), null, null, null);
+        when(accessKeyService.create(eq(owner), eq("Own"), eq(scopes), isNull()))
+            .thenReturn(new GeneratedKey(saved, "psk_secretValueForOwnKey0000000x"));
+        when(accessKeyService.list(MEMBER_ID)).thenReturn(List.of(saved));
+        when(accessKeyService.revoke(3L, MEMBER_ID)).thenReturn(true);
+
+        controller.create(new AccessKeyCreateRequest("Own", scopes, null));
+        List<AccessKeyResponse> listed = controller.list();
+        ResponseEntity<Void> deleted = controller.delete(3L);
+
+        assertThat(listed).extracting(AccessKeyResponse::id).containsExactly(3L);
+        assertThat(deleted.getStatusCode().value()).isEqualTo(204);
+        assertThat(createBuckets).containsOnlyKeys(MEMBER_ID);
+        verify(accessKeyService).list(MEMBER_ID);
+        verify(accessKeyService).revoke(3L, MEMBER_ID);
+        verify(userContext, never()).currentMemberId();
     }
 
     // ─── helpers ──────────────────────────────────────────────────────────────

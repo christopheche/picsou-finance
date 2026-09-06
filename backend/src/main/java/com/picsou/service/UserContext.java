@@ -5,6 +5,7 @@ import com.picsou.model.AppUser;
 import com.picsou.model.FamilyMember;
 import com.picsou.model.UserRole;
 import com.picsou.repository.AppUserRepository;
+import com.picsou.repository.FamilyMemberRepository;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -16,27 +17,54 @@ import org.springframework.web.server.ResponseStatusException;
 /**
  * Request-scoped helper to access the current authenticated user and their family member.
  * Admins can override the memberId via query param to act on behalf of a managed profile.
+ *
+ * <p>{@link #currentMember()} and {@link #currentMemberId()} both honour that override, so a
+ * create path (which needs the entity) and a read/update path (which needs the id) scope to the
+ * same member within one request. {@link #ownMemberId()} is the one accessor that never does —
+ * for the few resources bound to the login itself rather than to the profile being viewed.
  */
 @Component
 public class UserContext {
 
     private final AppUserRepository userRepository;
+    private final FamilyMemberRepository memberRepository;
 
-    public UserContext(AppUserRepository userRepository) {
+    public UserContext(AppUserRepository userRepository, FamilyMemberRepository memberRepository) {
         this.userRepository = userRepository;
+        this.memberRepository = memberRepository;
     }
 
     public AppUser currentUser() {
         return (AppUser) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
     }
 
+    /**
+     * The member the request acts on: the admin's impersonation target when {@code ?memberId=} is
+     * honoured, otherwise the caller's own member. Same resolution as {@link #currentMemberId()},
+     * so an account or goal created while impersonating lands under the impersonated profile.
+     */
     public FamilyMember currentMember() {
-        return currentUser().getMember();
+        Long override = getMemberIdOverride();
+        FamilyMember own = currentUser().getMember();
+        if (override == null || override.equals(own.getId())) {
+            return own;
+        }
+        return memberRepository.findById(override)
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Member not found"));
     }
 
     public Long currentMemberId() {
         Long override = getMemberIdOverride();
-        return override != null ? override : currentMember().getId();
+        return override != null ? override : ownMemberId();
+    }
+
+    /**
+     * The caller's own member id, never the impersonation override. For resources bound to the
+     * login rather than to the profile being viewed (access-keys: a managed profile has no login
+     * and cannot own one, so the admin's keys stay the admin's while impersonating).
+     */
+    public Long ownMemberId() {
+        return currentUser().getMember().getId();
     }
 
     public boolean isAdmin() {
@@ -72,7 +100,7 @@ public class UserContext {
         } catch (NumberFormatException e) {
             return null;
         }
-        if (memberId.equals(currentMember().getId())) return memberId;
+        if (memberId.equals(ownMemberId())) return memberId;
         boolean independent = userRepository.findByMemberId(memberId)
             .map(AppUser::isActivated)
             .orElse(false);

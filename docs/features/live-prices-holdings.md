@@ -1,6 +1,6 @@
 # Feature: Live Prices in Holdings
 
-> Last updated: 2026-08-10
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -132,6 +132,12 @@ For each past date, both `total` and `invested` are read from `balance_snapshot`
 | Holdings failure propagates instead | A missing *price* leaves the position visible with a stale value; a missing *holdings* response removes the position from every total | Returning `[]` for the failed account |
 
 ## Gotchas / Pitfalls
+
+- **The aggregated cash line has no unit price.** `usePortfolio` appends it with `isCash: true`, `ticker: 'EUR'` and `quantity: 0`; it is clickable like every other row. `HoldingDetailModal` treats a line with `isCash` or `quantity <= 0` as *not priceable*: it shows the total value only, hides the price/position toggle and the chart, and passes a `null` ticker to `usePriceHistory` and `HoldingInsightSection` — otherwise the headline read `value / 0 = ∞ €` and the modal fetched `/prices/EUR/history`. Covered by `HoldingDetailModal.test.tsx`.
+
+- **`PortfolioView`'s "total value" is the whole portfolio.** It reduces over `lines`, not over the
+  search-filtered `sorted` list — the header keeps the same label while the search box narrows the
+  rows, so summing the matches turned it into an unlabelled subtotal. Covered by `PortfolioView.test.tsx`.
 
 - **Prices are not persisted**: Live prices are only used for display. The DB `current_price` in `account_holding` is not updated — that still happens during sync.
 - **`useAccountHoldings` still exists**: The old hook is kept for the `usePortfolio` hook which fetches holdings for all accounts (portfolio view). Switching it to live prices would trigger many price API calls at once.

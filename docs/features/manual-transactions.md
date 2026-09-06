@@ -145,7 +145,7 @@ After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the 
 | `backend/src/main/java/com/picsou/controller/AccountController.java` | POST/DELETE `/accounts/{id}/transactions` |
 | `backend/src/main/java/com/picsou/repository/TransactionRepository.java` | `deleteByAccountIdAndIsManualFalse`, `sumAmountByAccountId`, `findByAccountIdAndTxTypeInOrderByDateAsc` |
 | `frontend/src/components/shared/AddTransactionModal.tsx` | Account-type-aware form modal |
-| `frontend/src/components/shared/TransactionsList.tsx` | Localized transaction-type fallbacks, date grouping with unambiguous historical years, manual badge, and delete button |
+| `frontend/src/components/shared/TransactionsList.tsx` | Localized transaction-type fallbacks, date grouping with unambiguous historical years, manual badge, delete button, and a `TRANSACTIONS_PAGE_SIZE` (200) window with a "show more" button — the endpoint returns the whole history unpaged |
 | `frontend/src/features/accounts/hooks.ts` | `useAddTransaction`, `useDeleteTransaction` |
 
 ## Technical choices
@@ -166,10 +166,16 @@ After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the 
   the effective name, or the canonical ticker when no name exists. The API already exposes
   `txType`; `TransactionsList` translates that enum for manual ticker rows with no name.
   Cash transactions with no ticker and synced provider descriptions keep their supplied text.
+- **A null `txType` arrives as an absent member, not `null`.** Jackson's `non_null` inclusion
+  omits it, so `TransactionsList` tests `txType == null` (loose) — a strict `=== null` guard never
+  matched and a manual ticker row with no type rendered as `undefined AAPL`. The same holds for
+  every `| null` field in `types/api.ts`.
+- **The list renders `TRANSACTIONS_PAGE_SIZE` rows at a time.** Filtering and grouping are
+  memoised on `(transactions, search, locale)`; a new search restarts from the first page.
 
 ## Tests
 
 - `HoldingComputeServiceTest` — 11 unit tests: BUY-only, multi-BUY VWAP, BUY+SELL, fully-sold position, null ticker/quantity skipping, multiple tickers, existing holding update, plus position name = newest transaction's name and name-preserved-when-transactions-have-none.
 - `ManualTransactionServiceTest` — 11 unit tests: manual cash add (balance + snapshots recomputed), synced cash add (transaction saved, balance/snapshots untouched), investment add (holdings recomputed, for both manual and synced accounts), non-owned account rejection, manual delete, synced-account delete (no reconstruct), synced-transaction delete rejection, not-found rejection, plus ISIN input → resolved ticker/name/description and plain-ticker uppercased with the user "Nom" winning.
-- `TransactionsList.test.tsx` — localized BUY, SELL, DIVIDEND, and FEE fallbacks, provider-description preservation, localized search, and date-heading behavior.
+- `TransactionsList.test.tsx` — localized BUY, SELL, DIVIDEND, and FEE fallbacks, provider-description preservation, an absent `txType` member keeping the stored description, localized search, date-heading behavior, and the 200-row window ("show more" extends it, a new search resets it).
 - `OpenFigiIsinConverterTest` — 4 unit tests for the `isIsin()` detector: valid ISINs, case/whitespace normalization, rejects tickers/non-ISIN strings, rejects null/blank.

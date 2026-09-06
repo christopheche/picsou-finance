@@ -34,6 +34,14 @@ If the prices API fails, the hook keeps the backend response. For Bourse Direct
 holdings that response can include the last reconciled broker valuation in EUR,
 even when Yahoo cannot resolve the native quote.
 
+The ticker list is sent without any account type: the frontend cannot tell a
+coin from a share. `PriceController` therefore goes through
+`PriceService.refreshHeldPrices`, which routes tickers held in a `CRYPTO` account
+crypto-only, so an unmapped coin (SNX, STX, APT, SEI) is simply absent from the
+response — the hook keeps the backend price for it — rather than displayed, and
+recorded in `price_snapshot`, at the share price of the equity trading under the
+same symbol. See [price-service.md](./price-service.md).
+
 The two failure modes are deliberately not symmetric. `usePortfolio` fetches
 holdings per account in a `Promise.all`, and a rejected holdings call fails the
 whole query: `PortfolioView` and `HoldingsCard` render `ErrorState` with

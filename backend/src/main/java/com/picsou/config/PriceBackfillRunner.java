@@ -1,5 +1,6 @@
 package com.picsou.config;
 
+import com.picsou.model.AccountType;
 import com.picsou.repository.AccountHoldingRepository;
 import com.picsou.service.PriceService;
 import org.slf4j.Logger;
@@ -10,10 +11,17 @@ import org.springframework.stereotype.Component;
 
 import java.time.LocalDate;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Automatically backfills historical prices on startup if holding tickers have no price history.
  * Idempotent — only fills gaps, skips dates that already have a snapshot.
+ *
+ * <p>Crypto holdings are kept apart from the rest, as {@code SchedulerService.refreshPrices} does
+ * hourly: the generic backfill hands anything CoinGecko cannot map to Yahoo Finance and saves
+ * every candle it gets back, so a coin sharing its symbol with a listed equity (STX, SNX, APT…)
+ * would get a year of that company's closes recorded under its ticker — and
+ * {@code HistoryService} values the position from those rows by ticker alone.
  */
 @Component
 public class PriceBackfillRunner implements ApplicationRunner {
@@ -30,14 +38,25 @@ public class PriceBackfillRunner implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
-        Set<String> tickers = holdingRepository.findDistinctTickers();
-        if (tickers.isEmpty()) {
+        Set<String> cryptoTickers = new TreeSet<>(
+            holdingRepository.findDistinctTickersByAccountType(AccountType.CRYPTO));
+        Set<String> otherTickers = new TreeSet<>(holdingRepository.findDistinctTickers());
+        otherTickers.removeAll(cryptoTickers);
+
+        if (cryptoTickers.isEmpty() && otherTickers.isEmpty()) {
             log.debug("No holding tickers found — skipping price backfill");
             return;
         }
 
         LocalDate from = LocalDate.now().minusMonths(12);
-        int saved = priceService.backfillHistoricalPrices(tickers, from);
-        log.info("Price backfill complete: {} snapshots saved for {} tickers", saved, tickers.size());
+        int saved = 0;
+        if (!cryptoTickers.isEmpty()) {
+            saved += priceService.backfillHistoricalCryptoPrices(cryptoTickers, from);
+        }
+        if (!otherTickers.isEmpty()) {
+            saved += priceService.backfillHistoricalPrices(otherTickers, from);
+        }
+        log.info("Price backfill complete: {} snapshots saved for {} tickers", saved,
+            cryptoTickers.size() + otherTickers.size());
     }
 }

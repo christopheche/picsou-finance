@@ -5,31 +5,43 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.picsou.adapter.CoinGeckoPriceProvider;
 import com.picsou.adapter.YahooFinancePriceProvider;
+import com.picsou.model.AccountType;
 import com.picsou.model.PriceSnapshot;
+import com.picsou.repository.AccountHoldingRepository;
+import com.picsou.repository.AccountRepository;
 import com.picsou.repository.PriceSnapshotRepository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 
 import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -57,11 +69,22 @@ class PriceServiceTest {
     @Mock CoinGeckoPriceProvider coinGecko;
     @Mock YahooFinancePriceProvider yahoo;
     @Mock PriceSnapshotRepository priceSnapshotRepository;
+    @Mock AccountHoldingRepository holdingRepository;
+    @Mock AccountRepository accountRepository;
 
-    @InjectMocks PriceService priceService;
+    /** Moved by hand: the two cache TTLs are behaviour under test, not background noise. */
+    private final SteppingClock clock = new SteppingClock();
+
+    PriceService priceService;
 
     private ListAppender<ILoggingEvent> logs;
     private ch.qos.logback.classic.Logger logger;
+
+    @BeforeEach
+    void wire() {
+        priceService = new PriceService(coinGecko, yahoo, priceSnapshotRepository,
+            holdingRepository, accountRepository, clock);
+    }
 
     @BeforeEach
     void captureLogs() {
@@ -358,5 +381,245 @@ class PriceServiceTest {
             .as("backfill must never propagate; PriceBackfillRunner would fail Spring Boot startup")
             .doesNotThrowAnyException();
         return result[0];
+    }
+
+    // ─── the negative cache and the write path ─────────────────────────────────────────────
+
+    /**
+     * The 2026-08-01 incident, rebuilt through the cache: a dashboard render during a CoinGecko
+     * cooldown remembers the miss, and an exchange sync a minute later must still value the
+     * asset from the recorded price. Serving the remembered miss as a null-priced live Quote
+     * skipped that fallback and wrote a partial balance into balance_snapshot for good.
+     */
+    @Test
+    void refreshCryptoQuotes_afterAReadPathMiss_stillValuesFromTheRecordedPrice() {
+        LocalDate yesterday = LocalDate.now().minusDays(1);
+        when(coinGecko.supports("BTC")).thenReturn(true);
+        when(coinGecko.getPricesEur(Set.of("BTC"))).thenReturn(Map.of());
+        when(priceSnapshotRepository.findRecentByTickers(eq(Set.of("BTC")), any(), any()))
+            .thenReturn(List.of(snapshot("BTC", yesterday, "54619")));
+
+        assertThat(priceService.getCryptoQuote("BTC").live()).isFalse(); // seeds the miss
+
+        Map<String, PriceService.Quote> quotes = priceService.refreshCryptoQuotes(Set.of("BTC"));
+
+        assertThat(quotes.get("BTC").price()).isEqualByComparingTo("54619");
+        assertThat(quotes.get("BTC").live()).isFalse();
+        assertThat(quotes.values()).allSatisfy(q -> assertThat(q.price()).isNotNull());
+        // The miss is still honoured for the *fetch* decision: one attempt, not one per path.
+        verify(coinGecko, times(1)).getPricesEur(any());
+    }
+
+    @Test
+    void refreshPrices_leavesARememberedMissOut_ratherThanMappingItToNull() {
+        when(coinGecko.supports("BTC")).thenReturn(true);
+        when(coinGecko.getPricesEur(Set.of("BTC"))).thenReturn(Map.of());
+        when(priceSnapshotRepository.findRecentByTickers(any(), any(), any())).thenReturn(List.of());
+        priceService.getCryptoPriceEur("BTC");
+
+        Map<String, BigDecimal> prices = priceService.refreshPrices(Set.of("BTC"));
+
+        // WalletSyncService reads prices.get(ticker) == null either way; the exchange sync does
+        // not, and a present-but-null entry is what defeated its fallback.
+        assertThat(prices).doesNotContainKey("BTC");
+        assertThat(prices.values()).doesNotContainNull();
+        verify(coinGecko, times(1)).getPricesEur(any());
+    }
+
+    @Test
+    void aQuoteNeverCarriesANullPrice() {
+        assertThatThrownBy(() -> new PriceService.Quote(null, LocalDate.now(), true))
+            .isInstanceOf(NullPointerException.class);
+    }
+
+    // ─── the two TTLs ──────────────────────────────────────────────────────────────────────
+
+    @Test
+    void aMissIsRetriedAfterSixtySeconds_whileAHitIsStillServed() {
+        when(coinGecko.supports("BTC")).thenReturn(true);
+        when(coinGecko.supports("ETH")).thenReturn(true);
+        when(coinGecko.getPricesEur(Set.of("BTC", "ETH")))
+            .thenReturn(Map.of("ETH", new BigDecimal("1619")));
+        when(coinGecko.getPricesEur(Set.of("BTC"))).thenReturn(Map.of());
+        when(priceSnapshotRepository.findRecentByTickers(any(), any(), any())).thenReturn(List.of());
+
+        priceService.getCryptoQuotes(Set.of("BTC", "ETH")); // ETH hit, BTC miss, both at t0
+
+        clock.advance(Duration.ofSeconds(59));
+        priceService.getCryptoQuotes(Set.of("BTC", "ETH"));
+        verify(coinGecko, never()).getPricesEur(Set.of("BTC"));
+
+        // The ADR's trade-off is "not retried for 60 seconds" -- not for the 900 s a hit lives.
+        // A 429 with a 30 s Retry-After would otherwise leave every affected ticker on the
+        // amber fallback for a quarter of an hour after the provider recovered.
+        clock.advance(Duration.ofSeconds(2));
+        Map<String, PriceService.Quote> quotes = priceService.getCryptoQuotes(Set.of("BTC", "ETH"));
+
+        verify(coinGecko, times(1)).getPricesEur(Set.of("BTC"));
+        assertThat(quotes.get("ETH").live()).isTrue();
+    }
+
+    @Test
+    void aHitExpiresAfterFifteenMinutes() {
+        when(coinGecko.supports("ETH")).thenReturn(true);
+        when(coinGecko.getPricesEur(Set.of("ETH"))).thenReturn(Map.of("ETH", new BigDecimal("1619")));
+
+        priceService.getCryptoQuote("ETH");
+        clock.advance(Duration.ofSeconds(899));
+        priceService.getCryptoQuote("ETH");
+        verify(coinGecko, times(1)).getPricesEur(any());
+
+        clock.advance(Duration.ofSeconds(2));
+        priceService.getCryptoQuote("ETH");
+        verify(coinGecko, times(2)).getPricesEur(any());
+    }
+
+    // ─── the request path is type-aware ────────────────────────────────────────────────────
+
+    /**
+     * GET /api/prices receives every holding of every account and cannot tell a coin from a
+     * share. A Synthetix position whose symbol CoinGecko does not map must not be displayed --
+     * and recorded in price_snapshot -- at TD SYNNEX's share price.
+     */
+    @Test
+    void refreshHeldPrices_neverSendsACryptoHoldingToYahoo() {
+        when(holdingRepository.findDistinctTickersByAccountType(AccountType.CRYPTO))
+            .thenReturn(Set.of("SNX", "BTC"));
+        when(accountRepository.findDistinctTickersByType(AccountType.CRYPTO)).thenReturn(Set.of());
+        when(coinGecko.supports("BTC")).thenReturn(true);
+        when(coinGecko.supports("SNX")).thenReturn(false);
+        when(coinGecko.supports("AAPL")).thenReturn(false);
+        when(coinGecko.getPricesEur(Set.of("BTC"))).thenReturn(Map.of("BTC", new BigDecimal("54619")));
+        when(yahoo.getPricesEur(Set.of("AAPL"))).thenReturn(Map.of("AAPL", new BigDecimal("150")));
+        when(priceSnapshotRepository.findByTickerAndDate(any(), any())).thenReturn(Optional.empty());
+
+        Map<String, BigDecimal> prices = priceService.refreshHeldPrices(Set.of("SNX", "BTC", "AAPL"));
+
+        assertThat(prices)
+            .containsEntry("BTC", new BigDecimal("54619"))
+            .containsEntry("AAPL", new BigDecimal("150"))
+            .doesNotContainKey("SNX");
+        verify(yahoo).getPricesEur(Set.of("AAPL"));
+        verify(yahoo, never()).getPricesEur(argThatContains("SNX"));
+        ArgumentCaptor<PriceSnapshot> saved = ArgumentCaptor.forClass(PriceSnapshot.class);
+        verify(priceSnapshotRepository, times(2)).save(saved.capture());
+        assertThat(saved.getAllValues()).extracting(PriceSnapshot::getTicker)
+            .containsExactlyInAnyOrder("BTC", "AAPL");
+    }
+
+    @Test
+    void refreshHeldPrices_treatsAManualCryptoAccountsOwnTickerAsCrypto() {
+        when(holdingRepository.findDistinctTickersByAccountType(AccountType.CRYPTO)).thenReturn(Set.of());
+        when(accountRepository.findDistinctTickersByType(AccountType.CRYPTO)).thenReturn(Set.of("stx"));
+        when(coinGecko.supports("STX")).thenReturn(false);
+
+        assertThat(priceService.refreshHeldPrices(Set.of("STX"))).isEmpty();
+
+        verifyNoInteractions(yahoo);
+        verify(priceSnapshotRepository, never()).save(any());
+    }
+
+    private static Set<String> argThatContains(String ticker) {
+        return org.mockito.ArgumentMatchers.argThat(set -> set != null && set.contains(ticker));
+    }
+
+    // ─── the backfill is type-aware ────────────────────────────────────────────────────────
+
+    @Test
+    void cryptoBackfill_skipsAnUnmappedTicker_insteadOfRecordingTheEquitysHistory() {
+        LocalDate from = LocalDate.of(2026, 1, 1);
+        when(coinGecko.supports("STX")).thenReturn(false);
+        when(coinGecko.supports("BTC")).thenReturn(true);
+        when(priceSnapshotRepository.findByTickerInAndDateBetween(eq(Set.of("BTC")), any(), any()))
+            .thenReturn(List.of());
+        when(coinGecko.getHistoricalPricesEur(eq("BTC"), any(), any()))
+            .thenReturn(Map.of(from, new BigDecimal("50000")));
+        when(priceSnapshotRepository.findByTickerAndDate(any(), any())).thenReturn(Optional.empty());
+
+        int saved = priceService.backfillHistoricalCryptoPrices(Set.of("STX", "BTC"), from);
+
+        // Seagate's closes under the Stacks ticker would become the "value at fromDate" of the
+        // position in every range P&L -- at every boot until the history reads as covered.
+        assertThat(saved).isEqualTo(1);
+        verifyNoInteractions(yahoo);
+        verify(priceSnapshotRepository, never()).findByTickerInAndDateBetween(eq(Set.of("STX")), any(), any());
+        assertThat(eventsAt(Level.WARN)).hasSize(1);
+        assertThat(eventsAt(Level.WARN).get(0).getFormattedMessage()).contains("STX");
+    }
+
+    // ─── concurrency ───────────────────────────────────────────────────────────────────────
+
+    /**
+     * The dashboard fires its requests in parallel and each of them values the same holdings.
+     * On a cold cache, every thread that saw the gap used to issue its own provider call
+     * before any of them had written the cache -- four identical calls counted by the free
+     * tier. The second thread must wait for the first and reuse its answer.
+     */
+    @Test
+    void concurrentReadsOfTheSameMissingTicker_costOneProviderCall() throws Exception {
+        when(coinGecko.supports("BTC")).thenReturn(true);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(coinGecko.getPricesEur(Set.of("BTC"))).thenAnswer(inv -> {
+            entered.countDown();
+            release.await(5, TimeUnit.SECONDS);
+            return Map.of("BTC", new BigDecimal("54619"));
+        });
+
+        PriceService.Quote[] seen = new PriceService.Quote[2];
+        Thread first = new Thread(() -> seen[0] = priceService.getCryptoQuote("BTC"));
+        Thread second = new Thread(() -> seen[1] = priceService.getCryptoQuote("BTC"));
+
+        first.start();
+        assertThat(entered.await(5, TimeUnit.SECONDS)).as("first thread reached the provider").isTrue();
+        second.start();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (second.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        release.countDown();
+        first.join(5_000);
+        second.join(5_000);
+
+        verify(coinGecko, times(1)).getPricesEur(any());
+        assertThat(seen[0].price()).isEqualByComparingTo("54619");
+        assertThat(seen[1].price()).isEqualByComparingTo("54619");
+        assertThat(seen[1].live()).isTrue();
+    }
+
+    /**
+     * Two callers recording a ticker's first price of the day can both find no row and both
+     * insert; the loser's unique-constraint violation used to escape as a 500 from
+     * GET /api/prices. It now adopts the winner's row.
+     */
+    @Test
+    void refreshPrices_survivesLosingTheInsertRaceForTodaysSnapshot() {
+        when(coinGecko.supports("AAPL")).thenReturn(false);
+        when(yahoo.getPricesEur(Set.of("AAPL"))).thenReturn(Map.of("AAPL", new BigDecimal("150")));
+        PriceSnapshot theirs = snapshot("AAPL", LocalDate.now(), "149");
+        when(priceSnapshotRepository.findByTickerAndDate("AAPL", LocalDate.now()))
+            .thenReturn(Optional.empty(), Optional.of(theirs));
+        when(priceSnapshotRepository.save(any()))
+            .thenThrow(new DataIntegrityViolationException("uk_price_snapshot_ticker_date"))
+            .thenAnswer(inv -> inv.getArgument(0));
+
+        Map<String, BigDecimal> prices = priceService.refreshPrices(Set.of("AAPL"));
+
+        assertThat(prices).containsEntry("AAPL", new BigDecimal("150"));
+        assertThat(theirs.getPriceEur()).isEqualByComparingTo("150");
+        verify(priceSnapshotRepository, times(2)).save(any());
+    }
+
+    /** A clock the test moves by hand. Volatile: the concurrency test reads it from two threads. */
+    private static final class SteppingClock extends Clock {
+        private volatile Instant now = Instant.parse("2026-09-06T09:00:00Z");
+
+        void advance(Duration by) {
+            now = now.plus(by);
+        }
+
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId zone) { return this; }
+        @Override public Instant instant() { return now; }
     }
 }

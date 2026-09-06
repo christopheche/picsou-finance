@@ -18,6 +18,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -37,15 +38,18 @@ public class MfaController {
     private final MfaService mfaService;
     private final PersistentSessionService persistentSessionService;
     private final Map<String, Bucket> mfaEnrollBuckets;
+    private final Map<String, Bucket> reauthBuckets;
 
     public MfaController(
         MfaService mfaService,
         PersistentSessionService persistentSessionService,
-        @Qualifier("mfaEnrollBuckets") Map<String, Bucket> mfaEnrollBuckets
+        @Qualifier("mfaEnrollBuckets") Map<String, Bucket> mfaEnrollBuckets,
+        @Qualifier("reauthBuckets") Map<String, Bucket> reauthBuckets
     ) {
         this.mfaService = mfaService;
         this.persistentSessionService = persistentSessionService;
         this.mfaEnrollBuckets = mfaEnrollBuckets;
+        this.reauthBuckets = reauthBuckets;
     }
 
     @GetMapping("/status")
@@ -65,7 +69,7 @@ public class MfaController {
         String ip = ClientIp.resolve(httpReq);
         Bucket bucket = mfaEnrollBuckets.computeIfAbsent(ip, k -> RateLimitConfig.createMfaEnrollBucket());
         if (!bucket.tryConsume(1)) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).build();
+            return rateLimited("Too many enrollment attempts. Try again in an hour.");
         }
         mfaService.requireReauth(user, req.currentPassword());
         MfaService.EnrollmentSecret secret = mfaService.beginEnrollment(user);
@@ -91,6 +95,13 @@ public class MfaController {
         @AuthenticationPrincipal AppUser user,
         @Valid @RequestBody DisableMfaRequest req
     ) {
+        // Step-up password check from an already-authenticated session: throttle it per
+        // user like /login, or a hijacked session cookie becomes a bcrypt-speed password
+        // oracle (see RateLimitConfig#reauthBuckets). Consumed BEFORE the password is
+        // looked at so a wrong password and a wrong code cost the same budget.
+        if (!consumeReauthToken(user)) {
+            return rateLimited(REAUTH_RATE_LIMITED);
+        }
         mfaService.requireReauth(user, req.currentPassword());
 
         boolean isRecovery = Boolean.TRUE.equals(req.isRecoveryCode());
@@ -109,6 +120,9 @@ public class MfaController {
         @AuthenticationPrincipal AppUser user,
         @Valid @RequestBody RegenerateCodesRequest req
     ) {
+        if (!consumeReauthToken(user)) {
+            return rateLimited(REAUTH_RATE_LIMITED);
+        }
         mfaService.requireReauth(user, req.currentPassword());
 
         // Recovery-code path explicitly disallowed here: regenerating codes from a
@@ -120,5 +134,29 @@ public class MfaController {
 
         List<String> codes = mfaService.regenerateRecoveryCodes(user);
         return ResponseEntity.ok(new RecoveryCodesResponse(codes));
+    }
+
+    // ─── helpers ────────────────────────────────────────────────────────────
+
+    private static final String REAUTH_RATE_LIMITED = "Too many password attempts. Try again in 15 minutes.";
+
+    /** One step-up password check against {@code user}'s reauth budget; false once it is exhausted. */
+    private boolean consumeReauthToken(AppUser user) {
+        Bucket bucket = reauthBuckets.computeIfAbsent(
+            String.valueOf(user.getId()), k -> RateLimitConfig.createReauthBucket());
+        return bucket.tryConsume(1);
+    }
+
+    /**
+     * 429 as RFC 7807 ProblemDetail, like every other error (api-rest.md "Error format").
+     * Generic so it slots into the typed {@code ResponseEntity<...>} signatures above; the
+     * body is a ProblemDetail either way, exactly as the {@code ResponseEntity<?>} endpoints
+     * of {@code AuthController} return it.
+     */
+    @SuppressWarnings("unchecked")
+    private static <T> ResponseEntity<T> rateLimited(String message) {
+        ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.TOO_MANY_REQUESTS);
+        detail.setDetail(message);
+        return (ResponseEntity<T>) ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(detail);
     }
 }

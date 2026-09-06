@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -45,7 +46,7 @@ public class GeocodingController {
 
     /** @param q free-form address; shorter than 3 characters returns nothing rather than noise */
     @GetMapping
-    public ResponseEntity<List<GeocodeSuggestion>> search(
+    public ResponseEntity<?> search(
         @RequestParam("q") String q,
         @RequestParam(value = "limit", required = false) Integer limit
     ) {
@@ -58,7 +59,8 @@ public class GeocodingController {
             String.valueOf(memberId), k -> RateLimitConfig.createGeocodeBucket());
         if (!bucket.tryConsume(1)) {
             log.warn("geocode.rate_limited memberId={}", memberId);
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).build();
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(ProblemDetail.forStatusAndDetail(
+                HttpStatus.TOO_MANY_REQUESTS, "Too many address lookups. Please wait a minute before retrying."));
         }
 
         List<GeocodingPort.GeocodeResult> results =

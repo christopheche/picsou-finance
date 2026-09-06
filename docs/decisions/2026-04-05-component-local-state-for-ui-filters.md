@@ -80,7 +80,11 @@ If in the future we need to:
 
 - `NetWorthCard` owns `range` state via `useState<TimeRange>('1Y')`
 - Time range selector and net worth chart live in the same component
-- Distribution and goals never re-fetch when time range changes
+- ~~Distribution and goals never re-fetch when time range changes~~ — no longer true since the
+  `range` argument was added to `useDashboard`: the hook keys its query on it, so a range click
+  refetches the whole dashboard payload, distribution and goals included. The decision itself
+  (component-local state, no global store) still holds; only this consequence lapsed. See the
+  gotchas in [dashboard-time-range-isolation.md](../features/dashboard-time-range-isolation.md).
 
 ### For future filters
 

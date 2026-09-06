@@ -1,6 +1,6 @@
 # Feature: Dashboard Time Range Isolation
 
-> Last updated: 2026-04-13
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -8,54 +8,62 @@ The Dashboard displays net worth history, account distribution, and goals. The t
 
 ## How it works
 
-The dashboard fetches all data once via `useDashboard()` (no range parameter). The backend always returns 12 months of net worth history. `NetWorthChart` filters this data client-side based on the selected range.
+`DashboardPage` owns the `range` state and three hooks read it:
+
+- `useDashboard(range)` sends `?range=` and keys its query on it, so **every range click refetches the whole dashboard payload** (distribution, liabilities, goals, `netWorthHistory`). `DashboardController` accepts the parameter and `DashboardService` turns it into a start date through `TimeRange.fromString(range).fromDate()`.
+- `useHistory(chartAccountIds, historyMonths)` fetches the series the chart actually draws; `historyMonths` is derived from the range in the page.
+- `usePnl(investmentAccountIds, pnlFromDate)` supplies the hero trend (`rangePnl`, falling back to the live `pnl` on `ALL`).
+
+`NetWorthChart` still filters the series it is given client-side, through `filterByRange()`, so the visible window is the range even when the fetched window is wider.
+
+Note that `DashboardData.netWorthHistory` — the series `useDashboard` refetches per range — has no consumer in the frontend today; the chart draws `useHistory`'s series.
 
 ### Key files
 
-- `frontend/src/pages/dashboard/DashboardPage.tsx` — Page layout, owns `range` state, calculates trend over selected period, passes `range`/`onRangeChange` to chart
+- `frontend/src/pages/dashboard/DashboardPage.tsx` — Page layout, owns `range` state, derives `historyMonths` and `pnlFromDate` from it, passes `range`/`onRangeChange` to chart
 - `frontend/src/components/shared/NetWorthChart.tsx` — Chart with `range`/`onRangeChange` props
 - `frontend/src/components/shared/chart-range.ts` — `filterByRange()` client-side filter, shared with `AccountsStackedChart` (unit-tested west of UTC in `chart-range.test.ts`)
 - `frontend/src/components/shared/TimeRangeSelector.tsx` — Time range button controls (1D, 7D, 1M, 3M, YTD, 1Y, ALL)
-- `backend/src/main/java/com/picsou/service/DashboardService.java` — `buildNetWorthHistory()` always fetches last 12 months
+- `frontend/src/features/dashboard/hooks.ts` — `useDashboard(range)`, query key `['dashboard', range]`
+- `backend/src/main/java/com/picsou/controller/DashboardController.java` — `GET /api/dashboard?range=`
+- `backend/src/main/java/com/picsou/service/DashboardService.java` — maps `range` to a start date via `TimeRange` and calls `historyService.buildHistory(ids, from, false, memberId)`
+- `backend/src/main/java/com/picsou/dto/TimeRange.java` — the one place a range literal becomes a date
 
 ### Flow
 
 ```
-DashboardPage mounts
+DashboardPage mounts, owns range state (default: '1Y')
   ↓
-useDashboard() fetches /api/dashboard (no range param)
+useDashboard(range) fetches /api/dashboard?range=<range>
   ↓
-Backend returns 12 months of history + distribution + goals
+Backend: TimeRange.fromString(range).fromDate() → buildHistory(ids, from, ...)
+         + distribution + liabilities + goals
   ↓
-DashboardPage owns range state (default: '1Y')
+useHistory(chartAccountIds, historyMonths) fetches the chart series
+useNetWorthIntraday(...) instead when range === '24H'
+usePnl(investmentAccountIds, pnlFromDate) supplies the hero trend
   ↓
-historyForRange = filterByRange(netWorthHistory, range)  (useMemo)
-  ↓
-Trend = last point of filtered data − first point of filtered data
-  ↓
-Hero card shows trend for the selected period
-  ↓
-NetWorthChart receives range + onRangeChange as props
+NetWorthChart filters the series client-side (filterByRange) and
+receives range + onRangeChange as props
   ↓
 User clicks "3M" → DashboardPage.setRange('3M')
   ↓
-Both hero trend AND chart update to reflect 3M period
-  ↓
-Distribution and goals: unaffected (no range dependency)
+All four queries re-key on the new range: dashboard, history, intraday, pnl
 ```
 
 ## Trend calculation
 
-The dashboard hero shows net worth change over the selected time range. The frontend filters `netWorthHistory` by the selected range, then computes:
+The dashboard hero shows the P&L over the selected range, computed server-side by
+`HistoryService.buildPnl(accountIds, memberId, fromDate)` and read through `usePnl`:
 
 ```typescript
-const startValue = historyForRange[0].total
-const endValue = historyForRange[historyForRange.length - 1].total
-const trend = endValue - startValue
-const trendPct = (trend / startValue) * 100
+const pnl = pnlData?.rangePnl != null ? pnlData.rangePnl : (pnlData?.pnl ?? 0)
+const pnlPct = pnlData?.rangePnlPercent ?? pnlData?.pnlPercent
 ```
 
-This replaces the previous approach that compared against an arbitrary second-to-last point. The trend now always reflects the chart's selected period.
+`pnlFromDate` is derived from the range in `DashboardPage` (`ALL` sends none, which
+asks for the live P&L). The earlier `last − first` over the filtered history array is
+gone; the chart still filters its own series client-side for what it draws.
 
 ## Optional invested data
 
@@ -83,16 +91,21 @@ locale rather than a bare `` `${percentage}%` ``.
 
 | Choice | Why | Rejected alternative |
 |--------|-----|----------------------|
-| Client-side filtering in `NetWorthChart` | Single API call, instant range switching, no extra backend work | Separate API call per range — backend ignores the `range` param anyway, would duplicate requests |
+| Client-side filtering in `NetWorthChart` | The fetched window can be wider than the range (`ALL` reaches back to the epoch); filtering on the client keeps the drawn window exactly the range without a second request | Trusting the server window alone — the same series feeds several ranges |
+| One place turns a range literal into a date (`TimeRange`) | `YTD` means "since 1 January", which a month count anchored on today cannot express | A `switch` on the raw string in `DashboardService` — it returned today-minus-N-months for YTD |
 | `range` state in `DashboardPage` (lifted from `NetWorthChart`) | Both hero trend and chart must react to range changes — single source of truth | State inside `NetWorthChart` only — trend was disconnected from range selection |
-| Default range `'1Y'` | Matches the 12 months of data the backend returns. Consistent with user expectations. | `'ALL'` — identical to 1Y given backend data window |
+| Default range `'1Y'` | A year of history is the useful default on open. | `'ALL'` — a much wider query on every dashboard load |
 | Responsive `TimeRangeSelector` buttons | Smaller padding/font on mobile (`px-1.5 text-[11px]`), larger on `sm:` breakpoint. `flex-wrap` for overflow. | Fixed size — overflows on small screens |
-| Derive trend from filtered history array | No backend field needed; trend always matches the visible chart period | Add backend field — redundant since history already has the data |
+| Hero trend from `usePnl`'s `rangePnl` | The range P&L is computed over holdings priced on both sides of the window, which a `last − first` over the history array cannot express (cash movements and unpriced positions leak into it) | Derive it from the filtered history array — the earlier approach |
 | Fixed-height chart cards | Tab content has different natural heights; a fixed row prevents card resizing on tab switches | Let the grid auto-size each tab panel — causes the PnL card to jump too |
 
 ## Gotchas / Pitfalls
 
-- **Backend always returns 12 months**: `DashboardService.buildNetWorthHistory()` hardcodes `LocalDate.now().minusMonths(12)`. Ranges like `'ALL'` will only show 12 months unless the backend is updated.
+- **Each range click is a full dashboard refetch**: `useDashboard(range)` keys on `range`, so switching 1M → 3M → 1Y issues three `GET /dashboard` (each recomputing live balances server-side) on top of the history and P&L calls. Only `netWorthHistory` in that payload depends on the range, and nothing reads it — dropping `range` from `useDashboard` would be a pure win if the payload's history is never wired up.
+
+- **`range` is a real backend parameter**: `DashboardController.getDashboard(@RequestParam String range)` → `TimeRange.fromString(range).fromDate()`. It is not ignored, and removing it from the frontend call silently narrows every range to the `1Y` fallback.
+
+- **`TimeRange.fromString` is the only parser**: it accepts both spellings (`1D`/`YTD`) and falls back to `_1Y`. Its old `valueOf("_" + value)` threw on `YTD` and `ALL` — the two alphabetic ranges the UI actually sends — and answered both with a one-year window.
 
 - **`filterByRange()` uses `new Date()` at filter time**: The cutoff date is computed on each range change relative to "now". If the page stays open across midnight, the filtered window shifts accordingly.
 
@@ -100,17 +113,20 @@ locale rather than a bare `` `${percentage}%` ``.
 
 - **`NetWorthChart` is used elsewhere**: It's a shared component in `components/shared/`. The `TimeRangeSelector` is now always rendered inside it. If another page uses `NetWorthChart`, it will also show the range selector.
 
-- **Trend needs at least 2 history points**: If `historyForRange` has fewer than 2 entries, `startValue` defaults to `0`, and the trend shows the full net worth as "gain." This is acceptable — a single data point means the account was just created.
-- **`useMemo` must be before conditional return**: In `DashboardPage`, the `historyForRange` memo is computed before the `if (isLoading) return` guard. React requires hooks to be called in the same order on every render. Placing hooks after an early return causes error #310 (too many re-renders).
+- **`useMemo` must be before the conditional return**: in `DashboardPage`, `chartAccountIds`, `investmentAccountIds`, `historyMonths`, `pnlFromDate` and `wealthValue` are all computed before the `if (isLoading || !data) return` guard. React requires hooks in the same order on every render; placing one after an early return causes error #310.
 
 - **`invested` is optional in history items**: Some data sources (e.g., bank sync) don't provide invested amounts. The chart and tooltip handle the absence gracefully. Don't assume `invested` exists without checking.
 
 ## Tests
 
-No dedicated test files. Manual verification:
+- `DashboardServiceTest.getDashboard_rangeSwitch_mapsToTheRangeStartDate` and `..._ytd_startsOnJanuaryFirst_notTodayMinusNMonths`
+- `TimeRangeTest` — every wire value, including `YTD` and `ALL`
+- `frontend/src/components/shared/chart-range.test.ts` — `filterByRange()`
+
+Manual verification:
 
 1. Open Dashboard
-2. Click range buttons in the chart → only chart data changes, hero/distribution/goals stay static
+2. Click range buttons in the chart → chart, hero P&L and the dashboard payload all refetch
 3. Toggle Distribution / Allocation → chart row card heights stay fixed
 4. Verify range buttons are usable on mobile viewport (no overflow)
 5. Refresh page → chart defaults to 1Y

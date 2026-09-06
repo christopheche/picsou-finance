@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -53,6 +54,21 @@ public class OpenFigiIsinConverter {
      * without any of this.
      */
     private static final Duration VERIFY_BUDGET = Duration.ofSeconds(10);
+
+    /**
+     * How long an <em>authoritative</em> miss is trusted — both sources answered and neither
+     * knows a Yahoo-quotable symbol for the ISIN. Long, because re-asking rarely changes the
+     * answer; bounded all the same, so a newly-listed instrument resolves the same day instead
+     * of waiting for a redeploy.
+     */
+    private static final Duration UNRESOLVED_TTL = Duration.ofHours(6);
+
+    /**
+     * How long a miss caused by a source that never answered is trusted. Short: the answer is
+     * expected to change as soon as the quota window rolls over, and re-asking is the point.
+     * Not zero — a sustained outage must not turn every {@code resolve()} back into a request.
+     */
+    private static final Duration UNAVAILABLE_TTL = Duration.ofMinutes(5);
 
     /**
      * Whether {@code s} looks like an ISIN (2-letter country code + 9 alphanumerics
@@ -158,17 +174,58 @@ public class OpenFigiIsinConverter {
      * is "do you carry this symbol", not a price source.
      */
     private final SymbolCatalogPort symbolCatalog;
-    // Cache: ISIN → TickerResult. Null value means conversion failed.
-    private final Map<String, TickerResult> cache = new ConcurrentHashMap<>();
+    /**
+     * Cache: ISIN → the resolution and when it stops being trusted.
+     *
+     * <p>A <em>resolved</em> ticker never expires — an instrument does not stop being listed
+     * where it is listed. A <em>fallback</em> (the ISIN used as its own ticker) does, because it
+     * is only ever "nobody could tell us better right now": {@link YahooFinancePriceProvider}
+     * refuses an ISIN as a symbol, so a fallback the caller persists leaves the holding
+     * unpriceable and out of its account's value (ADR 2026-08-01). Caching that for the process
+     * lifetime meant a single bulk sync past OpenFIGI's 25 req/min keyless quota pinned every
+     * ISIN past the limit to "unresolvable" until the JVM restarted.
+     */
+    private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
+
+    /** Only the cache TTLs read it; the verification budget stays on wall-clock time. */
+    private final Clock clock;
+
+    /** A cached resolution; {@code expiresAt == null} means "never re-resolve". */
+    private record CacheEntry(TickerResult result, Instant expiresAt) {
+        boolean isExpired(Clock clock) {
+            return expiresAt != null && clock.instant().isAfter(expiresAt);
+        }
+    }
+
+    /**
+     * Thrown when OpenFIGI could not be <em>asked</em> — a 429 against the keyless quota, a
+     * timeout, an unreachable API. Distinct from "OpenFIGI answered and knows nothing", which is
+     * a {@code null} return: the first must not be remembered as the second.
+     */
+    private static final class OpenFigiUnavailableException extends RuntimeException {
+        OpenFigiUnavailableException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
 
     public OpenFigiIsinConverter(CoinGeckoPriceProvider coinGecko, SymbolCatalogPort symbolCatalog) {
-        this.coinGecko = coinGecko;
-        this.symbolCatalog = symbolCatalog;
-        this.webClient = WebClient.builder()
+        this(coinGecko, symbolCatalog, WebClient.builder()
             .baseUrl("https://api.openfigi.com")
             .defaultHeader("Content-Type", "application/json")
             .defaultHeader("Accept", "application/json")
-            .build();
+            .build(), Clock.systemUTC());
+    }
+
+    /**
+     * Package-private for tests — inject a WebClient backed by an ExchangeFunction, and a Clock
+     * so the cache TTLs above can be exercised without waiting hours.
+     */
+    OpenFigiIsinConverter(CoinGeckoPriceProvider coinGecko, SymbolCatalogPort symbolCatalog,
+                          WebClient webClient, Clock clock) {
+        this.coinGecko = coinGecko;
+        this.symbolCatalog = symbolCatalog;
+        this.webClient = webClient;
+        this.clock = clock;
     }
 
     /**
@@ -192,10 +249,11 @@ public class OpenFigiIsinConverter {
         // Cache first — covers OpenFIGI results/fallbacks and the TR-crypto short-circuit
         // below, so an unrecognized crypto symbol is warned about once (before its OpenFIGI
         // miss is cached), not on every resolve() of the same holding.
-        TickerResult cached = cache.get(normalized);
-        if (cached != null) {
-            log.debug("ISIN {} resolved from cache -> {} ({})", normalized, cached.ticker, cached.name);
-            return cached;
+        CacheEntry cached = cache.get(normalized);
+        if (cached != null && !cached.isExpired(clock)) {
+            log.debug("ISIN {} resolved from cache -> {} ({})",
+                normalized, cached.result().ticker, cached.result().name);
+            return cached.result();
         }
 
         // TR-native crypto short-circuit (see TR_CRYPTO_ISIN_PATTERN): parse the symbol and,
@@ -205,7 +263,7 @@ public class OpenFigiIsinConverter {
             String symbol = trCrypto.group(1);
             if (coinGecko.supports(symbol)) {
                 TickerResult result = new TickerResult(symbol, coinGecko.displayName(symbol));
-                cache.put(normalized, result);
+                cache.put(normalized, new CacheEntry(result, null));
                 return result;
             }
             log.warn("TR-native crypto ISIN {} has unrecognized symbol '{}', falling back to OpenFIGI (will likely miss)",
@@ -213,23 +271,33 @@ public class OpenFigiIsinConverter {
         }
 
         TickerResult figi;
+        // Whether OpenFIGI actually answered. "We could not ask" and "there is nothing to find"
+        // produce the same null here, but they must not be remembered for the same length of time.
+        boolean openFigiAnswered = true;
         try {
             figi = fetchFromOpenFigi(normalized);
+        } catch (OpenFigiUnavailableException ex) {
+            figi = null;
+            openFigiAnswered = false;
+            log.warn("Could not reach OpenFIGI for ISIN {}: {}", normalized, ex.getMessage());
         } catch (Exception ex) {
             figi = null;
             log.warn("Failed to convert ISIN {} via OpenFIGI: {}", normalized, ex.getMessage());
         }
 
         TickerResult result = priceable(normalized, figi);
+        Instant expiresAt = null;
         if (result == null) {
-            // Cache the fallback too so we don't retry every call
+            // Cache the fallback too so we don't retry every call — but only for as long as the
+            // miss is worth trusting, which depends on whether anyone actually answered.
             result = new TickerResult(normalized, null);
-            log.warn("No Yahoo-quotable ticker for ISIN {} (OpenFIGI: {}), will use ISIN as-is",
-                     normalized, figi == null ? "no result" : figi.ticker());
+            expiresAt = clock.instant().plus(openFigiAnswered ? UNRESOLVED_TTL : UNAVAILABLE_TTL);
+            log.warn("No Yahoo-quotable ticker for ISIN {} (OpenFIGI: {}), will use ISIN as-is and re-resolve after {}",
+                     normalized, figi == null ? "no result" : figi.ticker(), expiresAt);
         } else if (figi != null && result.ticker.equals(figi.ticker)) {
             log.info("ISIN {} resolved via OpenFIGI -> {} ({})", normalized, result.ticker, result.name);
         }
-        cache.put(normalized, result);
+        cache.put(normalized, new CacheEntry(result, expiresAt));
         return result;
     }
 
@@ -286,19 +354,33 @@ public class OpenFigiIsinConverter {
         return figi;
     }
 
+    /**
+     * OpenFIGI's pick for {@code isin}, or {@code null} when OpenFIGI answered and has nothing.
+     *
+     * @throws OpenFigiUnavailableException when the call itself failed — a 429 against the
+     *         keyless 25 req/min quota, a timeout, an unreachable API — so {@link #resolve} can
+     *         tell that apart from an authoritative miss instead of caching one as the other.
+     */
     private TickerResult fetchFromOpenFigi(String isin) {
         List<MappingJob> request = List.of(new MappingJob("ID_ISIN", isin));
 
+        List<Map<String, Object>> responses;
         try {
             @SuppressWarnings("unchecked")
-            List<Map<String, Object>> responses = webClient.post()
+            List<Map<String, Object>> body = webClient.post()
                 .uri("/v3/mapping")
                 .bodyValue(request)
                 .retrieve()
                 .bodyToMono(List.class)
                 .timeout(TIMEOUT)
                 .block();
+            responses = body;
+        } catch (RuntimeException ex) {
+            log.warn("OpenFIGI API request failed for ISIN {}: {}", isin, ex.getMessage());
+            throw new OpenFigiUnavailableException(ex.getMessage(), ex);
+        }
 
+        try {
             if (responses == null || responses.isEmpty()) {
                 return null;
             }
@@ -307,8 +389,10 @@ public class OpenFigiIsinConverter {
             Map<String, Object> first = (Map<String, Object>) responses.get(0);
 
             if (first.containsKey("error")) {
+                // A per-job error, not a per-ISIN verdict: OpenFIGI reports "no such instrument"
+                // as a `warning` with empty data. So this is "could not ask", not "nothing found".
                 log.warn("OpenFIGI error for ISIN {}: {}", isin, first.get("error"));
-                return null;
+                throw new OpenFigiUnavailableException(String.valueOf(first.get("error")), null);
             }
 
             @SuppressWarnings("unchecked")
@@ -319,8 +403,12 @@ public class OpenFigiIsinConverter {
             }
 
             return pickBest(isin, data);
-        } catch (Exception ex) {
-            log.warn("OpenFIGI API request failed for ISIN {}: {}", isin, ex.getMessage());
+        } catch (OpenFigiUnavailableException ex) {
+            throw ex;
+        } catch (RuntimeException ex) {
+            // A shape nothing above anticipated (a ClassCastException on a changed payload):
+            // treat it as "OpenFIGI told us nothing" rather than failing the caller's write.
+            log.warn("OpenFIGI answered an unreadable payload for ISIN {}: {}", isin, ex.getMessage());
             return null;
         }
     }

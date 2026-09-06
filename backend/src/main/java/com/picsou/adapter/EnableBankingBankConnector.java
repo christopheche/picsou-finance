@@ -7,6 +7,7 @@ import com.picsou.port.BankConnectorPort;
 import io.jsonwebtoken.Jwts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.ExchangeStrategies;
@@ -44,6 +45,13 @@ public class EnableBankingBankConnector implements BankConnectorPort {
     private final WebClient webClient;
     private volatile CachedCountries countriesCache;
 
+    // Package-private constructor for tests — inject a WebClient backed by an ExchangeFunction.
+    EnableBankingBankConnector(EnableBankingConfigProvider configProvider, WebClient webClient) {
+        this.configProvider = configProvider;
+        this.webClient = webClient;
+    }
+
+    @Autowired
     public EnableBankingBankConnector(
         EnableBankingConfigProvider configProvider,
         @Value("${app.enablebanking.base-url:https://api.enablebanking.com}") String baseUrl
@@ -416,7 +424,10 @@ public class EnableBankingBankConnector implements BankConnectorPort {
             "Failed to fetch account details")
             .block();
 
-        BigDecimal balance = BigDecimal.ZERO;
+        // Null until the provider actually reports one: an account whose /balances answer is
+        // empty (a freshly-linked account still propagating, or a consent covering details but
+        // not balances) must not be persisted as 0.00 EUR. See AccountData#balance.
+        BigDecimal balance = null;
         String currency = "EUR";
         String name = "Account";
         String iban = null;
@@ -435,6 +446,11 @@ public class EnableBankingBankConnector implements BankConnectorPort {
                 balance = new BigDecimal(b.balanceAmount().amount());
                 currency = b.balanceAmount().currency();
             }
+        }
+
+        if (balance == null) {
+            log.warn("Enable Banking returned no balance for account {} — keeping its last known "
+                + "balance and skipping today's snapshot", accountId);
         }
 
         if (details != null && details.account() != null) {

@@ -458,10 +458,21 @@ public class SyncService {
             return Optional.empty();
         }
 
+        // A null balance is the provider saying it has none for this account right now, not a
+        // zero (see BankConnectorPort.AccountData#balance). Creating an account on it would
+        // invent a 0.00 EUR starting point, so the account waits for a sync that carries one.
+        if (data.balance() == null && existing.isEmpty()) {
+            log.warn("Skipping creation of account externalId={} for {}: no balance reported yet",
+                data.externalId(), requisition.getInstitutionName());
+            return Optional.empty();
+        }
+
         Account account;
         if (existing.isPresent()) {
             account = existing.get();
-            account.setCurrentBalance(data.balance());
+            if (data.balance() != null) {
+                account.setCurrentBalance(data.balance());
+            }
             account.setLastSyncedAt(Instant.now());
             if (account.getLogoUrl() == null && requisition.getLogoUrl() != null) {
                 account.setLogoUrl(requisition.getLogoUrl());
@@ -487,7 +498,11 @@ public class SyncService {
         }
 
         account = accountRepository.save(account);
-        accountService.upsertSnapshot(account, data.balance(), LocalDate.now());
+        // No snapshot without a balance: upsertSnapshot overwrites the day's existing row, so a
+        // 0.00 written here would replace a good morning figure and stay in the history for good.
+        if (data.balance() != null) {
+            accountService.upsertSnapshot(account, data.balance(), LocalDate.now());
+        }
 
         return Optional.of(accountService.toResponse(account));
     }

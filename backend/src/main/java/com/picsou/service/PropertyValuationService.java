@@ -111,8 +111,14 @@ public class PropertyValuationService {
         if (account.getType() != AccountType.REAL_ESTATE) {
             throw new IllegalArgumentException("Account is not a real estate account");
         }
+        // IllegalArgumentException (400), not IllegalStateException: metadata is only written by
+        // updateRealEstateMetadata, so a property whose address form has not been filled in yet is
+        // a routine precondition the user can fix — not a server fault. GlobalExceptionHandler has
+        // no IllegalStateException handler, so this used to answer 500 "An unexpected error
+        // occurred" with a full ERROR stack trace for a missing address.
         RealEstateMetadata metadata = metadataRepository.findByAccountId(accountId)
-            .orElseThrow(() -> new IllegalStateException("Property has no metadata yet"));
+            .orElseThrow(() -> new IllegalArgumentException(
+                "Add this property's address and characteristics before requesting an estimate."));
 
         return estimateFor(account, metadata);
     }

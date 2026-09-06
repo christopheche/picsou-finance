@@ -187,6 +187,12 @@ longer tests what it claims to.
   bunx vitest run         # unit tests
   bun run test:e2e        # E2E tests
   ```
+- The e2e suite is **not** run in CI, so its only routine safety net is the compiler:
+  `frontend/tsconfig.e2e.json` (referenced from `tsconfig.json`) puts `e2e/**/*.ts`,
+  `playwright.config.ts` and `vitest.config.ts` in a real project, so `bun run typecheck`
+  and `bun run build` catch a broken import or a renamed helper there. Keep new e2e or
+  tooling files inside that `include`, otherwise they belong to no project and are silently
+  skipped.
 
 ## Running tests
 

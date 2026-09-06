@@ -12,9 +12,9 @@ import com.picsou.repository.BalanceSnapshotRepository;
 import com.picsou.repository.FamilyMemberRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -133,7 +133,21 @@ public class SchedulerService {
                 log.error("Daily retry of FAILED Enable Banking sessions failed for member {}", memberId, ex);
             }
 
-            trSyncService.resyncIfSessionActive(memberId);
+            // Trade Republic and IBKR are class-level @Transactional services. Their
+            // resyncIf* entry points swallow sync failures themselves, but Spring can still
+            // throw UnexpectedRollbackException AT THE PROXY EXIT: a repository call failing
+            // inside the sync marks the shared transaction rollback-only through the
+            // repository's own proxy, and the commit attempt happens after the method's
+            // internal catch. Without these wrappers that breaks the loop for every
+            // remaining connector of this member and for every remaining member. The
+            // sidecar connectors below run their writes in a TransactionTemplate and
+            // catch RuntimeException themselves, so nothing crosses their proxy.
+            try {
+                trSyncService.resyncIfSessionActive(memberId);
+            } catch (Exception ex) {
+                log.error("Daily Trade Republic auto-sync failed for member {}", memberId, ex);
+            }
+
             boursoSyncService.resyncIfSessionActive(memberId);
             bourseDirectSyncService.resyncIfSessionActive(memberId);
             amundiSyncService.resyncIfSessionActive(memberId);
@@ -141,12 +155,6 @@ public class SchedulerService {
             try {
                 ibkrSyncService.resyncIfConnected(memberId);
             } catch (Exception ex) {
-                // resyncIfConnected swallows sync failures itself, but Spring can still
-                // throw UnexpectedRollbackException AT THE PROXY EXIT: a repository call
-                // failing inside the sync marks the shared transaction rollback-only
-                // through the repository's own proxy, and the commit attempt happens
-                // after the method's internal catch. Without this wrapper that breaks
-                // the loop for every remaining member.
                 log.error("Daily IBKR auto-sync failed for member {}", memberId, ex);
             }
 
@@ -183,9 +191,20 @@ public class SchedulerService {
 
     /**
      * Daily at 08:05: Take a balance snapshot for all accounts.
+     *
+     * <p><b>Deliberately not {@code @Transactional}.</b> It used to be, with a per-account
+     * try/catch meant to keep one failure from costing the whole day. That guard could only
+     * contain exceptions thrown by this class's own code: nearly everything in the loop is a
+     * proxied transactional call (the valuation, the existence check, the save), and an
+     * exception crossing any of those proxies marks the shared transaction rollback-only —
+     * the catch swallows it, the loop finishes, and the commit at method exit throws
+     * {@code UnexpectedRollbackException}, discarding every snapshot written in the run. A
+     * missing day is never rewritten, so that was the whole net-worth history losing a point
+     * for every member. Each repository call now commits on its own, so a snapshot that is
+     * saved stays saved whatever happens to the next account, and no pooled connection is
+     * held across the provider round-trips {@code valuation} makes.
      */
     @Scheduled(cron = "0 5 8 * * *")
-    @Transactional
     public void dailySnapshots() {
         log.info("Taking daily snapshots for all accounts");
         LocalDate today = LocalDate.now();
@@ -195,11 +214,8 @@ public class SchedulerService {
             List<Account> memberAccounts = accountRepository.findAllByMemberIdOrderByCreatedAtAsc(member.getId());
 
             for (Account account : memberAccounts) {
-                // Guard per account. This method is @Transactional, so without it a single
-                // failing price lookup would not merely skip one account -- it would abort
-                // every remaining account AND member, and roll back the snapshots already
-                // saved in this run. A missing snapshot for one account is recoverable;
-                // losing the whole day's is not.
+                // Guard per account: a missing snapshot for one account is recoverable, a
+                // scheduler thread that stops at the first bad account is not.
                 try {
                     Optional<BalanceSnapshot> existing = snapshotRepository.findByAccountIdAndDate(account.getId(), today);
                     if (existing.isEmpty()) {
@@ -225,12 +241,19 @@ public class SchedulerService {
                             .investedAmount(valuation.investedEur())
                             .build());
                     }
+                } catch (DataIntegrityViolationException ex) {
+                    // The 08:00 sync jobs run on their own executors and write today's row
+                    // through AccountService.upsertSnapshot when they finish. One landing
+                    // between the existence check above and the save trips the
+                    // (account_id, date) unique constraint: the day is recorded, just not by
+                    // us. WARN, not ERROR -- nothing is lost and nothing is wrong.
+                    log.warn("Today's snapshot for account {} (member {}) was written by a "
+                        + "concurrent sync -- keeping it", account.getId(), member.getId());
                 } catch (Exception ex) {
                     // ERROR, not WARN: the price adapters swallow expected upstream failures
                     // and return no prices, so anything reaching here is a genuine bug. Logging
                     // it at WARN would re-hide exactly what CoinGeckoPriceProvider now rethrows
-                    // to make visible. Skipping still matters -- this method is @Transactional,
-                    // so aborting would roll back the snapshots already written this run.
+                    // to make visible.
                     log.error("Daily snapshot failed for account {} (member {}) -- skipping it",
                         account.getId(), member.getId(), ex);
                 }
@@ -255,8 +278,15 @@ public class SchedulerService {
      * know nothing about members — so iterating members re-fetched shared tickers once per member.
      * A single set means a single provider round-trip, which matters against a free tier that
      * answers bursts with 429s.
+     *
+     * <p><b>Not at boot.</b> A {@code fixedDelay} task fires as soon as the context refreshes,
+     * which is <em>before</em> Spring Boot calls the application runners — so the first tick
+     * ran on the scheduler thread while {@code StartupSyncService} replayed the daily sync and
+     * {@code PriceBackfillRunner} requested twelve months of history on the main thread, all
+     * three against an empty cache and one keyless free tier. That burst is the trigger of the
+     * 2026-08-01 rate-limit incident; the initial delay keeps the hourly pass out of it.
      */
-    @Scheduled(fixedDelay = 3600000)
+    @Scheduled(fixedDelay = 3600000, initialDelay = 300000)
     public void refreshPrices() {
         // Crypto first, and kept apart: refreshPrices sends anything CoinGecko cannot map to
         // Yahoo Finance, which for a coin sharing its symbol with a listed equity (the

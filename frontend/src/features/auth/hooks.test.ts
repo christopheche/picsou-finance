@@ -20,12 +20,12 @@ function memoryStorage(): Storage {
 vi.stubGlobal('localStorage', memoryStorage())
 vi.stubGlobal('sessionStorage', memoryStorage())
 
-const { logout } = vi.hoisted(() => ({ logout: vi.fn() }))
+const { logout, updateUsername } = vi.hoisted(() => ({ logout: vi.fn(), updateUsername: vi.fn() }))
 vi.mock('./api', () => ({
-  authApi: { logout },
+  authApi: { logout, updateUsername },
 }))
 
-const { useLogout } = await import('./hooks')
+const { useLogout, useUpdateUsername } = await import('./hooks')
 const { useAuthStore } = await import('@/stores/auth-store')
 
 function makeWrapper(queryClient: QueryClient) {
@@ -36,6 +36,7 @@ function makeWrapper(queryClient: QueryClient) {
 beforeEach(() => {
   useAuthStore.getState().login({ username: 'chloe', role: 'ADMIN', memberId: 1, displayName: 'Chloé' })
   logout.mockReset()
+  updateUsername.mockReset()
 })
 
 describe('useLogout (server-confirmed logout only)', () => {
@@ -70,6 +71,36 @@ describe('useLogout (server-confirmed logout only)', () => {
     await waitFor(() => expect(result.current.isError).toBe(true))
 
     expect(useAuthStore.getState().isAuthenticated).toBe(true)
+    expect(useAuthStore.getState().user).toMatchObject({ username: 'chloe' })
+  })
+})
+
+describe('useUpdateUsername (rename owned by the feature layer)', () => {
+  it('stores the new username once the server accepted it', async () => {
+    updateUsername.mockResolvedValue({ data: {} })
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+
+    const { result } = renderHook(() => useUpdateUsername(), { wrapper: makeWrapper(queryClient) })
+    await act(async () => {
+      await result.current.mutateAsync('chloe.c')
+    })
+
+    expect(updateUsername).toHaveBeenCalledWith('chloe.c')
+    expect(useAuthStore.getState().user).toMatchObject({ username: 'chloe.c' })
+  })
+
+  it('leaves the displayed username alone when the call fails', async () => {
+    // The cookie still carries the old identity: showing the new name would make
+    // the UI disagree with the session until the next refresh.
+    updateUsername.mockRejectedValue({ response: { status: 409 } })
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+
+    const { result } = renderHook(() => useUpdateUsername(), { wrapper: makeWrapper(queryClient) })
+    act(() => {
+      result.current.mutate('taken')
+    })
+    await waitFor(() => expect(result.current.isError).toBe(true))
+
     expect(useAuthStore.getState().user).toMatchObject({ username: 'chloe' })
   })
 })

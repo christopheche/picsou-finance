@@ -24,7 +24,7 @@ import {
   useSyncCryptoExchange,
   useRemoveCryptoExchange,
 } from '@/features/sync/hooks'
-import { extractErrorMessage } from '@/lib/errors'
+import { extractErrorMessage, formatApiError } from '@/lib/errors'
 import { EXCHANGE_API_KEY_MAX_LENGTH, EXCHANGE_API_SECRET_MAX_LENGTH } from '@/lib/constants'
 
 export function CryptoExchangeTab() {
@@ -107,7 +107,7 @@ export function CryptoExchangeTab() {
   if (error) {
     return (
       <div className="flex flex-col items-center justify-center py-12 text-center">
-        <p className="text-sm text-muted-foreground">{extractErrorMessage(error)}</p>
+        <p className="text-sm text-muted-foreground">{formatApiError(error, t)}</p>
         <Button variant="outline" onClick={() => refetch()} className="mt-4">
           {t('common.retry')}
         </Button>

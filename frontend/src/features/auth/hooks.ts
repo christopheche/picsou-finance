@@ -38,6 +38,31 @@ export function useLogout() {
 }
 
 /**
+ * Activates an invited member's account from its one-time token. Owning the call
+ * here (rather than in ActivationPage) keeps the page free of API calls and gives
+ * it a single `isPending` / `error` source to render.
+ */
+export function useActivateAccount() {
+  return useMutation({
+    mutationFn: ({ token, password }: { token: string; password: string }) =>
+      authApi.activate(token, password, true),
+  })
+}
+
+/**
+ * Renames the signed-in user. The store is updated on success only: the cookie
+ * carries the identity, so a failed PATCH must leave the displayed username as
+ * the server still knows it.
+ */
+export function useUpdateUsername() {
+  const setUsername = useAuthStore(s => s.setUsername)
+  return useMutation({
+    mutationFn: (newUsername: string) => authApi.updateUsername(newUsername),
+    onSuccess: (_data, newUsername) => setUsername(newUsername),
+  })
+}
+
+/**
  * Probes the cookie-backed session via `POST /auth/refresh`. `isAuthenticated` mirrors
  * sessionStorage, which is wiped on every tab/browser close -- unrelated to the HttpOnly
  * access/refresh/persistent_token cookies, which can keep the session alive for up to 90

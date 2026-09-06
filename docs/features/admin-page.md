@@ -70,18 +70,26 @@ Frontend:
   than centered in a narrow wrapper.
 - `frontend/src/pages/admin/sections/SecuritySection.tsx` — RHF +
   `useFieldArray` for CORS origins, `Controller` + `Switch` for the secure-cookie
-  flag, Zod schema requires at least one origin.
+  flag, Zod schema requires at least one origin. The form adopts refetched server
+  values **only while it is pristine** (see the gotcha below) and re-baselines on
+  the accepted values after a successful save.
 - `frontend/src/pages/admin/sections/EnableBankingSection.tsx` — RHF over a
-  `FIELDS` array, Zod with `.url()` on `redirectUri`.
-- `frontend/src/pages/admin/sections/IntegrationsSection.tsx` — five hardcoded keys
-  (`enablebanking, boursobank, traderepublic, finary, crypto`) toggled via
-  `useToggleIntegration`.
+  `FIELDS` array, Zod with `.url()` on `redirectUri`. Same pristine-only seeding
+  as the security form.
+- `frontend/src/pages/admin/sections/IntegrationsSection.tsx` — six hardcoded keys
+  (`enablebanking, boursobank, boursedirect, traderepublic, finary, crypto`)
+  toggled via `useToggleIntegration`. Bourse Direct has no dedicated health probe:
+  its switch reflects the stored `integration.boursedirect` setting only, like
+  every other key in this list.
 - `frontend/src/pages/admin/sections/MembersSection.tsx` — create-user form (name
   + "Create user" button) on top, then the list of family members with avatar,
   display name, login, derived status; per-member actions: create / regenerate
   activation link, reset password, reset 2FA, delete. Generated/activation link is
   shown inline with a copy button; no email is sent (self-hosted, admin transmits
-  manually).
+  manually). Every one of those mutations renders its failure through
+  `formatApiError` in a `role="alert"` block (creation under the create row, the
+  link/reset failures above the link box, the 2FA reset inside its `ConfirmDialog`)
+  — a failed step used to be completely silent.
 - `frontend/src/features/family/hooks.ts` — `useCreateUserWithLogin` chains
   `createMember` + `generateActivationLink` (one loading/error state, returns the
   activation link); plus `useFamilyMembers`, `useDeleteMember`,
@@ -187,6 +195,15 @@ On submit / toggle ──► PUT or PATCH ──► invalidate adminKeys.setting
   (`/activate`) fails after the profile is created, you get a managed profile with no
   login — recoverable from the same screen via the per-member "Create login" button.
   No new backend endpoint was added precisely to reuse this idempotent recovery path.
+  The chained failure is surfaced under the create row and the typed name is kept,
+  so the admin recovers instead of re-submitting and creating a duplicate profile.
+- **Admin forms seed from the server only while pristine.** Every admin mutation
+  invalidates `adminKeys.settings()`, so the sections receive a fresh `settings`
+  prop at unpredictable times. Resetting react-hook-form from it unconditionally
+  wiped CORS origins or EB credentials the admin had typed but not yet saved
+  (generating a key pair flips `privateKeyPresent` and is enough to trigger it).
+  The effect now returns early when `formState.isDirty`; `onSubmit` calls
+  `reset(values)` so a saved form goes pristine again and resumes tracking.
 
 ## Tests
 

@@ -5,7 +5,7 @@ import { SUPPORTED_LOCALES, resolveLocale } from '@/i18n/locales'
 import { useNavigate } from 'react-router'
 import { useAuthStore } from '@/stores/auth-store'
 import { useAppStore, type DateFormat, type SidebarStyle } from '@/stores/app-store'
-import { useLogout } from '@/features/auth/hooks'
+import { useLogout, useUpdateUsername } from '@/features/auth/hooks'
 import { PageHeader } from '@/components/shared/PageHeader'
 import { Button } from '@/components/ui/button'
 import {
@@ -17,7 +17,7 @@ import {
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { getErrorStatus } from '@/lib/errors'
+import { formatApiError, getErrorStatus } from '@/lib/errors'
 import {
   Paintbrush,
   Globe,
@@ -33,7 +33,6 @@ import {
   ExternalLink,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { api } from '@/lib/api-client'
 import { APP_VERSION } from '@/lib/app-version'
 import { SecuritySection } from './security/SecuritySection'
 import { AccessKeysSection } from './sections/AccessKeysSection'
@@ -114,42 +113,45 @@ export function SettingsPage() {
   const navigate = useNavigate()
   const user = useAuthStore((s) => s.user)
   const logoutMutation = useLogout()
-  const setUsername = useAuthStore((s) => s.setUsername)
+  const updateUsername = useUpdateUsername()
   const { dateFormat, setDateFormat, sidebarStyle, setSidebarStyle } = useAppStore()
 
   // Username editing -------------------------------------------------------
   const [editingUsername, setEditingUsername] = useState(false)
   const [newUsername, setNewUsername] = useState('')
   const [usernameError, setUsernameError] = useState<string | null>(null)
-  const [usernameSaving, setUsernameSaving] = useState(false)
+  const usernameSaving = updateUsername.isPending
 
   function startEditUsername() {
     setNewUsername(user?.username ?? '')
     setUsernameError(null)
+    updateUsername.reset()
     setEditingUsername(true)
   }
 
   function cancelEditUsername() {
     setEditingUsername(false)
     setUsernameError(null)
+    updateUsername.reset()
   }
 
-  async function saveUsername() {
+  function saveUsername() {
     const trimmed = newUsername.trim()
     if (!trimmed || trimmed === user?.username) { setEditingUsername(false); return }
-    if (trimmed.length < 3) { setUsernameError(t('settings.usernameTooShort')); return }
-    if (!/^[a-zA-Z0-9._-]+$/.test(trimmed)) { setUsernameError(t('settings.usernameInvalidChars')); return }
-    setUsernameSaving(true)
+    // The three messages live under `auth.*`; `settings.username*` never existed,
+    // so i18next used to render the raw key as the validation error.
+    if (trimmed.length < 3) { setUsernameError(t('auth.usernameTooShort')); return }
+    if (!/^[a-zA-Z0-9._-]+$/.test(trimmed)) { setUsernameError(t('auth.usernameInvalidChars')); return }
     setUsernameError(null)
-    try {
-      await api.patch('/auth/username', { newUsername: trimmed })
-      setUsername(trimmed)
-      setEditingUsername(false)
-    } catch (err: unknown) {
-      setUsernameError(getErrorStatus(err) === 409 ? t('settings.usernameTaken') : t('common.error'))
-    } finally {
-      setUsernameSaving(false)
-    }
+    updateUsername.mutate(trimmed, {
+      onSuccess: () => setEditingUsername(false),
+      // 409 is the one status whose backend reason we replace with our own copy;
+      // everything else keeps the server's user-safe reason via formatApiError.
+      onError: (err: unknown) =>
+        setUsernameError(
+          getErrorStatus(err) === 409 ? t('auth.usernameTaken') : formatApiError(err, t),
+        ),
+    })
   }
 
   // Theme -----------------------------------------------------------------

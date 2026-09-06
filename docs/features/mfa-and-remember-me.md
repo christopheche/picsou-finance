@@ -368,7 +368,10 @@ All UIs are mobile-responsive (per repo convention).
 **Frontend (new):**
 - `frontend/src/features/mfa/api.ts`, `frontend/src/features/mfa/hooks.ts`
 - `frontend/src/pages/settings/security/MfaEnrollDialog.tsx`, `frontend/src/pages/settings/security/MfaDisableDialog.tsx`, `frontend/src/pages/settings/security/RecoveryCodesDialog.tsx`
-- `frontend/src/pages/settings/security/SessionsList.tsx`
+- `frontend/src/pages/settings/security/SessionsList.tsx` — the row's "last used"
+  timestamp goes through `formatDateTime` from `lib/utils`, so it follows the user's
+  `dateFormat` preference like every other date; a session with no User-Agent falls
+  back to `t('settings.sessionsUnknownDevice')`.
 - `frontend/src/pages/login/MfaChallengePage.tsx`
 
 **Frontend (modified):**

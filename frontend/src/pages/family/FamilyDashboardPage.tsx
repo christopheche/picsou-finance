@@ -1,21 +1,31 @@
 import { useTranslation } from 'react-i18next'
 import { PageHeader } from '@/components/shared/PageHeader'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { ErrorState } from '@/components/shared/ErrorState'
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton'
 import { useFamilyDashboard } from '@/features/family/hooks'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Wallet, Target, Users } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils'
+import { formatApiError } from '@/lib/errors'
+import { accountTypeLabelKey } from '@/lib/constants'
+import type { AccountType } from '@/types/api'
 
 export function FamilyDashboardPage() {
   const { t } = useTranslation()
-  const { data, isLoading } = useFamilyDashboard()
+  const { data, isLoading, isError, error, refetch } = useFamilyDashboard()
 
   if (isLoading) {
     return <LoadingSkeleton />
   }
 
-  const dashboard = data!
+  // A network failure never reaches the global 5xx redirect (there is no response),
+  // so the page must render its own retry surface instead of dereferencing `data`.
+  if (isError || !data) {
+    return <ErrorState message={formatApiError(error, t)} onRetry={() => refetch()} />
+  }
+
+  const dashboard = data
 
   return (
     <div className="space-y-6">
@@ -65,7 +75,9 @@ export function FamilyDashboardPage() {
                     <CardTitle className="text-sm">{account.name}</CardTitle>
                     <span className="text-xs text-muted-foreground">{account.ownerName}</span>
                   </div>
-                  <p className="text-xs text-muted-foreground">{account.type}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {t(accountTypeLabelKey(account.type as AccountType))}
+                  </p>
                 </CardHeader>
                 <CardContent>
                   <p className="text-lg font-bold">
@@ -73,7 +85,7 @@ export function FamilyDashboardPage() {
                   </p>
                   {account.currency !== 'EUR' && (
                     <p className="text-xs text-muted-foreground">
-                      {formatCurrency(account.balance)} {account.currency}
+                      {formatCurrency(account.balance, account.currency)}
                     </p>
                   )}
                 </CardContent>

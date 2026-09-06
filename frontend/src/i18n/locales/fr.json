@@ -17,6 +17,13 @@
       "tooManyRequests": "Trop de tentatives. Veuillez patienter un instant et réessayer.",
       "serverError": "Une erreur est survenue de notre côté. Veuillez réessayer."
     },
+    "validation": {
+      "required": "Ce champ est obligatoire.",
+      "tooLong": "Valeur trop longue.",
+      "invalidNumber": "Saisissez un nombre valide.",
+      "nonNegative": "La valeur ne peut pas être négative.",
+      "percentage": "Saisissez un pourcentage entre 0 et 100."
+    },
     "dateHint": "jj/mm/aaaa",
     "search": "Rechercher",
     "noResults": "Aucun résultat",
@@ -165,6 +172,9 @@
     "description": "Description",
     "amount": "Montant",
     "tickerOrIsin": "Ticker ou ISIN",
+    "accountNamePlaceholder": "PEA Boursorama",
+    "providerPlaceholder": "Boursorama",
+    "tickerPlaceholder": "BTC",
     "tickerOrIsinPlaceholder": "IWDA.AS, IE00B4L5Y983, BTC...",
     "assetNamePlaceholder": "Ex. : iShares Core MSCI World",
     "history": "Historique",
@@ -469,6 +479,7 @@
     "tr": {
       "title": "Trade Republic",
       "phone": "Numéro de téléphone",
+      "phonePlaceholder": "+33...",
       "pin": "Code PIN",
       "tan": "Code de vérification",
       "connect": "Connecter",
@@ -591,7 +602,10 @@
       "allAccountsMapped": "Tous les comptes déjà mappés, synchronisation...",
       "serviceUnavailable": "Le service Finary est temporairement indisponible. Réessayez dans quelques minutes.",
       "syncFailed": "La synchronisation Finary a échoué",
-      "authFailed": "Identifiants Finary invalides. Vérifiez votre email et mot de passe."
+      "authFailed": "Identifiants Finary invalides. Vérifiez votre email et mot de passe.",
+      "importFailed": "L'import Finary a échoué",
+      "txCount": "{{count}} transaction",
+      "txCount_other": "{{count}} transactions"
     },
     "all": {
       "title": "Synchroniser les comptes",
@@ -603,7 +617,16 @@
       "sessionExpired": "Session expirée",
       "reconnect": "Se reconnecter depuis l'onglet du fournisseur",
       "trManualInfo": "Trade Republic est la seule banque qui nécessite une reconnexion manuelle. Vous devrez ressaisir votre numéro et PIN à chaque synchronisation.",
-      "trSlowWarning": "La connexion peut prendre quelques instants, c'est normal."
+      "trSlowWarning": "La connexion peut prendre quelques instants, c'est normal.",
+      "status": {
+        "linked": "Connecté",
+        "connected": "Connecté",
+        "active": "Session active",
+        "pending": "En attente",
+        "expired": "Expiré",
+        "failed": "Échec",
+        "error": "Erreur"
+      }
     },
     "bourso": {
       "title": "BoursoBank",

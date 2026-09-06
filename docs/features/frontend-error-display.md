@@ -1,6 +1,6 @@
 # Feature: Frontend Error Display (`formatApiError` / `safeBackendMessage`)
 
-> Last updated: 2026-05-31
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -130,6 +130,13 @@ Used by:
   *"Operation failed for {customerId}"* will trigger a (failed) parse, which
   silently falls through to returning the raw `detail`. That's the correct
   behaviour but worth understanding before tweaking the regex/slice logic.
+- **Per-row errors on a shared mutation hook go through the promise, not
+  mutate-level callbacks.** `SyncAllModal` fires one `useRetryBankSync` (and one
+  exchange, one wallet) hook for every row of that type. TanStack Query only
+  delivers the `onSuccess`/`onError`/`onSettled` passed to the *latest* `mutate()`
+  on a hook — "Sync all" over two banks left the first row spinning forever with its
+  error swallowed. The modal now uses `mutateAsync(id).then(clear, showError).finally(clearSpinner)`,
+  which settles per call (`SyncAllModal.test.tsx`, "several rows of one provider type").
 - **Type cast `err as { response?: ...; message?: ... }`.** The helper accepts
   `unknown` for safety but does no runtime guards beyond the `typeof string`
   checks. If a non-Axios shape (e.g. a thrown plain string) reaches it, none of

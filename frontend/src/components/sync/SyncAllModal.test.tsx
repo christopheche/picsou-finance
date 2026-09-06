@@ -52,7 +52,7 @@ function mockStatusEndpoints() {
   apiGet.mockImplementation((url: string) => {
     switch (url) {
       case '/sync/status':
-        return Promise.resolve({ data: [] })
+        return Promise.resolve({ data: banksFixture })
       case '/crypto/exchange/status':
         return Promise.resolve({ data: [] })
       case '/crypto/wallet':
@@ -82,6 +82,7 @@ function mockStatusEndpoints() {
 /** Overridden per test to drive the session-provider rows. */
 let amundiStatus: Record<string, unknown>
 let accountsFixture: unknown[]
+let banksFixture: unknown[]
 
 const AMUNDI_INACTIVE = {
   isActive: false, syncStatus: 'IDLE', lastSyncError: null,
@@ -100,6 +101,19 @@ const AMUNDI_ACCOUNT = {
 function resetFixtures() {
   amundiStatus = AMUNDI_INACTIVE
   accountsFixture = [TR_ACCOUNT]
+  banksFixture = []
+}
+
+function bankConnection(id: number, institutionName: string) {
+  return {
+    id,
+    requisitionId: `req-${id}`,
+    institutionId: `${institutionName}::FR::personal`,
+    institutionName,
+    status: 'LINKED',
+    authLink: null,
+    lastSyncedAt: '2026-08-10T08:00:00Z',
+  }
 }
 
 function makeClient() {
@@ -313,8 +327,8 @@ describe('SyncAllModal session providers', () => {
     renderModal()
 
     const row = (await screen.findByText('Amundi')).closest('[data-slot="card"]') as HTMLElement
-    expect(within(row).getByText('FAILED')).toBeInTheDocument()
-    expect(within(row).queryByText('active')).not.toBeInTheDocument()
+    expect(within(row).getByText('sync.all.status.failed')).toBeInTheDocument()
+    expect(within(row).queryByText('sync.all.status.active')).not.toBeInTheDocument()
   })
 
   /** A Flex outage or a rate limit clears on its own, so a failed-but-live row keeps its retry. */
@@ -328,5 +342,47 @@ describe('SyncAllModal session providers', () => {
 
     await waitFor(() => expect(apiPost).toHaveBeenCalledWith('/amundi/sync'))
     expect(navigate).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * Every bank row fires the same `useRetryBankSync` hook, and TanStack only delivers the
+ * mutate-level callbacks of the *latest* call on a hook. "Sync all" over two banks therefore
+ * used to clear the second row and leave the first spinning forever with its error swallowed.
+ */
+describe('SyncAllModal "Sync all" with several rows of one provider type', () => {
+  beforeEach(() => {
+    apiGet.mockReset()
+    apiPost.mockReset()
+    apiDelete.mockReset()
+    navigate.mockReset()
+    resetFixtures()
+    mockStatusEndpoints()
+  })
+
+  it('settles every bank row: the failed one shows its error, both buttons re-enable', async () => {
+    banksFixture = [bankConnection(1, 'Crédit Agricole'), bankConnection(2, 'BNP Paribas')]
+    apiPost.mockImplementation((url: string) => {
+      if (url === '/sync/1/retry') {
+        return Promise.reject({ response: { status: 502, data: { detail: 'Enable Banking down' } } })
+      }
+      if (url === '/sync/2/retry') return Promise.resolve({ data: [] })
+      return Promise.reject(new Error(`Unexpected POST ${url}`))
+    })
+    renderModal()
+
+    const firstRow = (await screen.findByText('Crédit Agricole')).closest('[data-slot="card"]') as HTMLElement
+    const secondRow = screen.getByText('BNP Paribas').closest('[data-slot="card"]') as HTMLElement
+    fireEvent.click(screen.getByRole('button', { name: /sync\.all\.syncAll/ }))
+
+    await waitFor(() => expect(apiPost).toHaveBeenCalledWith('/sync/1/retry'))
+    expect(apiPost).toHaveBeenCalledWith('/sync/2/retry')
+
+    // A 5xx is always translated rather than echoing the backend body.
+    expect(await within(firstRow).findByText('common.errors.serverError')).toBeInTheDocument()
+    await waitFor(() => expect(within(firstRow).getByRole('button')).toBeEnabled())
+    await waitFor(() => expect(within(secondRow).getByRole('button')).toBeEnabled())
+    expect(within(secondRow).queryByText('common.errors.serverError')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /sync\.all\.syncAll/ })).toBeEnabled()
   })
 })

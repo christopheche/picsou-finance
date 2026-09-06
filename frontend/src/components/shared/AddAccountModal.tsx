@@ -28,8 +28,9 @@ import {
   EXCHANGE_API_KEY_MAX_LENGTH,
   EXCHANGE_API_SECRET_MAX_LENGTH,
   TR_VERIFICATION_CODE_LENGTH,
+  accountTypeLabelKey,
 } from '@/lib/constants'
-import { extractErrorMessage, formatTrAuthError, getErrorStatus, getErrorDetail } from '@/lib/errors'
+import { extractErrorMessage, formatApiError, formatTrAuthError, getErrorStatus, getErrorDetail } from '@/lib/errors'
 import { useCreateAccount, useUpdateDebtMetadata } from '@/features/accounts/hooks'
 import {
   useSearchInstitutions,
@@ -141,6 +142,10 @@ export function AddAccountModal({ open, onOpenChange }: AddAccountModalProps) {
   const [step, setStep] = useState<WizardStep>('selector')
   const [showManualForm, setShowManualForm] = useState(false)
   const [showPropertyForm, setShowPropertyForm] = useState(false)
+  // Survives a failed manual submit: a loan is created before its debt metadata is saved, so
+  // a retry after the second call failed must reuse the account rather than create a twin
+  // (the same guard AddPropertyModal keeps for its two-step create).
+  const [createdAccountId, setCreatedAccountId] = useState<number | null>(null)
 
   function handleSourceClick(key: string) {
     if (key === 'manual') {
@@ -158,8 +163,11 @@ export function AddAccountModal({ open, onOpenChange }: AddAccountModalProps) {
     setStep(key as WizardStep)
   }
 
+  // Reset on *close*: the parent opens this dialog by flipping the `open` prop, and Radix does
+  // not call onOpenChange for that — a reset-on-open here would never run, so Escape from a
+  // wizard used to reopen the dialog straight onto that wizard.
   function handleDialogChange(open: boolean) {
-    if (open) {
+    if (!open) {
       setStep('selector')
     }
     onOpenChange(open)
@@ -200,11 +208,16 @@ export function AddAccountModal({ open, onOpenChange }: AddAccountModalProps) {
       // Set only when a bank was picked from the catalog; the backend resolves its logo from it.
       institutionId: data.institutionId,
     }
-    const created = await createAccount.mutateAsync(request)
+    let accountId = createdAccountId
+    if (accountId == null) {
+      const created = await createAccount.mutateAsync(request)
+      accountId = created.id
+      setCreatedAccountId(accountId)
+    }
 
     if (data.type === 'LOAN' && data.borrowedAmount && data.borrowedAmount > 0) {
       await updateDebt.mutateAsync({
-        id: created.id,
+        id: accountId,
         data: {
           borrowedAmount: data.borrowedAmount,
           interestRate: data.interestRatePct != null ? data.interestRatePct / 100 : undefined,
@@ -218,7 +231,13 @@ export function AddAccountModal({ open, onOpenChange }: AddAccountModalProps) {
       })
     }
 
+    setCreatedAccountId(null)
     setShowManualForm(false)
+  }
+
+  function handleManualFormOpenChange(open: boolean) {
+    setShowManualForm(open)
+    if (!open) setCreatedAccountId(null)
   }
 
   return (
@@ -301,10 +320,10 @@ export function AddAccountModal({ open, onOpenChange }: AddAccountModalProps) {
 
       <AccountForm
         open={showManualForm}
-        onOpenChange={setShowManualForm}
+        onOpenChange={handleManualFormOpenChange}
         onSubmit={handleManualSubmit}
         title={t('addAccount.manual')}
-        loading={createAccount.isPending}
+        loading={createAccount.isPending || updateDebt.isPending}
       />
     </>
   )
@@ -788,7 +807,7 @@ function TradeRepublicWizard({ onBack }: { onDone: () => void; onBack: () => voi
                 <Smartphone className="size-4 inline-block mr-1" />
                 {t('sync.tr.phone')}
               </Label>
-              <Input id="tr-phone" type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} required placeholder="+49..." autoFocus />
+              <Input id="tr-phone" type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} required placeholder={t('sync.tr.phonePlaceholder')} autoFocus />
             </div>
             <div className="space-y-2">
               <Label htmlFor="tr-pin">
@@ -878,6 +897,13 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
   const executeApiMutation = useExecuteFinaryApiSync()
   const checkTotpMutation = useCheckFinaryTotp()
 
+  // A 502 is the sidecar-style "Finary unreachable" the backend maps deliberately, so it
+  // gets its own wording before the generic status mapping (same rule as FinaryTab).
+  function formatFinaryError(err: unknown, fallbackKey: string): string {
+    if (getErrorStatus(err) === 502) return t('sync.finary.serviceUnavailable')
+    return formatApiError(err, t, fallbackKey)
+  }
+
   // --- Login ---
 
   function handleLogin(e: React.FormEvent) {
@@ -902,12 +928,13 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
             },
             onError: (err: unknown) => {
               setLoading(false)
-              setError(getErrorDetail(err) || t('common.retry'))
+              setError(formatFinaryError(err, 'sync.finary.syncFailed'))
             },
           })
         },
-        onError: () => {
+        onError: (err: unknown) => {
           setLoading(false)
+          setError(formatFinaryError(err, 'sync.finary.authFailed'))
         },
       },
     )
@@ -928,7 +955,10 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
         setTotpCode('')
 
         if (data.autoMapped && data.suggestedMappings) {
-          executeWithMappings(data.fileToken, data.suggestedMappings)
+          // Passed explicitly: the `isApiSync` state set just above is not visible to this
+          // closure yet, and reading it here posted the API sync token to the file-import
+          // endpoint, which knows nothing of it.
+          executeWithMappings(data.fileToken, data.suggestedMappings, true)
         } else {
           setStep(2)
         }
@@ -938,7 +968,7 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
         if (getErrorStatus(err) === 403) {
           setTotpRequired(true)
         } else {
-          setError(err instanceof Error ? err.message : t('common.retry'))
+          setError(formatFinaryError(err, 'sync.finary.syncFailed'))
         }
       },
     })
@@ -961,13 +991,14 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
         if (getErrorStatus(err) === 403) {
           setTotpRequired(true)
         } else {
-          setError(err instanceof Error ? err.message : t('common.retry'))
+          setError(formatFinaryError(err, 'sync.finary.syncFailed'))
         }
       },
     })
   }
 
-  function executeWithMappings(token: string, mappingsToUse: FinaryAccountMapping[]) {
+  /** `apiSync` picks the endpoint whose cache issued `token`: the two never share tokens. */
+  function executeWithMappings(token: string, mappingsToUse: FinaryAccountMapping[], apiSync: boolean) {
     setLoading(true)
     setError(null)
     const onSuccess = (data: FinaryImportResultResponse) => {
@@ -977,10 +1008,10 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
     }
     const onError = (err: unknown) => {
       setLoading(false)
-      setError(err instanceof Error ? err.message : t('common.retry'))
+      setError(formatFinaryError(err, apiSync ? 'sync.finary.syncFailed' : 'sync.finary.importFailed'))
     }
 
-    if (isApiSync) {
+    if (apiSync) {
       executeApiMutation.mutate({ syncToken: token, mappings: mappingsToUse }, { onSuccess, onError })
     } else {
       importMutation.mutate({ fileToken: token, mappings: mappingsToUse }, { onSuccess, onError })
@@ -1002,7 +1033,7 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
       },
       onError: (err: unknown) => {
         setLoading(false)
-        setError(err instanceof Error ? err.message : t('common.retry'))
+        setError(formatFinaryError(err, 'sync.finary.importFailed'))
       },
     })
   }
@@ -1069,7 +1100,7 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
 
   function handleImport() {
     if (!previewData) return
-    executeWithMappings(previewData.fileToken, mappings)
+    executeWithMappings(previewData.fileToken, mappings, isApiSync)
   }
 
   const hasSkipAll = mappings.every((m) => m.action === 'SKIP')
@@ -1180,7 +1211,7 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
           {/* File upload divider */}
           <div className="flex items-center gap-3">
             <div className="h-px flex-1 bg-border" />
-            <span className="text-xs text-muted-foreground">ou</span>
+            <span className="text-xs text-muted-foreground">{t('addAccount.or')}</span>
             <div className="h-px flex-1 bg-border" />
           </div>
 
@@ -1231,7 +1262,7 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
                   </div>
                   <div className="text-right shrink-0 ml-2">
                     <CurrencyDisplay value={account.currentBalance} />
-                    <p className="text-xs text-muted-foreground">{account.transactionCount} tx</p>
+                    <p className="text-xs text-muted-foreground">{t('sync.finary.txCount', { count: account.transactionCount })}</p>
                   </div>
                 </div>
 
@@ -1261,7 +1292,7 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
                   >
                     <option value="" disabled>{t('sync.finary.mapExisting')}...</option>
                     {previewData.existingPicsouAccounts.map((acc) => (
-                      <option key={acc.id} value={acc.id}>{acc.name} ({acc.type})</option>
+                      <option key={acc.id} value={acc.id}>{acc.name} ({t(accountTypeLabelKey(acc.type))})</option>
                     ))}
                   </select>
                 )}
@@ -1348,7 +1379,7 @@ function FinaryWizard({ onDone, onBack }: { onDone: () => void; onBack: () => vo
                   <div className="size-3 shrink-0 rounded-full" style={{ backgroundColor: account.color }} />
                   <div className="flex-1 min-w-0">
                     <p className="truncate text-sm font-medium">{account.name}</p>
-                    <span className="text-xs text-muted-foreground">{account.type}</span>
+                    <span className="text-xs text-muted-foreground">{t(accountTypeLabelKey(account.type))}</span>
                   </div>
                   <CurrencyDisplay value={account.currentBalance} />
                 </div>

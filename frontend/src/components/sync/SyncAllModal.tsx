@@ -119,6 +119,22 @@ function statusVariant(status: string): 'default' | 'secondary' | 'destructive' 
   }
 }
 
+/**
+ * Translation key for a provider status code, or undefined for one the UI does not know —
+ * the raw code is then shown as-is rather than hidden. `SESSION_EXPIRED` is handled by the
+ * caller because Trade Republic words it differently.
+ */
+const STATUS_LABEL_KEY: Record<string, string> = {
+  LINKED: 'sync.all.status.linked',
+  CONNECTED: 'sync.all.status.connected',
+  active: 'sync.all.status.active',
+  CREATED: 'sync.all.status.pending',
+  EXPIRED: 'sync.all.status.expired',
+  FAILED: 'sync.all.status.failed',
+  ERROR: 'sync.all.status.error',
+  TOTP_REQUIRED: 'sync.finary.totpRequired',
+}
+
 interface SyncAllModalProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -328,53 +344,58 @@ export function SyncAllModal({ open, onOpenChange }: SyncAllModalProps) {
       delete next[connection.id]
       return next
     })
-    /** Row-scoped mutation callbacks: clear the spinner, and show the row's error on failure. */
-    const rowCallbacks = (formatError: (err: unknown) => string) => ({
-      onSettled: clearSyncing,
-      onSuccess: clearRowError,
-      onError: (err: unknown) => setRowErrors(prev => ({ ...prev, [connection.id]: formatError(err) })),
-    })
+    const showRowError = (formatError: (err: unknown) => string) => (err: unknown) =>
+      setRowErrors(prev => ({ ...prev, [connection.id]: formatError(err) }))
+    /**
+     * Row-scoped bookkeeping on the request's *promise*, not on mutate-level callbacks: the
+     * bank, exchange and wallet rows each share one mutation hook, and TanStack only fires the
+     * callbacks of the latest `mutate()` on a hook — "Sync all" over two banks would leave the
+     * first row spinning forever and swallow its error. `mutateAsync` settles per call.
+     */
+    const track = (request: Promise<unknown>, onError: (err: unknown) => void) => {
+      request.then(clearRowError, onError).finally(clearSyncing)
+    }
     const formatGeneric = (err: unknown) => formatApiError(err, t, 'common.errors.serverError')
+    const showGenericError = showRowError(formatGeneric)
 
     switch (connection.providerType) {
       case 'bank':
-        if (connection.syncId !== undefined) retryBankMutation.mutate(connection.syncId, rowCallbacks(formatGeneric))
+        if (connection.syncId !== undefined) track(retryBankMutation.mutateAsync(connection.syncId), showGenericError)
+        else clearSyncing()
         break
       case 'exchange':
-        if (connection.syncId !== undefined) syncExchangeMutation.mutate(connection.syncId, rowCallbacks(formatGeneric))
+        if (connection.syncId !== undefined) track(syncExchangeMutation.mutateAsync(connection.syncId), showGenericError)
+        else clearSyncing()
         break
       case 'wallet':
-        if (connection.syncId !== undefined) syncWalletMutation.mutate(connection.syncId, rowCallbacks(formatGeneric))
+        if (connection.syncId !== undefined) track(syncWalletMutation.mutateAsync(connection.syncId), showGenericError)
+        else clearSyncing()
         break
       case 'tr':
-        syncTrMutation.mutate(undefined, {
-          onSettled: clearSyncing,
-          onSuccess: clearRowError,
-          onError: (err: unknown) => {
-            setRowErrors(prev => ({ ...prev, [connection.id]: formatTrAuthError(err, t) }))
-            // Session truly dead (refresh rejected or session cleared): refetch
-            // the now-inactive status and fall back to the inline phone/PIN form.
-            if (isTrSessionDeadError(err)) {
-              queryClient.invalidateQueries({ queryKey: syncKeys.tr() })
-              setTrAuthStep('phone')
-            }
-          },
+        track(syncTrMutation.mutateAsync(undefined), (err: unknown) => {
+          setRowErrors(prev => ({ ...prev, [connection.id]: formatTrAuthError(err, t) }))
+          // Session truly dead (refresh rejected or session cleared): refetch
+          // the now-inactive status and fall back to the inline phone/PIN form.
+          if (isTrSessionDeadError(err)) {
+            queryClient.invalidateQueries({ queryKey: syncKeys.tr() })
+            setTrAuthStep('phone')
+          }
         })
         break
       case 'bourso':
-        syncBoursoMutation.mutate(undefined, rowCallbacks(formatGeneric))
+        track(syncBoursoMutation.mutateAsync(undefined), showGenericError)
         break
       case 'amundi':
-        syncAmundiMutation.mutate(undefined, rowCallbacks(formatGeneric))
+        track(syncAmundiMutation.mutateAsync(undefined), showGenericError)
         break
       case 'bourse-direct':
-        syncBourseDirectMutation.mutate(undefined, rowCallbacks(formatGeneric))
+        track(syncBourseDirectMutation.mutateAsync(undefined), showGenericError)
         break
       case 'degiro':
-        syncDegiroMutation.mutate(undefined, rowCallbacks(formatGeneric))
+        track(syncDegiroMutation.mutateAsync(undefined), showGenericError)
         break
       case 'ibkr':
-        syncIbkrMutation.mutate(undefined, rowCallbacks(formatGeneric))
+        track(syncIbkrMutation.mutateAsync(undefined), showGenericError)
         break
       case 'finary':
         navigate('/sync?tab=finary')
@@ -540,7 +561,9 @@ export function SyncAllModal({ open, onOpenChange }: SyncAllModalProps) {
                                 ? isTr
                                   ? t('sync.tr.noSession')
                                   : t('sync.all.sessionExpired')
-                                : connection.status}
+                                : STATUS_LABEL_KEY[connection.status]
+                                  ? t(STATUS_LABEL_KEY[connection.status])
+                                  : connection.status}
                             </Badge>
                             {isTr && (
                               <Tooltip>
@@ -634,7 +657,7 @@ export function SyncAllModal({ open, onOpenChange }: SyncAllModalProps) {
                                 type="tel"
                                 value={trPhone}
                                 onChange={e => setTrPhone(e.target.value)}
-                                placeholder="+49..."
+                                placeholder={t('sync.tr.phonePlaceholder')}
                                 required
                               />
                             </div>

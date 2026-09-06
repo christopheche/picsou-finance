@@ -21,7 +21,7 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Search, TrendingUp, TrendingDown } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, formatNumber, formatPercent, localeFromLanguage } from '@/lib/utils'
 import { accountTypeLabelKey } from '@/lib/constants'
 import { ErrorState } from '@/components/shared/ErrorState'
 import { formatApiError } from '@/lib/errors'
@@ -40,7 +40,8 @@ const FILTER_TABS: { value: FilterType; labelKey: string; match: (type: Account[
 ]
 
 function HoldingsItem({ line, onClick }: { line: PortfolioLine; onClick: () => void }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
   const name = portfolioLineLabel(line, t)
 
   return (
@@ -54,7 +55,7 @@ function HoldingsItem({ line, onClick }: { line: PortfolioLine; onClick: () => v
         <ItemTitle>{name}</ItemTitle>
         <ItemDescription className="text-sm">
           {line.quantity > 0
-            ? `${line.quantity.toLocaleString()} ${t('dashboard.shares')} · ${line.accountName}`
+            ? `${formatNumber(line.quantity, locale)} ${t('dashboard.shares')} · ${line.accountName}`
             : line.accountName}
         </ItemDescription>
       </ItemContent>
@@ -77,7 +78,7 @@ function HoldingsItem({ line, onClick }: { line: PortfolioLine; onClick: () => v
               {line.pnlPercent >= 0
                 ? <TrendingUp className="size-3" />
                 : <TrendingDown className="size-3" />}
-              {line.pnlPercent >= 0 ? '+' : ''}{line.pnlPercent.toFixed(1)}%
+              {line.pnlPercent >= 0 ? '+' : ''}{formatPercent(line.pnlPercent / 100, locale)}
             </span>
           )}
         </div>
@@ -175,6 +176,8 @@ export function HoldingsCard() {
             {FILTER_TABS.map(tab => (
               <button
                 key={tab.value}
+                type="button"
+                aria-pressed={filter === tab.value}
                 onClick={() => setFilter(tab.value)}
                 className={cn(
                   'inline-flex h-10 min-w-32 items-center justify-center whitespace-nowrap rounded-md border px-6 text-sm font-medium transition-[background-color,color,border-color]',

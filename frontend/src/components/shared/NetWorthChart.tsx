@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next'
 import { Area, AreaChart, CartesianGrid, Legend, Line, ReferenceLine, XAxis, YAxis } from 'recharts'
 import { type ChartConfig, ChartContainer, ChartTooltip } from '@/components/ui/chart'
 import { TimeRangeSelector, type TimeRange } from '@/components/shared/TimeRangeSelector'
-import { formatDate, formatCurrency, localeFromLanguage } from '@/lib/utils'
+import { formatDate, formatCurrency, formatNumber, localeFromLanguage, parseApiDate } from '@/lib/utils'
+import { filterByRange } from '@/components/shared/chart-range'
 import { EmptyChartState } from '@/components/shared/EmptyChartState'
 import type { IntradayPoint } from '@/features/dashboard/api'
 
@@ -144,21 +145,6 @@ function NetWorthTooltip({ active, payload, labels, is24H, showGainLoss }: {
   )
 }
 
-function filterByRange(data: NetWorthChartProps['data'], range: TimeRange) {
-  if (range === 'ALL') return data
-  const now = new Date()
-  let from: Date
-  switch (range) {
-    case '7D': from = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7); break
-    case '1M': from = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate()); break
-    case '3M': from = new Date(now.getFullYear(), now.getMonth() - 3, now.getDate()); break
-    case 'YTD': from = new Date(now.getFullYear(), 0, 1); break
-    case '1Y': from = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate()); break
-    default: return data
-  }
-  return data.filter(p => new Date(p.date) >= from)
-}
-
 // Span-aware formatter -- the X axis is now a time scale fed numeric
 // timestamps, so we pick the format based on the actual visible span rather
 // than the (potentially-misleading) range button. Goals can stretch a short
@@ -190,13 +176,13 @@ export function NetWorthChart({ data, intraday = [], range, onRangeChange, showI
 
   const targetAt = useMemo(() => {
     if (!target) return null
-    const startMs = new Date(target.startDate).getTime()
-    const endMs = new Date(target.endDate).getTime()
+    const startMs = parseApiDate(target.startDate).getTime()
+    const endMs = parseApiDate(target.endDate).getTime()
     const span = endMs - startMs
     if (!Number.isFinite(span) || span <= 0) return null
     const slope = (target.endValue - target.startValue) / span
     return (iso: string) => {
-      const t = new Date(iso).getTime()
+      const t = parseApiDate(iso).getTime()
       if (!Number.isFinite(t)) return null
       const clamped = Math.min(Math.max(t, startMs), endMs)
       return target.startValue + slope * (clamped - startMs)
@@ -209,13 +195,13 @@ export function NetWorthChart({ data, intraday = [], range, onRangeChange, showI
   // so the line doesn't drift past the deadline).
   const projectionAt = useMemo(() => {
     if (!projection) return null
-    const startMs = new Date(projection.startDate).getTime()
-    const endMs = new Date(projection.endDate).getTime()
+    const startMs = parseApiDate(projection.startDate).getTime()
+    const endMs = parseApiDate(projection.endDate).getTime()
     const span = endMs - startMs
     if (!Number.isFinite(span) || span <= 0) return null
     const slope = (projection.endValue - projection.startValue) / span
     return (iso: string) => {
-      const t = new Date(iso).getTime()
+      const t = parseApiDate(iso).getTime()
       if (!Number.isFinite(t) || t < startMs) return null
       const clamped = Math.min(t, endMs)
       return projection.startValue + slope * (clamped - startMs)
@@ -236,7 +222,10 @@ export function NetWorthChart({ data, intraday = [], range, onRangeChange, showI
         }))
       : filterByRange(data, range).map(p => ({
           ...p,
-          dateMs: new Date(p.date).getTime(),
+          // A LocalDate anchored at local midnight: parsed as an instant it is UTC midnight,
+          // and the time-scale axis would then label every point with the previous day
+          // west of UTC.
+          dateMs: parseApiDate(p.date).getTime(),
           total: p.total as number | null,
         }))
 
@@ -245,7 +234,7 @@ export function NetWorthChart({ data, intraday = [], range, onRangeChange, showI
     // "savings progress" -- showing them would make the chart misleading.
     const cropped = (() => {
       if (!target) return base
-      const startMs = new Date(target.startDate).getTime()
+      const startMs = parseApiDate(target.startDate).getTime()
       if (!Number.isFinite(startMs)) return base
       return base.filter(p => p.dateMs >= startMs)
     })()
@@ -265,7 +254,7 @@ export function NetWorthChart({ data, intraday = [], range, onRangeChange, showI
     // category.
     if (target && range === 'ALL' && targetAt) {
       const last = decorated[decorated.length - 1]
-      const deadlineMs = new Date(target.endDate).getTime()
+      const deadlineMs = parseApiDate(target.endDate).getTime()
       const lastMs = last?.dateMs ?? -Infinity
       if (Number.isFinite(deadlineMs) && deadlineMs > lastMs) {
         decorated.push({
@@ -294,13 +283,15 @@ export function NetWorthChart({ data, intraday = [], range, onRangeChange, showI
       if ('projection' in d && typeof d.projection === 'number') totals.push(d.projection)
     }
     const maxVal = totals.length ? Math.max(...totals) : 0
-    if (maxVal >= 1_000_000) return (v: number) => `${(v / 1_000_000).toFixed(1)}M`
-    if (maxVal >= 100_000) return (v: number) => `${(v / 1_000).toFixed(0)}k`
-    if (maxVal >= 10_000) return (v: number) => `${(v / 1_000).toFixed(1)}k`
-    if (maxVal >= 1_000) return (v: number) => `${(v / 1_000).toFixed(2)}k`
-    if (maxVal >= 100) return (v: number) => v.toFixed(0)
-    return (v: number) => v.toFixed(2)
-  }, [filteredData])
+    // The k/M suffix is kept literal on purpose: Intl's compact notation spells it out in
+    // German and Spanish ("1,5 Tsd.", "1,5 mil") and no longer fits the 45px axis gutter.
+    if (maxVal >= 1_000_000) return (v: number) => `${formatNumber(v / 1_000_000, locale, 1)}M`
+    if (maxVal >= 100_000) return (v: number) => `${formatNumber(v / 1_000, locale, 0)}k`
+    if (maxVal >= 10_000) return (v: number) => `${formatNumber(v / 1_000, locale, 1)}k`
+    if (maxVal >= 1_000) return (v: number) => `${formatNumber(v / 1_000, locale, 2)}k`
+    if (maxVal >= 100) return (v: number) => formatNumber(v, locale, 0)
+    return (v: number) => formatNumber(v, locale, 2)
+  }, [filteredData, locale])
 
   const chartConfig = useMemo(() => ({
     total: {

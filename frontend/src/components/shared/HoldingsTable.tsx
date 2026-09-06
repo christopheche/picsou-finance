@@ -4,7 +4,7 @@ import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
 import { PriceFreshnessDot } from '@/components/shared/PriceFreshnessDot'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { cn } from '@/lib/utils'
+import { cn, formatPercent, localeFromLanguage } from '@/lib/utils'
 import { Pencil, Trash2 } from 'lucide-react'
 import {
   Table,
@@ -22,7 +22,8 @@ interface HoldingsTableProps {
 }
 
 export function HoldingsTable({ holdings, onEdit, onDelete }: HoldingsTableProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
 
   if (holdings.length === 0) return null
 
@@ -71,7 +72,7 @@ export function HoldingsTable({ holdings, onEdit, onDelete }: HoldingsTableProps
                   {h.pnlEur != null ? <CurrencyDisplay value={h.pnlEur} showSign className="text-sm" /> : '\u2014'}
                 </TableCell>
                 <TableCell className={cn('text-right', h.pnlPercent != null && h.pnlPercent >= 0 ? 'text-emerald-500' : h.pnlPercent != null && h.pnlPercent < 0 ? 'text-red-500' : '')}>
-                  {h.pnlPercent != null ? `${h.pnlPercent >= 0 ? '+' : ''}${h.pnlPercent.toFixed(1)}%` : '\u2014'}
+                  {h.pnlPercent != null ? `${h.pnlPercent >= 0 ? '+' : ''}${formatPercent(h.pnlPercent / 100, locale)}` : '\u2014'}
                 </TableCell>
                 {(onEdit || onDelete) && (
                   <TableCell className="text-right">

@@ -1,3 +1,10 @@
+/**
+ * Mirrors the backend DTO records.
+ *
+ * The backend serialises with Jackson `default-property-inclusion: non_null`: a null member is
+ * *omitted* from the JSON, so every `T | null` below is `T | undefined` at runtime. Test such
+ * fields with `== null` or optional chaining — `=== null` never matches.
+ */
 export type AccountType =
   | 'LEP' | 'LIVRET_A' | 'LDDS' | 'LIVRET_JEUNE' | 'PEL' | 'CEL'
   | 'PEA' | 'COMPTE_TITRES' | 'CRYPTO' | 'CHECKING' | 'SAVINGS'

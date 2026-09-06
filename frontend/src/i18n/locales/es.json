@@ -28,6 +28,8 @@
     "search": "Buscar",
     "noResults": "Sin resultados",
     "retry": "Reintentar",
+    "errorTitle": "Error",
+    "showMore": "Mostrar {{count}} más",
     "back": "Atrás",
     "next": "Siguiente",
     "close": "Cerrar",

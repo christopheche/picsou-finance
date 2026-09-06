@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next'
 import { Line, LineChart, CartesianGrid, XAxis, YAxis } from 'recharts'
 import { type ChartConfig, ChartContainer, ChartTooltip } from '@/components/ui/chart'
 import { TimeRangeSelector, type TimeRange } from '@/components/shared/TimeRangeSelector'
-import { formatCurrency, localeFromLanguage } from '@/lib/utils'
+import { formatCurrency, formatNumber, localeFromLanguage, parseApiDate } from '@/lib/utils'
+import { filterByRange } from '@/components/shared/chart-range'
 import type { Account } from '@/types/api'
 
 interface AccountsStackedChartProps {
@@ -39,7 +40,7 @@ function PnlTooltip({ active, payload, accounts, labels }: {
   return (
     <div className="rounded-xl bg-popover px-3 py-2.5 text-xs text-popover-foreground shadow-lg ring-1 ring-foreground/5 dark:ring-foreground/10">
       <div className="mb-1.5 font-medium">
-        {new Date(dateStr).toLocaleDateString(labels.locale, { day: 'numeric', month: 'short', year: 'numeric' })}
+        {parseApiDate(dateStr).toLocaleDateString(labels.locale, { day: 'numeric', month: 'short', year: 'numeric' })}
       </div>
       <div className="space-y-0.5">
         {rows.map(({ item, account }) => (
@@ -63,21 +64,6 @@ function PnlTooltip({ active, payload, accounts, labels }: {
       </div>
     </div>
   )
-}
-
-function filterByRange(data: AccountsStackedChartProps['data'], range: TimeRange) {
-  if (range === 'ALL') return data
-  const now = new Date()
-  let from: Date
-  switch (range) {
-    case '24H': from = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1); break
-    case '7D': from = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7); break
-    case '1M': from = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate()); break
-    case '3M': from = new Date(now.getFullYear(), now.getMonth() - 3, now.getDate()); break
-    case 'YTD': from = new Date(now.getFullYear(), 0, 1); break
-    case '1Y': from = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate()); break
-  }
-  return data.filter(p => new Date(p.date) >= from)
 }
 
 export function AccountsStackedChart({ accounts, data }: AccountsStackedChartProps) {
@@ -118,7 +104,7 @@ export function AccountsStackedChart({ accounts, data }: AccountsStackedChartPro
             tickLine={false}
             axisLine={false}
             tickMargin={8}
-            tickFormatter={(value) => new Date(value).toLocaleDateString(locale, { month: 'short' })}
+            tickFormatter={(value) => parseApiDate(String(value)).toLocaleDateString(locale, { month: 'short' })}
           />
           <YAxis
             tickLine={false}
@@ -126,7 +112,7 @@ export function AccountsStackedChart({ accounts, data }: AccountsStackedChartPro
             tickMargin={8}
             tickFormatter={(value) => {
               const abs = Math.abs(value)
-              const formatted = abs >= 1000 ? `${(abs / 1000).toFixed(abs >= 10000 ? 0 : 1)}k` : abs.toFixed(0)
+              const formatted = abs >= 1000 ? `${formatNumber(abs / 1000, locale, abs >= 10000 ? 0 : 1)}k` : formatNumber(abs, locale, 0)
               return `${value < 0 ? '-' : ''}${formatted}`
             }}
             width={45}

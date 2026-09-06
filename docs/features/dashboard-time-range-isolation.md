@@ -13,7 +13,8 @@ The dashboard fetches all data once via `useDashboard()` (no range parameter). T
 ### Key files
 
 - `frontend/src/pages/dashboard/DashboardPage.tsx` — Page layout, owns `range` state, calculates trend over selected period, passes `range`/`onRangeChange` to chart
-- `frontend/src/components/shared/NetWorthChart.tsx` — Chart with `range`/`onRangeChange` props, `filterByRange()` client-side filter
+- `frontend/src/components/shared/NetWorthChart.tsx` — Chart with `range`/`onRangeChange` props
+- `frontend/src/components/shared/chart-range.ts` — `filterByRange()` client-side filter, shared with `AccountsStackedChart` (unit-tested west of UTC in `chart-range.test.ts`)
 - `frontend/src/components/shared/TimeRangeSelector.tsx` — Time range button controls (1D, 7D, 1M, 3M, YTD, 1Y, ALL)
 - `backend/src/main/java/com/picsou/service/DashboardService.java` — `buildNetWorthHistory()` always fetches last 12 months
 
@@ -73,6 +74,11 @@ the same bounded content area: the pie legend scrolls if needed, and the
 allocation treemap fills the available height. This prevents the whole grid row
 from growing when the user switches between "Distribution" and "Allocation".
 
+Each treemap tile is a `<button>` carrying `aria-label="<account> <share>"`, and focus drives the
+same highlight and tooltip as hover: the per-account share used to be hover-only, so keyboard and
+screen-reader users could never reach it. Shares are rendered through `formatPercent`, in the app
+locale rather than a bare `` `${percentage}%` ``.
+
 ## Technical choices
 
 | Choice | Why | Rejected alternative |
@@ -89,6 +95,8 @@ from growing when the user switches between "Distribution" and "Allocation".
 - **Backend always returns 12 months**: `DashboardService.buildNetWorthHistory()` hardcodes `LocalDate.now().minusMonths(12)`. Ranges like `'ALL'` will only show 12 months unless the backend is updated.
 
 - **`filterByRange()` uses `new Date()` at filter time**: The cutoff date is computed on each range change relative to "now". If the page stays open across midnight, the filtered window shifts accordingly.
+
+- **Points are `LocalDate`s and go through `parseApiDate`**: both the filter and the chart's time-scale `dateMs` anchor a date at *local* midnight. Parsed as an instant (`new Date(p.date)`) a point sits at UTC midnight, so west of UTC it was labelled with the previous day and a point dated exactly on the range start was dropped.
 
 - **`NetWorthChart` is used elsewhere**: It's a shared component in `components/shared/`. The `TimeRangeSelector` is now always rendered inside it. If another page uses `NetWorthChart`, it will also show the range selector.
 

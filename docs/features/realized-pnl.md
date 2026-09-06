@@ -73,6 +73,9 @@ See ADR [2026-07-11-realized-pnl-average-cost-on-the-fly](../decisions/2026-07-1
   sell-without-buy, account currency, buys-only (empty), and the same-day ordering behavioral
   contract: BUY-then-SELL in insertion order realizes the correct gain with no warning, while the
   reversed order documents the over-sell-warning failure mode that DB ordering must prevent.
+- `RealizedPnlSection.test.tsx` — empty/missing data renders nothing, gain/loss colouring, and
+  the lot date staying on its own day west of UTC (it is a `LocalDate`, formatted through the
+  shared `formatDate`).
 - `TransactionRepositoryTest` (`@DataJpaTest` + H2) — persists a SELL then a BUY on the same date
   and asserts `findByAccountIdAndTxTypeInOrderByDateAscIdAsc` returns them in insertion order
   (`(date, id)`), consistently across repeated calls.

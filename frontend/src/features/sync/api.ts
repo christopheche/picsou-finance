@@ -281,9 +281,11 @@ export const finaryApi = {
     return api.post<FinaryPreviewResponse>('/finary/preview', form).then(r => r.data)
   },
 
+  // The TOTP goes in the body, never in the query string: a `?totp=` would land in
+  // reverse-proxy access logs and browser history.
   previewApi: (totp?: string) =>
     api
-      .post<FinaryPreviewResponse>(`/finary/api-sync/preview${totp ? `?totp=${totp}` : ''}`)
+      .post<FinaryPreviewResponse>('/finary/api-sync/preview', totp ? { totp } : {})
       .then(r => r.data),
 
   import: (request: FinaryImportRequest) =>

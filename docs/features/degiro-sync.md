@@ -46,6 +46,15 @@ browser-automation one.
    `{sessionId, intAccount}` blob, which Java encrypts via `CryptoEncryption`
    into `DegiroSession.sessionBlob` — Java never parses this blob's contents.
 
+Both auth calls share the per-IP `degiroAuthBuckets` (5 per 15 min); `/complete`
+is throttled for the same reason as `/initiate` — the TOTP space is only 1M, so
+an unthrottled verify endpoint is brute-forceable once a `processId` is known.
+`POST /api/degiro/sync` is throttled too, on the shared per-IP `syncBuckets`
+(10/minute), because every call decrypts the stored session and performs a live
+portfolio fetch from the instance's IP, which DEGIRO itself throttles. The two
+budgets are separate, so exhausting sync never locks the member out of
+re-authenticating.
+
 Between the two calls the sidecar keeps the plaintext credentials in memory
 (they are re-submitted with the TOTP code). That entry lives at most
 `_PENDING_TTL` (5 min): a 30 s sweeper task (`lifespan`) drops expired entries

@@ -74,6 +74,14 @@ See the [ADR](../decisions/2026-07-19-ibkr-flex-web-service.md) for the full API
 
 ## Gotchas / Pitfalls
 
+- **`IbkrConnectRequest` bounds the plaintext, not the ciphertext.** `token` and `queryId` are
+  encrypted with AES-GCM before landing in `ibkr_connection.token` / `.query_id`, both
+  `varchar(500)`. Base64 turns n bytes into roughly `4/3 * (n + 28)` characters, so the
+  `@Size(max = 200)` on each is what keeps the stored value inside the column: without it a
+  pasted 400-character string came back as a 500 at INSERT instead of a 422. Real Flex tokens
+  are ~20 digits and query ids ~7, so the bound is generous. Same trap, and the same reasoning,
+  as `CryptoExchangeController.AddExchangeRequest`; raising either bound means widening the
+  column first.
 - **Base currency requirement (enforced).** `fxRateToBase` converts a position's native
   currency to the user's **IBKR base currency**, not necessarily EUR. `averageBuyIn` (and
   therefore the "invested" and PnL figures) is correct only when the IBKR base currency is

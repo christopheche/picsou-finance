@@ -111,6 +111,16 @@ All sync services (`FinaryPersistenceHelper`, `BoursoSyncService`) now call `tra
 
 `DELETE` validates that the transaction is manual (`isManual = true`). Synced transactions cannot be deleted via this endpoint.
 
+`POST` and `PUT` bodies are `@Valid`-checked against `TransactionRequest`, whose `@Size` bounds
+mirror the `transaction` columns exactly — `description` 255, `ticker` 30, `name` 100,
+`currency` 10 — because `ManualTransactionService` copies the fields verbatim: anything longer
+used to fail at INSERT and surface as a generic 500 rather than a 422 naming the field. If a
+column's width changes, the bound must change with it. `currency` also goes through
+`@ValidCurrency`, so an unknown ISO code can no longer be persisted and later crash the
+frontend's currency formatter (issue #9). `quantity` is bounded at zero — `HoldingComputeService`
+negates it itself on a SELL, so a negative one would add to the position instead of removing
+from it — while `amount` stays signed, an expense being negative.
+
 ### Frontend
 
 `AddTransactionModal` is account-type-aware:
@@ -170,11 +180,22 @@ After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the 
   omits it, so `TransactionsList` tests `txType == null` (loose) — a strict `=== null` guard never
   matched and a manual ticker row with no type rendered as `undefined AAPL`. The same holds for
   every `| null` field in `types/api.ts`.
+- **Bounds live on the DTO, not in the service.** `ManualTransactionService` still rejects
+  negative `fees` itself (a 400 with a message), because that rule reads better as a domain
+  refusal; everything expressible as a column width or a sign belongs on `TransactionRequest`
+  so the caller gets a 422 field map before any row is touched.
 - **The list renders `TRANSACTIONS_PAGE_SIZE` rows at a time.** Filtering and grouping are
   memoised on `(transactions, search, locale)`; a new search restarts from the first page.
 
 ## Tests
 
+- `TransactionRequestTest` — the bean-validation contract of the request body against the
+  standalone validator: a fully-populated request and one with every optional instrument field
+  null both pass; over-long `description` / `ticker` / `name`, an unknown or over-long
+  `currency` and a negative `quantity` are each rejected on their own field; a negative
+  `amount` passes.
+- `HoldingRequestTest` — the same for `PUT /accounts/{id}/holdings/{ticker}`: zero quantity and
+  a null `averageBuyIn` pass, a null quantity and negative figures are rejected.
 - `HoldingComputeServiceTest` — 11 unit tests: BUY-only, multi-BUY VWAP, BUY+SELL, fully-sold position, null ticker/quantity skipping, multiple tickers, existing holding update, plus position name = newest transaction's name and name-preserved-when-transactions-have-none.
 - `ManualTransactionServiceTest` — 11 unit tests: manual cash add (balance + snapshots recomputed), synced cash add (transaction saved, balance/snapshots untouched), investment add (holdings recomputed, for both manual and synced accounts), non-owned account rejection, manual delete, synced-account delete (no reconstruct), synced-transaction delete rejection, not-found rejection, plus ISIN input → resolved ticker/name/description and plain-ticker uppercased with the user "Nom" winning.
 - `TransactionsList.test.tsx` — localized BUY, SELL, DIVIDEND, and FEE fallbacks, provider-description preservation, an absent `txType` member keeping the stored description, localized search, date-heading behavior, and the 200-row window ("show more" extends it, a new search resets it).

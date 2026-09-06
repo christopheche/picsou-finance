@@ -2,7 +2,6 @@ package com.picsou.controller;
 
 import com.picsou.config.ClientIp;
 import com.picsou.config.RateLimitConfig;
-import com.picsou.dto.AccountResponse;
 import com.picsou.service.DegiroSyncService;
 import com.picsou.service.DegiroSyncService.AuthInitResponse;
 import com.picsou.service.DegiroSyncService.SessionStatusResponse;
@@ -27,15 +26,18 @@ public class DegiroController {
     private final DegiroSyncService   degiroService;
     private final UserContext         userContext;
     private final Map<String, Bucket> degiroAuthBuckets;
+    private final Map<String, Bucket> syncBuckets;
 
     public DegiroController(
         DegiroSyncService degiroService,
         UserContext userContext,
-        @org.springframework.beans.factory.annotation.Qualifier("degiroAuthBuckets") Map<String, Bucket> degiroAuthBuckets
+        @org.springframework.beans.factory.annotation.Qualifier("degiroAuthBuckets") Map<String, Bucket> degiroAuthBuckets,
+        @org.springframework.beans.factory.annotation.Qualifier("syncBuckets") Map<String, Bucket> syncBuckets
     ) {
         this.degiroService     = degiroService;
         this.userContext       = userContext;
         this.degiroAuthBuckets = degiroAuthBuckets;
+        this.syncBuckets       = syncBuckets;
     }
 
     /**
@@ -78,10 +80,17 @@ public class DegiroController {
     /**
      * Manually trigger a sync using the stored session. There is no scheduled
      * equivalent for DEGIRO — see {@link DegiroSyncService} Javadoc.
+     *
+     * <p>Throttled like every other sync entry point: each call decrypts the stored session
+     * and performs a live portfolio fetch from the instance's IP, which DEGIRO itself
+     * throttles — nothing else stops a caller re-issuing it the moment one finishes.
      */
     @PostMapping("/sync")
-    public AccountResponse sync() {
-        return degiroService.sync(userContext.currentMemberId());
+    public ResponseEntity<?> sync(HttpServletRequest request) {
+        if (!checkSyncRateLimit(request)) {
+            return rateLimited("Too many DEGIRO synchronization requests. Please wait before retrying.");
+        }
+        return ResponseEntity.ok(degiroService.sync(userContext.currentMemberId()));
     }
 
     /** Return session status (active / needs reconnect, last sync time). */
@@ -105,9 +114,19 @@ public class DegiroController {
         return bucket.tryConsume(1);
     }
 
+    private boolean checkSyncRateLimit(HttpServletRequest request) {
+        String ip = ClientIp.resolve(request);
+        Bucket bucket = syncBuckets.computeIfAbsent(ip, k -> RateLimitConfig.createSyncBucket());
+        return bucket.tryConsume(1);
+    }
+
     private ResponseEntity<ProblemDetail> rateLimited() {
+        return rateLimited("Too many DEGIRO authentication attempts. Please wait before retrying.");
+    }
+
+    private ResponseEntity<ProblemDetail> rateLimited(String message) {
         ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.TOO_MANY_REQUESTS);
-        detail.setDetail("Too many DEGIRO authentication attempts. Please wait before retrying.");
+        detail.setDetail(message);
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(detail);
     }
 

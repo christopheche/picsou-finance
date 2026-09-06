@@ -1,6 +1,6 @@
 # Fix: Trade Republic Holding Deduplication
 
-> Last updated: 2026-05-18
+> Last updated: 2026-09-06
 
 ## Problem
 
@@ -21,7 +21,7 @@ This occurred because multiple ISIN codes (securities identifiers) could convert
 
 ## Solution
 
-Modified `TradeRepublicSyncService.upsertAccount()` (and `BoursoSyncService` which has the same shape) to deduplicate holdings by ticker before persisting:
+Modified `TradeRepublicSyncService.upsertAccount()` to deduplicate holdings by ticker before persisting (IBKR and DEGIRO reuse the same helper; the provider-valued brokers — BoursoBank, Bourse Direct, Amundi — merge with their own `mergePositions`, see below):
 
 1. **Collect and deduplicate**: Loop through positions, converting each ISIN to a ticker
 2. **Aggregate via VWAP**: When multiple positions map to the same ticker, combine quantities AND compute a quantity-weighted average buy-in
@@ -30,15 +30,17 @@ Modified `TradeRepublicSyncService.upsertAccount()` (and `BoursoSyncService` whi
 ### Implementation
 
 - Shared helper `com.picsou.service.HoldingDedup` exposes the `HoldingAgg` record and a static `vwapMerge(prev, next)` method
-- Used `Map.merge(..., HoldingDedup::vwapMerge)` so both sync services share a single canonical merge formula
+- Trade Republic, IBKR and DEGIRO use `Map.merge(..., HoldingDedup::vwapMerge)` so the three ISIN-converting brokers share a single canonical merge formula
+- BoursoBank, Bourse Direct and Amundi do **not** use `HoldingDedup`: their lines carry a provider valuation (`providerValueEur` / `providerPnlEur`) that `HoldingAgg` has no field for, and dropping it on merge is exactly what makes an unpriceable holding read as 0 EUR downstream. Each of them has a private `mergePositions(left, right)` that sums quantities and provider value/PnL, weights buy-in and current price by quantity, and refuses to merge lines whose quote currencies differ (BoursoBank, Bourse Direct) or whose labels differ (Amundi — an ISIN-less fallback ticker colliding across two funds). Their `PreparedPosition` records are the merge unit, not `HoldingAgg`.
 - Positions are deduplicated **in-memory before database writes**, avoiding constraint violations
-- VWAP formula: `weightedAvg = (q1·a1 + q2·a2) / (q1 + q2)` at scale 8, `RoundingMode.HALF_UP` (matches `HoldingComputeService`)
+- VWAP formula: `weightedAvg = (q1·a1 + q2·a2) / (q1 + q2)` at scale 8, `RoundingMode.HALF_UP` (matches `HoldingComputeService`); the provider-valued services use the same formula but return `null` instead of treating a missing side as zero
 
 ### Key files
 
 - `backend/src/main/java/com/picsou/service/HoldingDedup.java` — shared VWAP merge helper
-- `backend/src/main/java/com/picsou/service/TradeRepublicSyncService.java:346-378` — TR upsertAccount dedup loop
-- `backend/src/main/java/com/picsou/service/BoursoSyncService.java:245-281` — Bourso upsertAccount dedup loop
+- `backend/src/main/java/com/picsou/service/TradeRepublicSyncService.java` — `upsertAccount()` dedup loop ("Deduplicate by ticker" block) over `HoldingDedup::vwapMerge`
+- `backend/src/main/java/com/picsou/service/IbkrSyncService.java`, `DegiroSyncService.java` — same helper, same loop shape
+- `backend/src/main/java/com/picsou/service/BoursoSyncService.java`, `BourseDirectSyncService.java`, `AmundiSyncService.java` — `preparePositions()` merges through the service's own `mergePositions()` (provider valuation preserved)
 
 ## Technical choices
 
@@ -47,7 +49,8 @@ Modified `TradeRepublicSyncService.upsertAccount()` (and `BoursoSyncService` whi
 | Deduplicate in-memory before saving | Avoids constraint violations and keeps the database clean | Update existing holdings (more complex, slower) |
 | Use `Map.merge()` for aggregation | Concise, handles both first occurrence and merges in one pass | Manual `if-put-get` logic (more verbose) |
 | VWAP-weighted average buy-in on duplicates | Mathematically correct cost-basis; preserves the gain/loss invariant `pnl = value − cost` | "Keep first averageBuyIn" — non-deterministic (depends on HashMap iteration order) and produces wrong gain/loss percentages |
-| Shared `HoldingDedup` helper for TR & Bourso | One canonical formula = one place to audit/test; prevents drift between providers | Per-service private lambdas (regressed twice already) |
+| Shared `HoldingDedup` helper for TR, IBKR & DEGIRO | One canonical formula = one place to audit/test; prevents drift between the brokers whose lines are priced by Yahoo only | Per-service private lambdas (regressed twice already) |
+| Private `mergePositions` in BoursoBank / Bourse Direct / Amundi | `HoldingAgg` carries no provider valuation; a merge through `vwapMerge` would silently drop `providerValueEur` / `providerPnlEur` and zero the line once Yahoo cannot price it | Extending `HoldingAgg` with provider fields (would make TR/IBKR/DEGIRO carry nullable columns they never fill) or reusing `vwapMerge` (regressed to 0 EUR holdings — see `bourso-bank.md`) |
 
 ## Gotchas / Pitfalls
 
@@ -64,6 +67,7 @@ Modified `TradeRepublicSyncService.upsertAccount()` (and `BoursoSyncService` whi
 - `HoldingDedupTest` — VWAP math, null handling, order independence, zero-quantity guard, name/currentPrice fallback
 - `TradeRepublicSyncServiceTest#sync_mergesDuplicateTickersWithVwap` — integration wiring: two distinct ISINs → same ticker → saved `AccountHolding.averageBuyIn` is the VWAP, not whichever position appeared first
 - `TradeRepublicSyncServiceTest#sync_deletesOldHoldingsWhenPortfolioReturnsEmpty` — empty authoritative TR portfolio clears stale holdings
+- `BoursoSyncServiceTest#queueSync_mergesLinesThatResolveToTheSameTicker`, `BourseDirectSyncServiceTest#duplicatePositions_areMergedWithWeightedPrices` / `#duplicatePositions_doNotInventMissingPrices`, `AmundiSyncServiceTest#theSameFundListedTwiceIsMerged` / `#twoDifferentFundsCollidingOnTheFallbackTickerAreRefusedNotFused` — the provider-valued merge path: quantities and provider value summed, prices weighted, `null` kept when one side is missing, collisions refused
 - No regression in existing sync flow when the backend suite is run.
 
 ## Related

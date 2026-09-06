@@ -6,6 +6,7 @@ import com.picsou.dto.EnableBankingTestResponse;
 import io.jsonwebtoken.Jwts;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -38,18 +39,32 @@ public class IntegrationsHealthService {
 
     private final EnableBankingConfigProvider configProvider;
     private final SetupService setupService;
+    private final WebClient.Builder clientBuilder;
     private final WebClient ebClient;
     private final String envBoursoUrl;
 
+    @Autowired
     public IntegrationsHealthService(
         EnableBankingConfigProvider configProvider,
         SetupService setupService,
         @Value("${app.enablebanking.base-url:https://api.enablebanking.com}") String ebBaseUrl,
         @Value("${app.bourso-auth.url:http://bourso-auth:8001}") String envBoursoUrl
     ) {
+        this(configProvider, setupService, WebClient.builder(), ebBaseUrl, envBoursoUrl);
+    }
+
+    /** Test seam: the builder's exchange function is what the tests fake. */
+    IntegrationsHealthService(
+        EnableBankingConfigProvider configProvider,
+        SetupService setupService,
+        WebClient.Builder clientBuilder,
+        String ebBaseUrl,
+        String envBoursoUrl
+    ) {
         this.configProvider = configProvider;
         this.setupService = setupService;
-        this.ebClient = WebClient.builder().baseUrl(ebBaseUrl).build();
+        this.clientBuilder = clientBuilder;
+        this.ebClient = clientBuilder.clone().baseUrl(ebBaseUrl).build();
         this.envBoursoUrl = envBoursoUrl;
     }
 
@@ -88,6 +103,10 @@ public class IntegrationsHealthService {
                 "Enable Banking rejected the JWT. Double-check your Application ID and Key ID, " +
                 "and make sure the public key has been uploaded to the Enable Banking dashboard.");
         } catch (WebClientResponseException.Forbidden ex) {
+            // Enable Banking answers 403 for several distinct causes; the body is
+            // the only clue an operator gets, so keep it in the log.
+            log.info("setup.integration.enablebanking.test failed code=public_key_not_uploaded status={} body={}",
+                ex.getStatusCode(), ex.getResponseBodyAsString());
             return EnableBankingTestResponse.failure("public_key_not_uploaded",
                 "Your public key does not match any key on the Enable Banking dashboard. " +
                 "Go back one step, copy the public key, and paste it in your Enable Banking app.");
@@ -108,7 +127,7 @@ public class IntegrationsHealthService {
             .orElse(envBoursoUrl);
 
         try {
-            WebClient.builder().baseUrl(url).build()
+            clientBuilder.clone().baseUrl(url).build()
                 .get().uri("/health")
                 .retrieve()
                 .toBodilessEntity()

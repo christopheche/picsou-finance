@@ -1,6 +1,6 @@
 # Feature: First-launch Setup Wizard
 
-> Last updated: 2026-07-19 (HSTS is opt-in, no longer an always-on nginx header)
+> Last updated: 2026-09-06 (`IntegrationsHealthServiceTest`, 403 branch logged; previously 2026-07-19: HSTS is opt-in, no longer an always-on nginx header)
 
 ## Context
 
@@ -256,9 +256,15 @@ The wizard makes zero outbound requests on first load:
 - `CryptoKeyGeneratorServiceTest` — Base64 AES-256 shape on first call, never
   overwrites on re-run, `exists()` reports absence then presence.
 
-`IntegrationsHealthService` is tested indirectly through `SetupControllerTest` mocks
-— no dedicated unit test today, since its logic is a thin HTTP-client wrapper whose
-failure modes are better exercised at the controller boundary.
+- `IntegrationsHealthServiceTest` — over a fake `ExchangeFunction` (no network, no
+  Spring context): the JWT sent to `GET /aspsps` is signed with the stored key and
+  carries the Key ID / Application ID, the status → code mapping (401 →
+  `invalid_key_id`, 403 → `public_key_not_uploaded`, other HTTP → `unknown`,
+  connection failure → `network`), no call is made when the Application ID is
+  missing, and the sidecar health check prefers the URL stored in the database over
+  the environment default. Every failure branch of the Enable Banking test also
+  logs a `setup.integration.enablebanking.test` line (the 403 one keeps the response
+  body, since Enable Banking uses that status for several distinct causes).
 
 Frontend coverage is smoke-tested via `bun run typecheck` + `bun run build` + manual
 flow verification until a Playwright e2e suite is added (tracked as future work).

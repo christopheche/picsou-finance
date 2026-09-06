@@ -356,11 +356,13 @@ public class BoursoSyncService {
     }
 
     /**
-     * BoursoBank's trading board exposes its own instrument symbol, not an ISIN,
-     * so the sidecar resolves the ISIN separately and may legitimately fail. A
-     * position without one keeps the symbol as its ticker: it will not be priced
-     * by Yahoo, and {@code AccountService.PROVIDER_VALUED} then falls back to
-     * BoursoBank's own valuation instead of reading the line as zero.
+     * Each position row on BoursoBank's trading board ships its own ISIN next to
+     * the bank's internal symbol; the sidecar normalises a missing or malformed
+     * one to {@code null} rather than looking it up elsewhere (there is no
+     * separate instrument feed -- the sidecar contract test pins that). A
+     * position without a resolvable ISIN keeps the symbol as its ticker: it will
+     * not be priced by Yahoo, and {@code AccountService.PROVIDER_VALUED} then
+     * falls back to BoursoBank's own valuation instead of reading the line as zero.
      */
     private String resolveTicker(BoursoPort.Position position) {
         String ticker = clean(position.symbol());

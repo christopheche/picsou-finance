@@ -123,6 +123,8 @@ Sets `access_token` and `refresh_token` HttpOnly cookies.
 ```
 Rotates `access_token`/`refresh_token` (old refresh token is invalidated) whenever a valid `refresh_token` is presented, **or** when a still-valid `persistent_token` re-authenticates the request in place of a missing/invalid one (this is what lets "Remember Me" survive a tab/browser restart, since the frontend probes this endpoint on mount instead of trusting a stale client-side flag). `access_token`/`refresh_token` are reissued as **persistent cookies** (matching `persistent_token`'s remaining lifetime) only when the request actually carries a `persistent_token` owned by the same user — otherwise they're reissued as session cookies, so a non-"Remember Me" login can't outlive the browser via this endpoint. A Remember-Me `refresh_token` is bound to its persistent-session `series_id` (a `sid` claim); if that session has been revoked (`/auth/sessions`) or has passed its 90-day cap, the refresh is refused even though the JWT itself is still valid, so revoking a device actually logs it out at its next refresh.
 
+The `persistent_token` fallback applies only when `PersistentTokenAuthFilter` validated that cookie's token hash on this same request; a principal derived from a bare `access_token` is never enough to mint a fresh `refresh_token` here, so a leaked 15-minute access token cannot be upgraded into a 7-day one.
+
 **Errors:** 401 (no refresh token and no valid persistent_token; or the presented session's series has been revoked/expired — `"Session revoked"`)
 
 ---
@@ -132,7 +134,7 @@ Rotates `access_token`/`refresh_token` (old refresh token is invalidated) whenev
 - **Auth:** Public
 - **Body:** none
 
-**Response `204`** — clears both cookies.
+**Response `204`** — clears all auth cookies. A `persistent_token` on the request is also revoked server-side, but only once its token hash has been validated (by `PersistentTokenAuthFilter`, or by this endpoint itself when a valid `access_token` made the filter skip the cookie): a stale cookie's series id alone never revokes anything.
 
 ---
 
@@ -151,7 +153,9 @@ Rotates `access_token`/`refresh_token` (old refresh token is invalidated) whenev
 { "message": "Password updated successfully" }
 ```
 
-**Errors:** 401 (current password incorrect), 422 (validation)
+Bumps the user's `tokenVersion` (every outstanding access/refresh JWT on every device is invalidated), revokes all persistent ("Remember Me") sessions, and re-issues session-scoped cookies to the calling browser.
+
+**Errors:** 401 (current password incorrect), 422 (validation), 429 (step-up password checks are limited to 5 per user per 15 minutes — shared with `/api/auth/mfa/disable` and `/api/auth/mfa/recovery-codes/regenerate`)
 
 ---
 

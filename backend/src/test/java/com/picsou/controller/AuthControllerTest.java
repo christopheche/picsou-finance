@@ -2,10 +2,14 @@ package com.picsou.controller;
 
 import com.picsou.config.AuthCookieWriter;
 import com.picsou.config.JwtUtil;
+import com.picsou.config.PersistentTokenAuthFilter;
+import com.picsou.config.RateLimitConfig;
 import com.picsou.dto.ActivationRequest;
 import com.picsou.dto.LoginRequest;
+import com.picsou.dto.MfaDtos;
 import com.picsou.model.AppUser;
 import com.picsou.model.FamilyMember;
+import com.picsou.model.PersistentSession;
 import com.picsou.model.UserRole;
 import com.picsou.repository.AppUserRepository;
 import com.picsou.service.MfaService;
@@ -40,12 +44,15 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -61,6 +68,7 @@ class AuthControllerTest {
 
     Map<String, Bucket> loginBuckets;
     Map<String, Bucket> mfaVerifyBuckets;
+    Map<String, Bucket> reauthBuckets;
     AuthController controller;
     MockHttpServletRequest httpReq;
     MockHttpServletResponse httpRes;
@@ -69,6 +77,7 @@ class AuthControllerTest {
     void setUp() {
         loginBuckets = new HashMap<>();
         mfaVerifyBuckets = new HashMap<>();
+        reauthBuckets = new HashMap<>();
         controller = newController(false);
         httpReq = new MockHttpServletRequest();
         httpReq.setRemoteAddr("10.0.0.5");
@@ -78,7 +87,7 @@ class AuthControllerTest {
     private AuthController newController(boolean adminRecoveryEnabled) {
         return new AuthController(
             userRepository, passwordEncoder, jwtUtil,
-            loginBuckets, mfaVerifyBuckets, cookieWriter,
+            loginBuckets, mfaVerifyBuckets, reauthBuckets, cookieWriter,
             mfaService, persistentSessionService, auditService,
             adminRecoveryEnabled
         );
@@ -95,6 +104,29 @@ class AuthControllerTest {
             .tokenVersion(3L)
             .member(member)
             .build();
+    }
+
+    /** A persistent-session row as {@code validateAndRotate} would hand it back. */
+    private PersistentSession session(long ownerId, UUID series, boolean trusted) {
+        return PersistentSession.builder()
+            .id(1L)
+            .seriesId(series)
+            .user(AppUser.builder().id(ownerId).username("owner").build())
+            .tokenHash("h")
+            .trustedFor2fa(trusted)
+            .createdAt(Instant.now().minus(1, ChronoUnit.DAYS))
+            .lastUsedAt(Instant.now())
+            .expiresAt(Instant.now().plus(80, ChronoUnit.DAYS))
+            .build();
+    }
+
+    /** Arranges an activated MFA-enabled "alice" whose password check passes. */
+    private AppUser mfaUserWithGoodPassword() {
+        AppUser active = user(true);
+        when(userRepository.findByUsernameWithMember("alice")).thenReturn(Optional.of(active));
+        when(passwordEncoder.matches("pw", "$2a$12$hash")).thenReturn(true);
+        when(mfaService.isEnabled(active)).thenReturn(true);
+        return active;
     }
 
     // ─── login ───────────────────────────────────────────────────────────
@@ -157,9 +189,11 @@ class AuthControllerTest {
         when(userRepository.findByUsernameWithMember("alice")).thenReturn(Optional.of(active));
         when(passwordEncoder.matches("pw", "$2a$12$hash")).thenReturn(true);
         when(mfaService.isEnabled(active)).thenReturn(true);
-        // A DIFFERENT identity's "Remember Me" cookie is sitting on this browser.
+        // A DIFFERENT identity's "Remember Me" cookie is sitting on this browser. The
+        // persistent filter did not stamp the request, so the controller checks the hash
+        // itself -- and a stale/foreign token fails that check.
         httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "stale-admin-cookie"));
-        when(persistentSessionService.isTrustedDeviceFor(active, "stale-admin-cookie")).thenReturn(false);
+        when(persistentSessionService.validateAndRotate("stale-admin-cookie")).thenReturn(Optional.empty());
         when(jwtUtil.generateMfaChallengeToken(active, false)).thenReturn("chal");
 
         ResponseEntity<?> res = controller.login(
@@ -215,6 +249,163 @@ class AuthControllerTest {
         verify(cookieWriter, never()).clearPersistent(httpRes);
     }
 
+    // ─── login: trusted-device MFA skip requires a hash-validated cookie ──
+
+    @Test
+    void login_mfa_forgedPersistentCookie_withForeignPrincipal_stillRequiresMfa() {
+        // Attack: victim's password + a stale copy of her persistent cookie (series id is
+        // not a secret) + ANY valid access_token (e.g. the attacker's own family login),
+        // which makes PersistentTokenAuthFilter bail out before validating the hash. The
+        // controller must then validate the hash itself instead of trusting the series id.
+        AppUser active = mfaUserWithGoodPassword();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "victim-series:garbage"));
+        // No VALIDATED_SERIES_ATTR on the request; the hash check fails (theft detection).
+        when(persistentSessionService.validateAndRotate("victim-series:garbage")).thenReturn(Optional.empty());
+        when(jwtUtil.generateMfaChallengeToken(active, false)).thenReturn("chal");
+
+        ResponseEntity<?> res = controller.login(
+            new LoginRequest("alice", "pw", false), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(((Map<?, ?>) res.getBody()).get("mfaRequired")).isEqualTo(true);
+        // The series-id-only lookup is never consulted on an unvalidated cookie.
+        verify(persistentSessionService, never()).isTrustedDeviceFor(any(), any());
+        verify(cookieWriter).clearSessionCookies(httpRes);
+        verify(cookieWriter).setMfaChallenge(httpRes, "chal");
+        verify(cookieWriter, never()).setAccessAndRefresh(any(), any(), any(), anyBoolean());
+    }
+
+    @Test
+    void login_mfa_validCookieOfAnotherUser_stillRequiresMfa() {
+        // The cookie is genuine (hash matches) but the series belongs to user 99, not alice.
+        AppUser active = mfaUserWithGoodPassword();
+        UUID series = UUID.randomUUID();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, series + ":tok"));
+        when(persistentSessionService.validateAndRotate(series + ":tok")).thenReturn(Optional.of(
+            new PersistentSessionService.ValidationResult(series + ":rotated", session(99L, series, true))));
+        when(jwtUtil.generateMfaChallengeToken(active, false)).thenReturn("chal");
+
+        ResponseEntity<?> res = controller.login(
+            new LoginRequest("alice", "pw", false), httpReq, httpRes);
+
+        assertThat(((Map<?, ?>) res.getBody()).get("mfaRequired")).isEqualTo(true);
+        verify(cookieWriter).clearSessionCookies(httpRes);
+        // The rotated value is not handed back: the foreign cookie is being cleared anyway.
+        verify(cookieWriter, never()).setPersistent(any(), any(), anyLong());
+        verify(cookieWriter, never()).setAccessAndRefresh(any(), any(), any(), anyBoolean());
+    }
+
+    @Test
+    void login_mfa_trustedDevice_skipsMfa_whenFilterValidatedHash() {
+        // Legit path 1: no access_token on the request, so PersistentTokenAuthFilter
+        // validated + rotated the cookie and stamped its series on the request.
+        AppUser active = mfaUserWithGoodPassword();
+        UUID series = UUID.randomUUID();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "mine"));
+        httpReq.setAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR, series);
+        when(persistentSessionService.seriesFromCookie("mine")).thenReturn(Optional.of(series));
+        when(persistentSessionService.isTrustedDeviceFor(active, "mine")).thenReturn(true);
+        when(jwtUtil.generateAccessToken(active)).thenReturn("acc");
+        when(jwtUtil.generateRefreshToken(active, series)).thenReturn("ref");
+
+        ResponseEntity<?> res = controller.login(
+            new LoginRequest("alice", "pw", false), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(((Map<?, ?>) res.getBody()).containsKey("mfaRequired")).isFalse();
+        verify(cookieWriter, never()).setMfaChallenge(any(), any());
+        verify(cookieWriter, never()).clearSessionCookies(any());
+        // Remember-Me TTLs, refresh bound to the trusted series (sid).
+        verify(cookieWriter).setAccessAndRefresh(httpRes, "acc", "ref", true);
+        // The filter already rotated: no second validation (it would only pass via the grace
+        // window and emit a conflicting Set-Cookie) and no new series.
+        verify(persistentSessionService, never()).validateAndRotate(any());
+        verify(persistentSessionService, never()).issue(any(), anyBoolean(), any(), any());
+        verify(cookieWriter, never()).setPersistent(any(), any(), anyLong());
+    }
+
+    @Test
+    void login_mfa_filterStampForAnotherSeries_doesNotTrustThisCookie() {
+        // Defensive: the stamp must name THIS cookie's series, not just exist.
+        AppUser active = mfaUserWithGoodPassword();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "mine"));
+        httpReq.setAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR, UUID.randomUUID());
+        when(persistentSessionService.seriesFromCookie("mine")).thenReturn(Optional.of(UUID.randomUUID()));
+        when(jwtUtil.generateMfaChallengeToken(active, false)).thenReturn("chal");
+
+        ResponseEntity<?> res = controller.login(
+            new LoginRequest("alice", "pw", false), httpReq, httpRes);
+
+        assertThat(((Map<?, ?>) res.getBody()).get("mfaRequired")).isEqualTo(true);
+        verify(persistentSessionService, never()).isTrustedDeviceFor(any(), any());
+    }
+
+    @Test
+    void login_mfa_trustedDevice_skipsMfa_whenControllerValidatesHash_underAccessTokenPrincipal() {
+        // Legit path 2: a still-valid access_token of the SAME user made the filter bail
+        // out. The controller validates + rotates the cookie itself and writes the rotated
+        // value, exactly as the filter would have.
+        AppUser active = mfaUserWithGoodPassword(); // id 7L
+        UUID series = UUID.randomUUID();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, series + ":tok"));
+        when(persistentSessionService.validateAndRotate(series + ":tok")).thenReturn(Optional.of(
+            new PersistentSessionService.ValidationResult(series + ":rotated", session(7L, series, true))));
+        when(persistentSessionService.seriesFromCookie(series + ":tok")).thenReturn(Optional.of(series));
+        when(jwtUtil.generateAccessToken(active)).thenReturn("acc");
+        when(jwtUtil.generateRefreshToken(active, series)).thenReturn("ref");
+
+        ResponseEntity<?> res = controller.login(
+            new LoginRequest("alice", "pw", false), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        verify(cookieWriter, never()).setMfaChallenge(any(), any());
+        verify(cookieWriter).setPersistent(eq(httpRes), eq(series + ":rotated"), anyLong());
+        verify(cookieWriter).setAccessAndRefresh(httpRes, "acc", "ref", true);
+        verify(persistentSessionService, never()).isTrustedDeviceFor(any(), any());
+        verify(persistentSessionService, never()).issue(any(), anyBoolean(), any(), any());
+    }
+
+    @Test
+    void login_mfa_untrustedOwnCookie_stillRequiresMfa_evenWhenHashValid() {
+        // Own cookie, valid hash, but the series was never marked trusted_for_2fa.
+        AppUser active = mfaUserWithGoodPassword();
+        UUID series = UUID.randomUUID();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, series + ":tok"));
+        when(persistentSessionService.validateAndRotate(series + ":tok")).thenReturn(Optional.of(
+            new PersistentSessionService.ValidationResult(series + ":rotated", session(7L, series, false))));
+        when(jwtUtil.generateMfaChallengeToken(active, false)).thenReturn("chal");
+
+        ResponseEntity<?> res = controller.login(
+            new LoginRequest("alice", "pw", false), httpReq, httpRes);
+
+        assertThat(((Map<?, ?>) res.getBody()).get("mfaRequired")).isEqualTo(true);
+        verify(cookieWriter, never()).setAccessAndRefresh(any(), any(), any(), anyBoolean());
+    }
+
+    @Test
+    void login_trustedDevice_withRememberMe_keepsTrustedSeries() {
+        // Re-ticking Remember Me on an already-trusted device must NOT mint a fresh
+        // (untrusted) series: that would overwrite the trusted cookie with one the filter
+        // discards at first use, and orphan the trusted row in Settings -> Sessions.
+        AppUser active = mfaUserWithGoodPassword();
+        UUID series = UUID.randomUUID();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "mine"));
+        httpReq.setAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR, series);
+        when(persistentSessionService.seriesFromCookie("mine")).thenReturn(Optional.of(series));
+        when(persistentSessionService.isTrustedDeviceFor(active, "mine")).thenReturn(true);
+        when(jwtUtil.generateAccessToken(active)).thenReturn("acc");
+        when(jwtUtil.generateRefreshToken(active, series)).thenReturn("ref");
+
+        ResponseEntity<?> res = controller.login(
+            new LoginRequest("alice", "pw", true), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        verify(persistentSessionService, never()).issue(any(), anyBoolean(), any(), any());
+        verify(cookieWriter, never()).setPersistent(any(), any(), anyLong());
+        verify(cookieWriter, never()).clearPersistent(any());
+        verify(cookieWriter).setAccessAndRefresh(httpRes, "acc", "ref", true);
+    }
+
     @Test
     void login_unknownUserAndWrongPassword_payIdenticalBcryptCost_soLatencyRevealsNothing() {
         // Drive the controller with a REAL bcrypt encoder (strength 12, same as prod —
@@ -224,7 +415,7 @@ class AuthControllerTest {
         PasswordEncoder realEncoder = spy(new BCryptPasswordEncoder(12));
         AuthController timingController = new AuthController(
             userRepository, realEncoder, jwtUtil,
-            loginBuckets, mfaVerifyBuckets, cookieWriter,
+            loginBuckets, mfaVerifyBuckets, reauthBuckets, cookieWriter,
             mfaService, persistentSessionService, auditService, false);
 
         // Path A — the username does not exist: there is no stored hash to compare,
@@ -275,7 +466,7 @@ class AuthControllerTest {
         PasswordEncoder realEncoder = spy(new BCryptPasswordEncoder(12));
         AuthController timingController = new AuthController(
             userRepository, realEncoder, jwtUtil,
-            loginBuckets, mfaVerifyBuckets, cookieWriter,
+            loginBuckets, mfaVerifyBuckets, reauthBuckets, cookieWriter,
             mfaService, persistentSessionService, auditService, false);
 
         AppUser pending = AppUser.builder()
@@ -321,7 +512,7 @@ class AuthControllerTest {
 
         AuthController spoofTestController = new AuthController(
             userRepository, passwordEncoder, jwtUtil,
-            mockedLoginBuckets, mfaVerifyBuckets, cookieWriter,
+            mockedLoginBuckets, mfaVerifyBuckets, reauthBuckets, cookieWriter,
             mfaService, persistentSessionService, auditService, false);
 
         MockHttpServletRequest firstCall = new MockHttpServletRequest();
@@ -417,7 +608,154 @@ class AuthControllerTest {
         verify(userRepository, never()).save(any());
     }
 
+    @Test
+    void activate_returns400ProblemDetail_whenTokenExpired() {
+        // RFC 7807 like every other error: the frontend only reads `detail`, so an ad-hoc
+        // {"error": ...} body would leave the member with axios boilerplate instead of
+        // "the link expired, ask the admin for a new one".
+        AppUser member = AppUser.builder()
+            .id(11L).username("bob")
+            .role(UserRole.MEMBER)
+            .passwordHash("")
+            .activated(false)
+            .tokenVersion(5L)
+            .activationToken("tok")
+            .activationTokenExpires(Instant.now().minus(1, ChronoUnit.HOURS))
+            .member(FamilyMember.builder().id(50L).displayName("Bob").build())
+            .build();
+        when(userRepository.findByActivationToken("tok")).thenReturn(Optional.of(member));
+
+        ResponseEntity<?> res = controller.activate(
+            "tok", new ActivationRequest("new-password-123", true), httpReq);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(res.getBody()).isInstanceOf(ProblemDetail.class);
+        assertThat(((ProblemDetail) res.getBody()).getDetail()).containsIgnoringCase("expired");
+        assertThat(member.isActivated()).isFalse();
+        verify(userRepository, never()).save(any());
+        verify(persistentSessionService, never()).revokeAllForUser(any());
+    }
+
     // ─── mfa/verify ──────────────────────────────────────────────────────
+
+    /** A parsed, signed mfa_challenge for user 7 sitting on the request. */
+    private Claims challengeFor(long uid) {
+        httpReq.setCookies(new Cookie(AuthCookieWriter.MFA_CHALLENGE_COOKIE, "challenge"));
+        Claims claims = org.mockito.Mockito.mock(Claims.class);
+        when(jwtUtil.validateAndParse("challenge")).thenReturn(claims);
+        when(jwtUtil.isMfaChallengeToken(claims)).thenReturn(true);
+        when(claims.get("uid", Long.class)).thenReturn(uid);
+        return claims;
+    }
+
+    @Test
+    void mfaVerify_rememberMeWithoutTrust_issuesNoPersistentSession() {
+        // A 2FA user who ticked Remember Me but declined "Trust this device": the persistent
+        // filter would refuse (rotate, then clear) an untrusted persistent_token for an MFA
+        // user, so issuing one would only leave a phantom "active session" behind. Remember
+        // Me without trust is a normal session-scoped login.
+        AppUser active = user(true);
+        challengeFor(7L);
+        when(userRepository.findByIdWithMember(7L)).thenReturn(Optional.of(active));
+        when(mfaService.verifyTotpOrRecovery(active, "123456", false)).thenReturn(true);
+        when(jwtUtil.generateAccessToken(active)).thenReturn("acc");
+        when(jwtUtil.generateRefreshToken(active)).thenReturn("ref");
+
+        ResponseEntity<?> res = controller.mfaVerify(
+            new MfaDtos.MfaVerifyRequest("123456", false, false), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        verify(persistentSessionService, never()).issue(any(), anyBoolean(), any(), any());
+        verify(cookieWriter, never()).setPersistent(any(), any(), anyLong());
+        verify(cookieWriter).setAccessAndRefresh(httpRes, "acc", "ref", false);
+        verify(cookieWriter).clearMfaChallenge(httpRes);
+    }
+
+    @Test
+    void mfaVerify_trustDevice_issuesTrustedPersistentSession() {
+        AppUser active = user(true);
+        UUID series = UUID.randomUUID();
+        challengeFor(7L);
+        when(userRepository.findByIdWithMember(7L)).thenReturn(Optional.of(active));
+        when(mfaService.verifyTotpOrRecovery(active, "123456", false)).thenReturn(true);
+        when(persistentSessionService.issue(eq(active), eq(true), any(), any())).thenReturn(
+            new PersistentSessionService.IssueResult(series + ":fresh", session(7L, series, true)));
+        when(jwtUtil.generateAccessToken(active)).thenReturn("acc");
+        when(jwtUtil.generateRefreshToken(active, series)).thenReturn("ref");
+
+        ResponseEntity<?> res = controller.mfaVerify(
+            new MfaDtos.MfaVerifyRequest("123456", true, false), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        verify(cookieWriter).setPersistent(eq(httpRes), eq(series + ":fresh"), anyLong());
+        verify(cookieWriter).setAccessAndRefresh(httpRes, "acc", "ref", true);
+    }
+
+    @Test
+    void mfaVerify_ratelimitKey_isChallengeUid_notClientIp() {
+        // Two attempts for the SAME account from two different addresses share one bucket,
+        // and (conversely) a family behind one NAT is not locked out by one member's typos.
+        @SuppressWarnings("unchecked")
+        Map<String, Bucket> mockedBuckets = mock(Map.class);
+        Bucket bucket = mock(Bucket.class);
+        when(bucket.tryConsume(1)).thenReturn(true);
+        when(mockedBuckets.computeIfAbsent(any(), any())).thenReturn(bucket);
+        AuthController keyController = new AuthController(
+            userRepository, passwordEncoder, jwtUtil,
+            loginBuckets, mockedBuckets, reauthBuckets, cookieWriter,
+            mfaService, persistentSessionService, auditService, false);
+        AppUser active = user(true);
+        challengeFor(7L);
+        when(userRepository.findByIdWithMember(7L)).thenReturn(Optional.of(active));
+        when(mfaService.verifyTotpOrRecovery(active, "000000", false)).thenReturn(false);
+
+        MockHttpServletRequest fromHome = new MockHttpServletRequest();
+        fromHome.setRemoteAddr("10.0.0.5");
+        fromHome.setCookies(httpReq.getCookies());
+        MockHttpServletRequest fromPhone = new MockHttpServletRequest();
+        fromPhone.setRemoteAddr("203.0.113.9");
+        fromPhone.setCookies(httpReq.getCookies());
+
+        keyController.mfaVerify(new MfaDtos.MfaVerifyRequest("000000", false, false), fromHome, httpRes);
+        keyController.mfaVerify(new MfaDtos.MfaVerifyRequest("000000", false, false), fromPhone, httpRes);
+
+        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
+        verify(mockedBuckets, times(2)).computeIfAbsent(keyCaptor.capture(), any());
+        assertThat(keyCaptor.getAllValues()).containsOnly("7");
+    }
+
+    @Test
+    void mfaVerify_returns429_andClearsChallenge_whenAccountBucketExhausted() {
+        challengeFor(7L);
+        Bucket drained = RateLimitConfig.createMfaVerifyBucket();
+        while (drained.tryConsume(1)) { /* drain */ }
+        mfaVerifyBuckets.put("7", drained);
+
+        ResponseEntity<?> res = controller.mfaVerify(
+            new MfaDtos.MfaVerifyRequest("123456", false, false), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(res.getBody()).isInstanceOf(ProblemDetail.class);
+        verify(cookieWriter).clearMfaChallenge(httpRes);
+        verify(mfaService, never()).verifyTotpOrRecovery(any(), any(), anyBoolean());
+        verify(userRepository, never()).findByIdWithMember(any());
+    }
+
+    @Test
+    void mfaVerify_returns401ProblemDetail_whenCookieIsNotAChallengeToken() {
+        httpReq.setCookies(new Cookie(AuthCookieWriter.MFA_CHALLENGE_COOKIE, "an-access-token"));
+        Claims claims = org.mockito.Mockito.mock(Claims.class);
+        when(jwtUtil.validateAndParse("an-access-token")).thenReturn(claims);
+        when(jwtUtil.isMfaChallengeToken(claims)).thenReturn(false);
+
+        ResponseEntity<?> res = controller.mfaVerify(
+            new MfaDtos.MfaVerifyRequest("123456", false, false), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(res.getBody()).isInstanceOf(ProblemDetail.class);
+        assertThat(((ProblemDetail) res.getBody()).getDetail()).isEqualTo("Invalid MFA challenge");
+        verify(cookieWriter).clearMfaChallenge(httpRes);
+    }
 
     @Test
     void mfaVerify_returns400_andKeepsChallenge_whenCodeInvalid() {
@@ -515,9 +853,11 @@ class AuthControllerTest {
     @Test
     void refresh_returns200_andMintsFreshCookies_fromPersistentPrincipal_whenNoRefreshTokenCookie() {
         // No refresh_token cookie in the request, but PersistentTokenAuthFilter already
-        // re-authenticated this request from a valid persistent_token one filter earlier.
+        // re-authenticated this request from a valid persistent_token one filter earlier
+        // (hash validated + rotated, request stamped with the series).
         AppUser active = user(true);
         httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "mine"));
+        httpReq.setAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR, UUID.randomUUID());
         when(persistentSessionService.ownerUserId("mine")).thenReturn(Optional.of(active.getId()));
         when(jwtUtil.generateAccessToken(active)).thenReturn("acc3");
         when(jwtUtil.generateRefreshToken(active)).thenReturn("ref3");
@@ -533,9 +873,38 @@ class AuthControllerTest {
         ));
         // The endpoint's contract is "200 = fresh cookies were issued" -- always mint here,
         // regardless of whether PersistentTokenAuthFilter already wrote a pair moments ago,
-        // so a bare access-token-derived principal (no persistent_token at all) never gets
-        // a phantom 200 with zero Set-Cookie that dies within the access token's 15 minutes.
+        // rather than trusting what the filter may or may not have written.
         verify(cookieWriter).setAccessAndRefresh(httpRes, "acc3", "ref3", true);
+    }
+
+    @Test
+    void refresh_returns401_whenOnlyAccessTokenPrincipal_andNoRefreshOrPersistentCookie() {
+        // The principal came from JwtAuthenticationFilter (a bare access_token): no
+        // VALIDATED_SERIES_ATTR stamp. A 15-minute credential must not be exchangeable for a
+        // fresh 7-day refresh_token, otherwise its short TTL contains nothing.
+        AppUser active = user(true);
+
+        ResponseEntity<?> res = controller.refresh(active, httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        verify(cookieWriter).clearAuthCookies(httpRes);
+        verify(cookieWriter, never()).setAccessAndRefresh(any(), any(), any(), anyBoolean());
+        verify(jwtUtil, never()).generateRefreshToken(any());
+        verify(jwtUtil, never()).generateRefreshToken(any(), any());
+    }
+
+    @Test
+    void refresh_returns401_whenAccessTokenPrincipal_presentsOwnedButUnvalidatedPersistentCookie() {
+        // Ownership of the series (a series-id-only lookup) is NOT proof of possession: the
+        // persistent filter skipped the cookie because the access_token authenticated the
+        // request, so nothing checked its hash. No stamp -> no re-mint.
+        AppUser active = user(true);
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "mine"));
+
+        ResponseEntity<?> res = controller.refresh(active, httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        verify(cookieWriter, never()).setAccessAndRefresh(any(), any(), any(), anyBoolean());
     }
 
     @Test
@@ -558,6 +927,7 @@ class AuthControllerTest {
         httpReq.setCookies(
             new Cookie("refresh_token", "stale-rt"),
             new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "mine"));
+        httpReq.setAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR, UUID.randomUUID());
         Claims claims = org.mockito.Mockito.mock(Claims.class);
         when(jwtUtil.validateAndParse("stale-rt")).thenReturn(claims);
         when(jwtUtil.isRefreshToken(claims)).thenReturn(true);
@@ -615,5 +985,167 @@ class AuthControllerTest {
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         verify(cookieWriter).clearAuthCookies(httpRes);
         verify(jwtUtil, never()).generateAccessToken(any());
+    }
+
+    // ─── logout ──────────────────────────────────────────────────────────
+
+    @Test
+    void logout_revokesSeries_whenFilterValidatedTheCookie() {
+        UUID series = UUID.randomUUID();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, series + ":tok"));
+        httpReq.setAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR, series);
+
+        ResponseEntity<Void> res = controller.logout(httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        verify(persistentSessionService).revokeBySeriesId(series);
+        // Already validated + rotated by the filter: no second hash check.
+        verify(persistentSessionService, never()).validateAndRotate(any());
+        verify(cookieWriter).clearAuthCookies(httpRes);
+    }
+
+    @Test
+    void logout_validatesHash_thenRevokes_whenAccessTokenAuthenticatedTheRequest() {
+        // The usual case: a valid access_token made the persistent filter skip the cookie,
+        // so logout proves possession itself before revoking.
+        UUID series = UUID.randomUUID();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, series + ":tok"));
+        when(persistentSessionService.validateAndRotate(series + ":tok")).thenReturn(Optional.of(
+            new PersistentSessionService.ValidationResult(series + ":rotated", session(7L, series, false))));
+
+        controller.logout(httpReq, httpRes);
+
+        verify(persistentSessionService).revokeBySeriesId(series);
+        verify(cookieWriter).clearAuthCookies(httpRes);
+    }
+
+    @Test
+    void logout_doesNotRevokeOnSeriesIdAlone_whenHashIsNotValid() {
+        // A stale copy of the cookie carries the (non-secret) series id but a dead token:
+        // logout must not turn it into a "log anyone out" primitive. (A mismatching hash is
+        // left to validateAndRotate's own theft detection.)
+        UUID series = UUID.randomUUID();
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, series + ":stale"));
+        when(persistentSessionService.validateAndRotate(series + ":stale")).thenReturn(Optional.empty());
+
+        ResponseEntity<Void> res = controller.logout(httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        verify(persistentSessionService, never()).revokeBySeriesId(any());
+        verify(persistentSessionService, never()).seriesFromCookie(any());
+        verify(cookieWriter).clearAuthCookies(httpRes);
+    }
+
+    // ─── change-password ─────────────────────────────────────────────────
+
+    @Test
+    void changePassword_bumpsTokenVersion_revokesAllPersistentSessions_andIssuesSessionCookies() {
+        AppUser active = user(true); // tokenVersion 3
+        when(passwordEncoder.matches("old-pw", "$2a$12$hash")).thenReturn(true);
+        when(passwordEncoder.encode("new-password-123")).thenReturn("$2a$12$new");
+        when(jwtUtil.generateAccessToken(active)).thenReturn("acc");
+        when(jwtUtil.generateRefreshToken(active)).thenReturn("ref");
+
+        ResponseEntity<?> res = controller.changePassword(active,
+            new AuthController.ChangePasswordRequest("old-pw", "new-password-123"), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(active.getPasswordHash()).isEqualTo("$2a$12$new");
+        // tokenVersion 3 -> 4 invalidates every outstanding access/refresh JWT on every device.
+        assertThat(active.getTokenVersion()).isEqualTo(4L);
+        verify(userRepository).save(active);
+        // ...and every Remember-Me browser is kicked (CWE-613/640).
+        verify(persistentSessionService).revokeAllForUser(7L);
+        // The calling browser is re-issued session-scoped cookies and loses its persistent one.
+        verify(cookieWriter).setAccessAndRefresh(httpRes, "acc", "ref", false);
+        verify(cookieWriter).clearPersistent(httpRes);
+    }
+
+    @Test
+    void changePassword_wrongCurrentPassword_throwsBadCredentials_andChangesNothing() {
+        AppUser active = user(true);
+        when(passwordEncoder.matches("wrong", "$2a$12$hash")).thenReturn(false);
+
+        assertThatThrownBy(() -> controller.changePassword(active,
+                new AuthController.ChangePasswordRequest("wrong", "new-password-123"), httpReq, httpRes))
+            .isInstanceOf(BadCredentialsException.class);
+
+        assertThat(active.getPasswordHash()).isEqualTo("$2a$12$hash");
+        assertThat(active.getTokenVersion()).isEqualTo(3L);
+        verify(userRepository, never()).save(any());
+        verifyNoInteractions(persistentSessionService);
+        verify(cookieWriter, never()).setAccessAndRefresh(any(), any(), any(), anyBoolean());
+    }
+
+    @Test
+    void changePassword_returns429ProblemDetail_beforeCheckingPassword_whenReauthBucketExhausted() {
+        // A hijacked session must not get unlimited bcrypt-speed guesses at the account
+        // password through the step-up check; the per-user budget mirrors /login.
+        AppUser active = user(true);
+        Bucket drained = RateLimitConfig.createReauthBucket();
+        while (drained.tryConsume(1)) { /* drain */ }
+        reauthBuckets.put("7", drained);
+
+        ResponseEntity<?> res = controller.changePassword(active,
+            new AuthController.ChangePasswordRequest("guess", "new-password-123"), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat(res.getBody()).isInstanceOf(ProblemDetail.class);
+        // No oracle: the password was never compared.
+        verify(passwordEncoder, never()).matches(any(), any());
+        verify(userRepository, never()).save(any());
+        verifyNoInteractions(persistentSessionService);
+    }
+
+    @Test
+    void changePassword_reauthBudget_isKeyedByUserId() {
+        AppUser active = user(true);
+        when(passwordEncoder.matches("wrong", "$2a$12$hash")).thenReturn(false);
+
+        assertThatThrownBy(() -> controller.changePassword(active,
+                new AuthController.ChangePasswordRequest("wrong", "new-password-123"), httpReq, httpRes))
+            .isInstanceOf(BadCredentialsException.class);
+
+        assertThat(reauthBuckets).containsOnlyKeys("7");
+        assertThat(reauthBuckets.get("7").getAvailableTokens()).isEqualTo(4L);
+    }
+
+    // ─── change-username ─────────────────────────────────────────────────
+
+    @Test
+    void changeUsername_returns409ProblemDetail_onCollision_andChangesNothing() {
+        AppUser active = user(true);
+        when(userRepository.existsByUsername("bob")).thenReturn(true);
+
+        ResponseEntity<?> res = controller.changeUsername(active,
+            new AuthController.ChangeUsernameRequest("bob"), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(res.getBody()).isInstanceOf(ProblemDetail.class);
+        assertThat(active.getUsername()).isEqualTo("alice");
+        verify(userRepository, never()).save(any());
+        verify(cookieWriter, never()).setAccessAndRefresh(any(), any(), any(), anyBoolean());
+    }
+
+    @Test
+    void changeUsername_reissuesCookies_withNewSubject_preservingPersistence() {
+        AppUser active = user(true); // id 7L
+        UUID series = UUID.randomUUID();
+        // A Remember-Me device renaming itself must keep Remember-Me TTLs and its sid binding.
+        httpReq.setCookies(new Cookie(AuthCookieWriter.PERSISTENT_COOKIE, "mine"));
+        when(persistentSessionService.ownerUserId("mine")).thenReturn(Optional.of(7L));
+        when(persistentSessionService.seriesFromCookie("mine")).thenReturn(Optional.of(series));
+        when(userRepository.existsByUsername("alice2")).thenReturn(false);
+        when(jwtUtil.generateAccessToken(active)).thenReturn("acc");
+        when(jwtUtil.generateRefreshToken(active, series)).thenReturn("ref");
+
+        ResponseEntity<?> res = controller.changeUsername(active,
+            new AuthController.ChangeUsernameRequest(" alice2 "), httpReq, httpRes);
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(((Map<?, ?>) res.getBody()).get("username")).isEqualTo("alice2");
+        assertThat(active.getUsername()).isEqualTo("alice2");
+        verify(userRepository).save(active);
+        verify(cookieWriter).setAccessAndRefresh(httpRes, "acc", "ref", true);
     }
 }

@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -299,6 +300,9 @@ class MfaServiceTest {
     @Test
     void requireReauth_passesOnGoodPassword() {
         when(passwordEncoder.matches("right", "hashed")).thenReturn(true);
-        service.requireReauth(user, "right"); // no throw
+
+        assertThatCode(() -> service.requireReauth(user, "right")).doesNotThrowAnyException();
+
+        verify(passwordEncoder).matches("right", "hashed");
     }
 }

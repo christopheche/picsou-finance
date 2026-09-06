@@ -38,10 +38,29 @@ import java.util.Optional;
  *
  * <p>On a malformed/expired/replayed token the {@code persistent_token}
  * cookie is cleared so the browser stops sending the bad value.
+ *
+ * <p>Whenever the cookie's token hash has been checked (constant-time) on the
+ * current request, the filter stamps the request with
+ * {@link #VALIDATED_SERIES_ATTR}. That attribute — not the mere presence of a
+ * cookie whose series id resolves to a row — is what downstream code
+ * ({@code AuthController.login/refresh/logout}) must require before treating
+ * the persistent cookie as proof of possession: the series id is not a secret
+ * (it survives rotation and is readable from any stale copy of the cookie or
+ * from a refresh JWT's {@code sid} claim).
  */
 public class PersistentTokenAuthFilter extends OncePerRequestFilter {
 
     private static final Logger log = LoggerFactory.getLogger(PersistentTokenAuthFilter.class);
+
+    /**
+     * Request attribute holding the {@link java.util.UUID} series id of the
+     * {@code persistent_token} whose hash this filter validated (and rotated) on
+     * the current request. Absent when the filter bailed out (a valid
+     * {@code access_token} already authenticated the request), when no cookie was
+     * presented, or when validation failed.
+     */
+    public static final String VALIDATED_SERIES_ATTR =
+        PersistentTokenAuthFilter.class.getName() + ".validatedSeries";
 
     private final PersistentSessionService persistentSessionService;
     private final AppUserRepository userRepository;
@@ -86,8 +105,10 @@ public class PersistentTokenAuthFilter extends OncePerRequestFilter {
         try {
             validated = persistentSessionService.validateAndRotate(cookieValue);
         } catch (RuntimeException ex) {
-            // DB error or unexpected — fail closed (anonymous) and keep serving.
-            log.warn("Persistent token validation failed: {}", ex.getMessage());
+            // DB error or unexpected — fail closed (anonymous) and keep serving. A
+            // RuntimeException here is a bug path, so log the exception object itself
+            // (a bare getMessage() prints "null" for an NPE and hides the stack).
+            log.error("Persistent token validation failed", ex);
             chain.doFilter(request, response);
             return;
         }
@@ -100,6 +121,10 @@ public class PersistentTokenAuthFilter extends OncePerRequestFilter {
         }
 
         PersistentSession session = validated.get().session();
+        // The cookie's token hash matched (constant-time) and the series was rotated:
+        // from here on, this request has PROVEN possession of series `seriesId`.
+        request.setAttribute(VALIDATED_SERIES_ATTR, session.getSeriesId());
+
         AppUser user = userRepository.findByIdWithMember(session.getUser().getId()).orElse(null);
         if (user == null || !user.isActivated()) {
             cookieWriter.clearPersistent(response);
@@ -109,8 +134,13 @@ public class PersistentTokenAuthFilter extends OncePerRequestFilter {
 
         // Honour the trusted-device promise: if the user has 2FA enabled but this
         // session was issued without trust, the cookie alone must not bypass MFA.
-        // Clear it so the browser stops auto-attempting silent re-login.
+        // Clear it so the browser stops auto-attempting silent re-login, and revoke
+        // the row too: no browser can ever use this series again, so leaving it
+        // active would only show a phantom "active session" in Settings → Sessions
+        // (and count it in "log out everywhere else"). Such rows are legacy — login
+        // and mfa/verify no longer issue an untrusted series to a 2FA-enabled user.
         if (mfaService.isEnabled(user) && !session.isTrustedFor2fa()) {
+            persistentSessionService.revokeBySeriesId(session.getSeriesId());
             cookieWriter.clearPersistent(response);
             chain.doFilter(request, response);
             return;

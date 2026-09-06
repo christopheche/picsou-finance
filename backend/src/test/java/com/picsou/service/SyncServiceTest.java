@@ -6,6 +6,7 @@ import ch.qos.logback.core.read.ListAppender;
 import com.picsou.dto.AccountResponse;
 import com.picsou.exception.SyncException;
 import com.picsou.model.Account;
+import com.picsou.model.AccountType;
 import com.picsou.model.FamilyMember;
 import com.picsou.model.Requisition;
 import com.picsou.model.RequisitionStatus;
@@ -495,6 +496,66 @@ class SyncServiceTest {
         assertThat(eventsAt(Level.ERROR)).hasSize(1);
         assertThat(eventsAt(Level.ERROR).get(0).getThrowableProxy()).isNotNull();
         assertThat(eventsAt(Level.ERROR).get(0).getFormattedMessage()).contains("Boursorama");
+    }
+
+    // ─── A missing balance is not a zero ──────────────────────────────────────
+
+    /**
+     * The reported failure: a bank answers 200 with an empty {@code balances} list for an account
+     * holding 3 200 EUR. Persisting that as {@code 0.00} overwrote the balance AND stamped a zero
+     * into the day's snapshot — and {@code upsertSnapshot} overwrites an existing same-day row, so
+     * the dip stayed in the net-worth chart even after the next good sync fixed the balance. Same
+     * refusal {@code WalletSyncService} and {@code CryptoExchangeSyncService} make on their paths.
+     */
+    @Test
+    void resyncAll_keepsTheLastKnownBalance_whenTheProviderReportsNone() {
+        Long memberId = 90L;
+        FamilyMember member = FamilyMember.builder().id(memberId).displayName("Owner").build();
+        Requisition requisition = linkedRequisition(90L, member, "session-90", "BNP Paribas");
+
+        when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
+            .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(90L, memberId)).thenReturn(Optional.of(requisition));
+        when(bankConnector.fetchBalances("session-90"))
+            .thenReturn(List.of(new AccountData("ext-90", "Courant", "FR76...90", "EUR", null)));
+
+        Account existing = Account.builder()
+            .id(900L).member(member).name("Courant").type(AccountType.CHECKING)
+            .currency("EUR").currentBalance(new BigDecimal("3200.00"))
+            .externalAccountId("ext-90").isManual(false).build();
+        when(accountRepository.findByExternalAccountIdAndMemberId("ext-90", memberId))
+            .thenReturn(Optional.of(existing));
+        when(accountRepository.save(any(Account.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(accountService.toResponse(any(Account.class))).thenReturn(new AccountResponse(
+            900L, "Courant", null, "BNP Paribas", "EUR", new BigDecimal("3200.00"),
+            new BigDecimal("3200.00"), null, null, false, "#6366f1", null,
+            null, null, null, null, null, null, null));
+
+        syncService.resyncAll(memberId);
+
+        assertThat(existing.getCurrentBalance()).isEqualByComparingTo("3200.00");
+        assertThat(existing.getLastSyncedAt()).isNotNull();
+        verify(accountService, never()).upsertSnapshot(any(Account.class), any(), any());
+    }
+
+    /** And a brand-new account is not invented at 0.00 either — it waits for a real balance. */
+    @Test
+    void resyncAll_doesNotCreateAnAccountTheProviderReportsNoBalanceFor() {
+        Long memberId = 91L;
+        FamilyMember member = FamilyMember.builder().id(memberId).displayName("Owner").build();
+        Requisition requisition = linkedRequisition(91L, member, "session-91", "BNP Paribas");
+
+        when(requisitionRepository.findByStatusAndMemberIdOrderByCreatedAtDesc(RequisitionStatus.LINKED, memberId))
+            .thenReturn(List.of(requisition));
+        when(requisitionRepository.findByIdAndMemberId(91L, memberId)).thenReturn(Optional.of(requisition));
+        when(bankConnector.fetchBalances("session-91"))
+            .thenReturn(List.of(new AccountData("ext-91", "Courant", "FR76...91", "EUR", null)));
+        stubNewAccountUpsert("ext-91", memberId);
+
+        syncService.resyncAll(memberId);
+
+        verify(accountRepository, never()).save(any(Account.class));
+        verify(accountService, never()).upsertSnapshot(any(Account.class), any(), any());
     }
 
     /** Expected upstream flakiness stays a one-line WARN, and the session is still marked retryable. */

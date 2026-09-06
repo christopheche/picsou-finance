@@ -235,11 +235,12 @@ public class PowensBankConnector implements BankConnectorPort {
     private AccountData toAccountData(PowensAccount a) {
         String accountName = a.name() != null ? a.name() : a.originalName();
         String currency = (a.currency() != null && a.currency().id() != null) ? a.currency().id() : "EUR";
-        BigDecimal balance = BigDecimal.valueOf(a.balance());
-        String product = mapProduct(a.type(), accountName);
+        // Null when Powens reports no balance for the account — never 0, which SyncService would
+        // persist and snapshot as a real figure. See BankConnectorPort.AccountData#balance.
+        BigDecimal balance = a.balance();
 
-        log.debug("[Powens] account id={} name='{}' type={} → product={} balance={}",
-            a.id(), accountName, a.type(), product, balance);
+        log.debug("[Powens] account id={} name='{}' type={} balance={}",
+            a.id(), accountName, a.type(), balance);
 
         return new AccountData(
             String.valueOf(a.id()),
@@ -248,24 +249,6 @@ public class PowensBankConnector implements BankConnectorPort {
             currency,
             balance
         );
-    }
-
-    /**
-     * Maps Powens account type to a product string that SyncService.detectType() understands.
-     * LEP is a savings account — detected by checking the account name.
-     */
-    private String mapProduct(String powensType, String name) {
-        if (powensType == null) return null;
-        return switch (powensType.toLowerCase()) {
-            case "pea"                                          -> "pea";
-            case "market"                                       -> "market";
-            case "savings", "deposit", "life_insurance",
-                 "madelin", "per", "perco", "perp"             -> {
-                String n = name != null ? name.toLowerCase() : "";
-                yield n.contains("lep") ? "lep" : "savings";
-            }
-            default -> powensType;
-        };
     }
 
     private String basicAuth() {
@@ -286,7 +269,9 @@ public class PowensBankConnector implements BankConnectorPort {
         Long id,
         String name,
         @JsonProperty("original_name") String originalName,
-        Double balance,
+        // BigDecimal, not Double: a balance routed through binary floating point is a balance
+        // that can no longer be trusted to the cent, and this one is persisted and snapshotted.
+        BigDecimal balance,
         String iban,
         String type,
         PowensCurrency currency

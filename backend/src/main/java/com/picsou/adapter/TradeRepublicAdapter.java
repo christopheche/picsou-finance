@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -56,8 +57,21 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
     private static final String WS_URL     = "wss://api.traderepublic.com/";
     private static final int    WS_VERSION = 31;
     private static final Duration DEFAULT_REFRESH_TIMEOUT = Duration.ofSeconds(15);
+    /** Idle ceiling between two WebSocket frames before the stream is declared complete. */
+    private static final Duration DEFAULT_WS_TIMEOUT = Duration.ofSeconds(30);
+    /** Slack added to the idle timeout for the whole session (connect + all subscriptions). */
+    private static final Duration WS_SESSION_SLACK = Duration.ofSeconds(15);
 
-    private record SecAccount(
+    /**
+     * How much of a frame goes into an error log. A portfolio frame is the user's complete
+     * position list; the ticker branch and {@code IbkrFlexClient} apply the same cap.
+     */
+    private static final int LOG_PAYLOAD_CHARS = 300;
+
+    /** The frame type TR uses for a subscription it rejected ({@code <id> E {"errors":[...]}}). */
+    private static final String WS_TYPE_ERROR = "E";
+
+    record SecAccount(
         String wrapper,
         String accountNumber,
         String cashAccountNumber,
@@ -69,6 +83,8 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
     private final WebClient    sidecarClient;
     private final ObjectMapper objectMapper;
     private final Duration     refreshTimeout;
+    private final String       wsUrl;
+    private final Duration     wsTimeout;
 
     @Autowired
     public TradeRepublicAdapter(
@@ -79,11 +95,19 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
     }
 
     TradeRepublicAdapter(ObjectMapper objectMapper, String trAuthUrl, Duration refreshTimeout) {
+        this(objectMapper, trAuthUrl, refreshTimeout, WS_URL, DEFAULT_WS_TIMEOUT);
+    }
+
+    /** Test seam: points the WebSocket at a local server and shortens its idle timeout. */
+    TradeRepublicAdapter(ObjectMapper objectMapper, String trAuthUrl, Duration refreshTimeout,
+                         String wsUrl, Duration wsTimeout) {
         this.objectMapper   = objectMapper;
         this.sidecarClient  = WebClient.builder()
             .baseUrl(trAuthUrl)
             .build();
         this.refreshTimeout = refreshTimeout;
+        this.wsUrl          = wsUrl;
+        this.wsTimeout      = wsTimeout;
     }
 
     // ─── Auth (delegated to Python sidecar) ───────────────────────────────────
@@ -207,6 +231,12 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
                 .toList());
 
         AtomicReference<String> cashJson = new AtomicReference<>();
+        // The default cash subscription answers once; a later delta frame under the same wsId
+        // must not overwrite a good payload (same first-frame-wins rule as answeredTickerSubs).
+        AtomicBoolean cashAnswered = new AtomicBoolean(false);
+        // Set when TR rejected the cash subscription: the stream may complete, but no TR Cash
+        // account is emitted — see parseCashJson.
+        AtomicBoolean cashRejected = new AtomicBoolean(false);
         ConcurrentHashMap<String, String> scopedCashJsonByAccount = new ConcurrentHashMap<>();
         ConcurrentHashMap<String, ConcurrentHashMap<String, JsonNode>> positionsByAccount = new ConcurrentHashMap<>();
         ConcurrentHashMap<String, BigDecimal> tickerPrices = new ConcurrentHashMap<>();
@@ -227,8 +257,7 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
         AtomicInteger receivedPortfolios = new AtomicInteger(0);
         int totalPortfolioSubs = secAccounts.size();
         int totalScopedCashSubs = (int) secAccounts.stream()
-            .filter(account -> account.type() == AccountType.PEA)
-            .filter(account -> account.cashAccountNumber() != null && !account.cashAccountNumber().isBlank())
+            .filter(TradeRepublicAdapter::hasScopedCash)
             .count();
 
         HttpHeaders headers = new HttpHeaders();
@@ -236,7 +265,7 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
         String connectMsg = buildConnectMessage();
 
         new ReactorNettyWebSocketClient()
-            .execute(URI.create(WS_URL), headers, session ->
+            .execute(URI.create(wsUrl), headers, session ->
                 session.send(Mono.just(session.textMessage(connectMsg)))
                     .thenMany(
                         session.receive()
@@ -252,9 +281,7 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
                                     log.info("TR WS --> sub {} availableCash", id1);
 
                                     for (SecAccount account : secAccounts) {
-                                        if (account.type() == AccountType.PEA
-                                                && account.cashAccountNumber() != null
-                                                && !account.cashAccountNumber().isBlank()) {
+                                        if (hasScopedCash(account)) {
                                             int id = subIdCounter.incrementAndGet();
                                             scopedCashSubIds.put(id, account);
                                             msgs.add(subAvailableCash(id, account.cashAccountNumber(), sessionToken));
@@ -282,6 +309,11 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
 
                                 int wsId = extractWsId(text);
                                 String payload = extractWsPayload(text);
+                                // The frame type token TR puts between the id and the payload
+                                // ("A" answer, "C"/"D" delta, "E" error). Without reading it, a
+                                // rejected subscription looks exactly like an answer whose JSON we
+                                // failed to understand — and got counted as one.
+                                boolean rejected = WS_TYPE_ERROR.equals(extractWsType(text));
 
                                 if (isAuthError(payload)) {
                                     log.warn("TR WS: session expired (AUTHENTICATION_ERROR)");
@@ -290,15 +322,39 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
                                 }
 
                                 if (wsId == 1) {
-                                    cashJson.set(payload);
+                                    if (cashAnswered.compareAndSet(false, true)) {
+                                        if (rejected) {
+                                            log.warn("TR WS: availableCash subscription rejected: {}",
+                                                truncate(payload));
+                                            cashRejected.set(true);
+                                        } else {
+                                            cashJson.set(payload);
+                                        }
+                                    }
 
                                 } else if (scopedCashSubIds.containsKey(wsId)) {
                                     SecAccount account = scopedCashSubIds.get(wsId);
-                                    receivedScopedCashSubs.add(wsId);
-                                    scopedCashJsonByAccount.put(account.externalId(), payload);
+                                    if (receivedScopedCashSubs.add(wsId)) {
+                                        if (rejected) {
+                                            log.warn("TR WS: availableCash rejected for account {}: {}",
+                                                account.name(), truncate(payload));
+                                        } else {
+                                            scopedCashJsonByAccount.put(account.externalId(), payload);
+                                        }
+                                    }
 
                                 } else if (portfolioSubIds.containsKey(wsId)) {
                                     SecAccount account = portfolioSubIds.get(wsId);
+                                    if (rejected) {
+                                        // Counted as answered so the stream can complete, but NOT
+                                        // recorded as a received portfolio: the account is then
+                                        // left out entirely rather than written at 0.
+                                        log.warn("TR WS: compactPortfolioByType rejected for account {}: {}",
+                                            account.name(), truncate(payload));
+                                        receivedPortfolios.incrementAndGet();
+                                        expectedTickers.compareAndSet(-1, 0);
+                                        return Mono.just(text);
+                                    }
                                     receivedPortfolios.incrementAndGet();
                                     receivedPortfolioIds.add(account.externalId());
                                     log.info("TR compactPortfolioByType [{}] raw: {}", account.name(),
@@ -377,8 +433,12 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
                                             log.info("TR compactPortfolioByType [{}]: no positions found", account.name());
                                         }
                                     } catch (Exception ex) {
-                                        log.error("Failed to parse compactPortfolioByType [{}]: {}",
-                                            account.name(), payload, ex);
+                                        // Truncated: a portfolio frame is the user's complete
+                                        // position list (ISINs, quantities, average buy-in), and
+                                        // full payloads do not belong in server logs — same rule
+                                        // as IbkrFlexClient and the ticker branch below.
+                                        log.error("Failed to parse compactPortfolioByType [{}] ({} chars): {}",
+                                            account.name(), payload.length(), truncate(payload), ex);
                                         expectedTickers.compareAndSet(-1, 0);
                                     }
 
@@ -408,7 +468,7 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
                             })
                             .takeUntil(text -> {
                                 if (authExpired.get()) return true;
-                                boolean cashDone = cashJson.get() != null
+                                boolean cashDone = (cashJson.get() != null || cashRejected.get())
                                         && receivedScopedCashSubs.size() >= totalScopedCashSubs;
                                 boolean allPortfoliosIn = receivedPortfolios.get() >= totalPortfolioSubs;
                                 int exp = expectedTickers.get();
@@ -417,12 +477,12 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
                                         && answeredTickerSubs.size() >= exp;
                                 return cashDone && tickersDone;
                             })
-                            .timeout(Duration.ofSeconds(30))
+                            .timeout(wsTimeout)
                             .onErrorReturn("timeout")
                     )
                     .then()
             )
-            .timeout(Duration.ofSeconds(45))
+            .timeout(wsTimeout.plus(WS_SESSION_SLACK))
             .block();
 
         if (authExpired.get()) {
@@ -437,9 +497,23 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
             Map<String, JsonNode> positionsByIsin = positionsByAccount.getOrDefault(
                 secAccount.externalId(), new ConcurrentHashMap<>());
 
-            BigDecimal totalPortfolioValue = secAccount.type() == AccountType.PEA
-                ? parseCashValue(scopedCashJsonByAccount.get(secAccount.externalId()))
-                : BigDecimal.ZERO;
+            // A PEA's balance is its positions PLUS its cash pocket. When a scoped availableCash
+            // subscription was sent for this account and no value came back — the frame never
+            // arrived before the idle timeout, TR rejected the subscription, or the payload could
+            // not be parsed — the account is skipped rather than written at positions-only value:
+            // upsertSnapshot overwrites the day's row, so the understated figure would stay in the
+            // net-worth history for good.
+            BigDecimal totalPortfolioValue = BigDecimal.ZERO;
+            if (hasScopedCash(secAccount)) {
+                Optional<BigDecimal> scopedCash =
+                    parseCashValue(scopedCashJsonByAccount.get(secAccount.externalId()));
+                if (scopedCash.isEmpty()) {
+                    log.warn("TR [{}]: no cash balance received for the account's cash pocket — "
+                        + "skipping it rather than writing a positions-only balance", secAccount.name());
+                    continue;
+                }
+                totalPortfolioValue = scopedCash.get();
+            }
             int priced = 0;
             for (var entry : positionsByIsin.entrySet()) {
                 String isin = entry.getKey();
@@ -530,7 +604,7 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
         return payload != null && payload.contains("AUTHENTICATION_ERROR");
     }
 
-    private int extractWsId(String text) {
+    int extractWsId(String text) {
         int space = text.indexOf(' ');
         if (space <= 0) return -1;
         try {
@@ -538,6 +612,21 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
         } catch (NumberFormatException e) {
             return -1;
         }
+    }
+
+    /**
+     * The frame-type token of a TR WebSocket frame ({@code <id> <type> <payload>}) — "A" for an
+     * answer, "C"/"D" for a delta, "E" for a rejected subscription — or an empty string when the
+     * frame has no type token. {@link #extractWsPayload} deliberately drops it; reading it is what
+     * lets an error frame be told apart from an answer whose payload we simply could not parse.
+     */
+    String extractWsType(String text) {
+        if (text == null) return "";
+        int first = text.indexOf(' ');
+        if (first < 0) return "";
+        int second = text.indexOf(' ', first + 1);
+        if (second < 0) return "";
+        return text.substring(first + 1, second);
     }
 
     private String extractWsPayload(String text) {
@@ -559,7 +648,7 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
             );
             return "connect " + WS_VERSION + " " + objectMapper.writeValueAsString(payload);
         } catch (Exception ex) {
-            throw new SyncException("Failed to build TR connect message: " + ex.getMessage());
+            throw new SyncException("Failed to build TR connect message: " + ex.getMessage(), ex);
         }
     }
 
@@ -567,7 +656,7 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
         try {
             return "sub " + id + " " + objectMapper.writeValueAsString(payload);
         } catch (Exception ex) {
-            throw new SyncException("Failed to build subscription message: " + ex.getMessage());
+            throw new SyncException("Failed to build subscription message: " + ex.getMessage(), ex);
         }
     }
 
@@ -595,7 +684,7 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
         return buildSub(id, payload);
     }
 
-    private List<SecAccount> extractSecAccounts(String sessionToken) {
+    List<SecAccount> extractSecAccounts(String sessionToken) {
         try {
             String[] parts = sessionToken.split("\\.");
             if (parts.length < 2) return List.of();
@@ -616,7 +705,10 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
             });
             return result;
         } catch (Exception ex) {
-            log.warn("Failed to extract sec account numbers from JWT: {}", ex.getMessage());
+            // With the exception object, not just its message: this is the input to the whole
+            // portfolio subscription, and a claim-layout change surfaces as an empty portfolio
+            // whose only trace used to be one line reading "null" for an NPE.
+            log.warn("Failed to extract sec account numbers from JWT", ex);
         }
         return List.of();
     }
@@ -677,18 +769,49 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
         };
     }
 
-    private List<TrAccountData> parseCashJson(String json) {
-        log.info("TR availableCash raw: {}", json);
-        List<TrAccountData> accounts = new ArrayList<>();
-        BigDecimal value = parseCashValue(json);
-        if (value.compareTo(BigDecimal.ZERO) >= 0) {
-            accounts.add(new TrAccountData("tr_cash", "TR Cash", AccountType.CHECKING, value, List.of()));
-        }
-        return accounts;
+    /** Whether a securities account has a cash pocket of its own to subscribe to (PEA). */
+    private static boolean hasScopedCash(SecAccount account) {
+        return account.type() == AccountType.PEA
+            && account.cashAccountNumber() != null
+            && !account.cashAccountNumber().isBlank();
     }
 
-    private BigDecimal parseCashValue(String json) {
-        if (json == null || json.isBlank()) return BigDecimal.ZERO;
+    /**
+     * The TR Cash account, or nothing at all when the payload carried no readable amount.
+     *
+     * <p>Emitting a 0 EUR account instead is what this returns an empty list for: the value is
+     * persisted as {@code account.currentBalance} and stamped as the day's balance snapshot, which
+     * overwrites whatever an earlier successful sync wrote — so one unreadable frame turned into a
+     * permanent hole in the net-worth chart. Skipping leaves the previous balance standing, the
+     * same refusal {@code CryptoExchangeSyncService} and {@code WalletSyncService} make.
+     */
+    List<TrAccountData> parseCashJson(String json) {
+        Optional<BigDecimal> value = parseCashValue(json);
+        if (value.isEmpty()) {
+            log.warn("TR availableCash carried no readable amount ({} chars) — skipping the TR Cash "
+                + "account rather than recording a zero: {}",
+                json == null ? 0 : json.length(), truncate(json));
+            return List.of();
+        }
+        log.info("TR availableCash: {}", value.get());
+        return List.of(new TrAccountData(
+            "tr_cash", "TR Cash", AccountType.CHECKING, value.get(), List.of()));
+    }
+
+    /**
+     * The cash amount in an {@code availableCash} payload, or {@link Optional#empty()} when there
+     * is none to read — a blank body, an error frame, a shape carrying neither {@code value} nor
+     * {@code amount}.
+     *
+     * <p>Returning {@code BigDecimal.ZERO} for all of those made "the account holds nothing" and
+     * "we could not read the answer" the same value, and every caller here writes that value into
+     * a balance.
+     *
+     * <p>Negative entries are skipped rather than returned, preserving the original scan: TR sends
+     * one entry per currency and a negative one is not the euro cash pocket being looked for.
+     */
+    Optional<BigDecimal> parseCashValue(String json) {
+        if (json == null || json.isBlank()) return Optional.empty();
         try {
             JsonNode root = objectMapper.readTree(json);
             JsonNode array = root.isArray() ? root : root.path("availableCash");
@@ -696,28 +819,42 @@ public class TradeRepublicAdapter implements TradeRepublicPort {
 
             if (array.isArray()) {
                 for (JsonNode item : array) {
-                    BigDecimal value = extractValue(item);
-                    if (value.compareTo(BigDecimal.ZERO) >= 0) {
+                    Optional<BigDecimal> value = extractValue(item);
+                    if (value.isPresent() && value.get().signum() >= 0) {
                         return value;
                     }
                 }
             } else if (array.isObject()) {
-                BigDecimal value = extractValue(array);
-                if (value.compareTo(BigDecimal.ZERO) >= 0) {
+                Optional<BigDecimal> value = extractValue(array);
+                if (value.isPresent() && value.get().signum() >= 0) {
                     return value;
                 }
             }
         } catch (Exception ex) {
-            log.error("Failed to parse TR availableCash: {}", json, ex);
+            log.error("Failed to parse TR availableCash ({} chars): {}",
+                json.length(), truncate(json), ex);
         }
-        return BigDecimal.ZERO;
+        return Optional.empty();
     }
 
-    private BigDecimal extractValue(JsonNode node) {
-        if (node == null || node.isMissingNode()) return BigDecimal.ZERO;
-        if (node.has("value"))   return new BigDecimal(node.get("value").asText("0"));
-        if (node.has("amount"))  return new BigDecimal(node.get("amount").asText("0"));
-        if (node.isNumber())     return node.decimalValue();
-        return BigDecimal.ZERO;
+    /** The amount carried by one {@code availableCash} entry, or empty when it carries none. */
+    private Optional<BigDecimal> extractValue(JsonNode node) {
+        if (node == null || node.isMissingNode()) return Optional.empty();
+        try {
+            if (node.has("value"))   return Optional.of(new BigDecimal(node.get("value").asText("0")));
+            if (node.has("amount"))  return Optional.of(new BigDecimal(node.get("amount").asText("0")));
+            if (node.isNumber())     return Optional.of(node.decimalValue());
+        } catch (NumberFormatException ex) {
+            log.warn("TR availableCash entry carries an unreadable amount: {}", truncate(node.toString()));
+        }
+        return Optional.empty();
+    }
+
+    /** A payload prefix safe to log — see {@link #LOG_PAYLOAD_CHARS}. */
+    private static String truncate(String payload) {
+        if (payload == null) return "";
+        return payload.length() > LOG_PAYLOAD_CHARS
+            ? payload.substring(0, LOG_PAYLOAD_CHARS) + "…"
+            : payload;
     }
 }

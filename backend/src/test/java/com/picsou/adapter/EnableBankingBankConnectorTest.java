@@ -2,6 +2,7 @@ package com.picsou.adapter;
 
 import com.picsou.config.EnableBankingConfigProvider;
 import com.picsou.exception.SyncException;
+import com.picsou.port.BankConnectorPort;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -22,6 +23,105 @@ class EnableBankingBankConnectorTest {
 
     private EnableBankingBankConnector connector() {
         return new EnableBankingBankConnector(configProvider, "https://api.enablebanking.test");
+    }
+
+    /** One RSA key for the whole class: generating a 2048-bit pair per test is the slow part. */
+    private static final java.security.PrivateKey SIGNING_KEY = generateKey();
+
+    private static java.security.PrivateKey generateKey() {
+        try {
+            java.security.KeyPairGenerator generator = java.security.KeyPairGenerator.getInstance("RSA");
+            generator.initialize(2048);
+            return generator.generateKeyPair().getPrivate();
+        } catch (java.security.NoSuchAlgorithmException ex) {
+            throw new IllegalStateException(ex);
+        }
+    }
+
+    /** A connector whose HTTP calls are answered by {@code route}, keyed on the request path. */
+    private EnableBankingBankConnector connectorRouting(
+        java.util.function.Function<String, String> route) {
+        lenient().when(configProvider.applicationId()).thenReturn(Optional.of("app-id"));
+        lenient().when(configProvider.keyId()).thenReturn(Optional.of("key-id"));
+        lenient().when(configProvider.privateKey()).thenReturn(Optional.of(SIGNING_KEY));
+
+        org.springframework.web.reactive.function.client.ExchangeFunction exchange = request -> {
+            String body = route.apply(request.url().getPath());
+            if (body == null) {
+                return reactor.core.publisher.Mono.just(
+                    org.springframework.web.reactive.function.client.ClientResponse
+                        .create(org.springframework.http.HttpStatus.NOT_FOUND)
+                        .header("Content-Type", "application/json").body("{}").build());
+            }
+            return reactor.core.publisher.Mono.just(
+                org.springframework.web.reactive.function.client.ClientResponse
+                    .create(org.springframework.http.HttpStatus.OK)
+                    .header("Content-Type", "application/json").body(body).build());
+        };
+        return new EnableBankingBankConnector(configProvider,
+            org.springframework.web.reactive.function.client.WebClient.builder()
+                .baseUrl("https://api.enablebanking.test")
+                .exchangeFunction(exchange)
+                .build());
+    }
+
+    private static final String SESSION_WITH_ONE_ACCOUNT =
+        "{\"session_id\":\"session-1\",\"accounts\":[\"acc-1\"]}";
+
+    // ─── Missing balances ─────────────────────────────────────────────────────
+
+    /**
+     * The reported failure mode: a bank's PSD2 API answers 200 with an empty {@code balances}
+     * list — common while a freshly-linked account is still propagating, or when consent covered
+     * details but not balances. Read as {@code 0.00} it overwrote a real balance and stamped a
+     * zero into that day's snapshot, which nothing later goes back to fix.
+     */
+    @Test
+    void fetchBalances_reportsNoBalance_ratherThanZero_whenTheBankReturnsAnEmptyBalanceList() {
+        var connector = connectorRouting(path -> switch (path) {
+            case "/sessions/session-1" -> SESSION_WITH_ONE_ACCOUNT;
+            case "/accounts/acc-1/balances" -> "{\"balances\":[]}";
+            case "/accounts/acc-1/details" -> "{\"account\":{\"name\":\"Compte courant\",\"iban\":\"FR76\"}}";
+            default -> null;
+        });
+
+        assertThat(connector.fetchBalances("session-1"))
+            .singleElement()
+            .satisfies(account -> {
+                assertThat(account.externalId()).isEqualTo("acc-1");
+                assertThat(account.balance()).isNull();
+            });
+    }
+
+    /** Same refusal for an item that exists but carries no {@code balance_amount}. */
+    @Test
+    void fetchBalances_reportsNoBalance_whenTheBalanceItemCarriesNoAmount() {
+        var connector = connectorRouting(path -> switch (path) {
+            case "/sessions/session-1" -> SESSION_WITH_ONE_ACCOUNT;
+            case "/accounts/acc-1/balances" -> "{\"balances\":[{\"balance_type\":\"closingBooked\"}]}";
+            case "/accounts/acc-1/details" -> "{\"account\":{\"name\":\"Livret A\"}}";
+            default -> null;
+        });
+
+        assertThat(connector.fetchBalances("session-1")).singleElement()
+            .extracting(BankConnectorPort.AccountData::balance).isNull();
+    }
+
+    @Test
+    void fetchBalances_prefersTheBookedBalance_andReadsItsCurrency() {
+        var connector = connectorRouting(path -> switch (path) {
+            case "/sessions/session-1" -> SESSION_WITH_ONE_ACCOUNT;
+            case "/accounts/acc-1/balances" -> "{\"balances\":["
+                + "{\"balance_type\":\"interimAvailable\",\"balance_amount\":{\"amount\":\"10.00\",\"currency\":\"EUR\"}},"
+                + "{\"balance_type\":\"closingBooked\",\"balance_amount\":{\"amount\":\"3200.45\",\"currency\":\"EUR\"}}]}";
+            case "/accounts/acc-1/details" -> "{\"account\":{\"name\":\"Compte courant\"}}";
+            default -> null;
+        });
+
+        var account = connector.fetchBalances("session-1").get(0);
+
+        assertThat(account.balance()).isEqualByComparingTo("3200.45");
+        assertThat(account.currency()).isEqualTo("EUR");
     }
 
     @Test

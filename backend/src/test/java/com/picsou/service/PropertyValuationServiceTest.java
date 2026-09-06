@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
@@ -121,6 +122,23 @@ class PropertyValuationServiceTest {
         when(valuationRepository.findByAccountIdAndValuedAt(eq(10L), any(LocalDate.class)))
             .thenReturn(Optional.empty());
         when(valuationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+    }
+
+    /**
+     * Metadata is only ever written by {@code updateRealEstateMetadata}, so a property whose
+     * address form has not been filled in yet is a routine precondition, not a server fault.
+     * As an {@code IllegalStateException} it had no handler in {@code GlobalExceptionHandler}:
+     * the user got a 500 "An unexpected error occurred" and the log an ERROR with a stack trace.
+     */
+    @Test
+    void estimate_withoutMetadata_isARequestError_notAServerFault() {
+        Account account = house();
+        when(accessResolver.requireOwner(10L, 1L)).thenReturn(account);
+        when(metadataRepository.findByAccountId(10L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.estimate(10L, 1L))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("address");
     }
 
     @Test

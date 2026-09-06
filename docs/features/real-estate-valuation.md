@@ -127,6 +127,7 @@ account card (see [accounts-overview.md](./accounts-overview.md#account-card-ana
   municipality", sending debugging towards the address instead of the logs. Transport
   failures now raise `ValuationProviderException` → `PROVIDER_UNAVAILABLE`, which is a
   different message from an empty market.
+- **Estimating a property with no metadata is a 400, not a 500.** `RealEstateMetadata` is only ever written by `updateRealEstateMetadata`, so a property created manually and valued before its address form is filled in is a routine precondition. `estimate()` threw `IllegalStateException`, for which `GlobalExceptionHandler` has no handler — the user got the generic 500 "An unexpected error occurred" and the log an ERROR with a full stack trace. It now throws `IllegalArgumentException` (400) naming what is missing, which `formatApiError` passes through to the user verbatim.
 - **A property is never left at 0 €.** Without a valuation it falls back to its cost basis;
   0 € against a purchase price renders as a 100% loss, which reads as "your flat is
   worthless" rather than "no figure yet". The floor only ever lifts a zero — a real
@@ -196,7 +197,9 @@ account card (see [accounts-overview.md](./accounts-overview.md#account-card-ana
   >256 KB payload over a real socket; stubbed `ClientResponse` fixtures decode with their own
   strategies, so neither the constructor nor the buffer regression is visible to them
 - `GeoplateformeGeocoderTest` — INSEE mapping, coordinate order, overseas department codes
-- `PropertyValuationServiceTest` — MANUAL lock, status paths, re-indexing, per-property guard
+- `PropertyValuationServiceTest` — MANUAL lock, status paths, re-indexing, per-property guard,
+  and a property without metadata reported as an `IllegalArgumentException` (400) rather than a
+  server fault
 - `PropertyAdjustmentsTest` — direction, bounds, no double-counting of energy vs era, and
   `applyTo` reproducing the headline transform, keeping the band around the estimate in both
   clamp directions, and passing a null bound through; the capped breakdown reconciling with the

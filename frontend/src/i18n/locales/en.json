@@ -17,6 +17,13 @@
       "tooManyRequests": "Too many attempts. Please wait a moment and try again.",
       "serverError": "Something went wrong on our side. Please try again."
     },
+    "validation": {
+      "required": "This field is required.",
+      "tooLong": "Value is too long.",
+      "invalidNumber": "Enter a valid number.",
+      "nonNegative": "The value cannot be negative.",
+      "percentage": "Enter a percentage between 0 and 100."
+    },
     "dateHint": "dd/mm/yyyy",
     "search": "Search",
     "noResults": "No results",
@@ -165,6 +172,9 @@
     "description": "Description",
     "amount": "Amount",
     "tickerOrIsin": "Ticker or ISIN",
+    "accountNamePlaceholder": "PEA Boursorama",
+    "providerPlaceholder": "Boursorama",
+    "tickerPlaceholder": "BTC",
     "tickerOrIsinPlaceholder": "IWDA.AS, IE00B4L5Y983, BTC...",
     "assetNamePlaceholder": "Example: iShares Core MSCI World",
     "priceLive": "Live price",
@@ -469,6 +479,7 @@
     "tr": {
       "title": "Trade Republic",
       "phone": "Phone number",
+      "phonePlaceholder": "+49...",
       "pin": "PIN code",
       "tan": "Verification code",
       "connect": "Connect",
@@ -591,7 +602,10 @@
       "allAccountsMapped": "All accounts already mapped, syncing...",
       "serviceUnavailable": "Finary service is temporarily unavailable. Please try again in a few minutes.",
       "syncFailed": "Finary sync failed",
-      "authFailed": "Invalid Finary credentials. Please check your email and password."
+      "authFailed": "Invalid Finary credentials. Please check your email and password.",
+      "importFailed": "Finary import failed",
+      "txCount": "{{count}} transaction",
+      "txCount_other": "{{count}} transactions"
     },
     "all": {
       "title": "Sync accounts",
@@ -603,7 +617,16 @@
       "sessionExpired": "Session expired",
       "reconnect": "Reconnect on the provider's tab",
       "trManualInfo": "Trade Republic is the only bank that requires manual re-authentication. You will need to re-enter your phone number and PIN each time you sync.",
-      "trSlowWarning": "Connection may take a few moments, this is normal."
+      "trSlowWarning": "Connection may take a few moments, this is normal.",
+      "status": {
+        "linked": "Linked",
+        "connected": "Connected",
+        "active": "Active",
+        "pending": "Pending",
+        "expired": "Expired",
+        "failed": "Failed",
+        "error": "Error"
+      }
     },
     "bourso": {
       "title": "BoursoBank",

@@ -1,16 +1,23 @@
 import time
 import unittest
+from unittest.mock import patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from positions_parser import parse_plans
+import main
 from main import (
+    BACKEND_AUTH_TIMEOUT_SECONDS,
     MAX_CONCURRENT_BROWSERS,
+    MFA_PROMPT_TIMEOUT_SECONDS,
+    TOKEN_CAPTURE_TIMEOUT_SECONDS,
     PlanPayload,
     _acquire_browser_slot,
     _log_safe,
+    _new_browser,
     _release_browser_slot,
+    _token_capture_budget,
     PENDING_TTL_SECONDS,
     TokenCollector,
     _cleanup_expired,
@@ -168,6 +175,88 @@ class BrowserSlotTest(unittest.IsolatedAsyncioTestCase):
             await _acquire_browser_slot()
         for _ in range(MAX_CONCURRENT_BROWSERS):
             await _release_browser_slot()
+
+
+class FakeBrowser:
+    def __init__(self, context_error: Exception | None = None):
+        self.context_error = context_error
+        self.closed = 0
+
+    async def new_context(self, **_kwargs):
+        if self.context_error is not None:
+            raise self.context_error
+        raise AssertionError("not needed by these tests")
+
+    async def close(self):
+        self.closed += 1
+
+
+class FakeChromium:
+    def __init__(self, browser: FakeBrowser | None, launch_error: Exception | None = None):
+        self.browser = browser
+        self.launch_error = launch_error
+
+    async def launch(self, **_kwargs):
+        if self.launch_error is not None:
+            raise self.launch_error
+        return self.browser
+
+
+class FakePlaywright:
+    def __init__(self, chromium: FakeChromium):
+        self.chromium = chromium
+
+
+class BrowserSlotReleaseOnSetupFailureTest(unittest.IsolatedAsyncioTestCase):
+    """A slot taken for a browser whose context never came up must be given back.
+
+    The caller's `browser` local is still None when `_new_browser` raises, so
+    `_close_resources` cannot release it -- after four such failures every
+    /initiate and /positions would answer 503 with no browser actually open.
+    """
+
+    async def asyncSetUp(self):
+        main._browsers = 0
+
+    async def asyncTearDown(self):
+        main._browsers = 0
+
+    async def test_a_rejected_storage_state_closes_the_browser_and_frees_the_slot(self):
+        browser = FakeBrowser(context_error=RuntimeError("bad cookie sameSite"))
+
+        with self.assertRaises(RuntimeError):
+            await _new_browser(FakePlaywright(FakeChromium(browser)), storage_state={"cookies": [{}]})
+
+        self.assertEqual(browser.closed, 1)
+        self.assertEqual(main._browsers, 0)
+
+    async def test_a_failed_launch_still_frees_the_slot(self):
+        with self.assertRaises(RuntimeError):
+            await _new_browser(FakePlaywright(FakeChromium(None, launch_error=RuntimeError("no chromium"))))
+
+        self.assertEqual(main._browsers, 0)
+
+
+class LoginTimingTest(unittest.TestCase):
+    """A wrong password shows neither a second-factor prompt nor a bearer.
+
+    Mirrors AmundiAdapterTest's "validation timeout outlives auth timeout": the
+    sidecar must be the one to give up, inside Java's 45 s auth timeout, or the
+    user is told Amundi is unavailable instead of that the password is wrong.
+    """
+
+    def test_the_second_factor_poll_and_the_bearer_wait_share_one_budget(self):
+        self.assertEqual(
+            MFA_PROMPT_TIMEOUT_SECONDS + _token_capture_budget(),
+            TOKEN_CAPTURE_TIMEOUT_SECONDS,
+        )
+
+    def test_a_rejected_password_is_reported_inside_the_backend_auth_timeout(self):
+        self.assertLess(TOKEN_CAPTURE_TIMEOUT_SECONDS, BACKEND_AUTH_TIMEOUT_SECONDS)
+
+    def test_the_bearer_wait_never_collapses_to_zero(self):
+        with patch("main.MFA_PROMPT_TIMEOUT_SECONDS", TOKEN_CAPTURE_TIMEOUT_SECONDS + 5):
+            self.assertEqual(_token_capture_budget(), 1)
 
 
 class PendingAuthenticationLifecycleTest(unittest.IsolatedAsyncioTestCase):

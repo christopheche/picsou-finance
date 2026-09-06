@@ -6,7 +6,36 @@ mirrors services/bourse-direct-auth/portfolio_parser.py.
 The "value" array-of-{name, value}-pairs shape modeled here was reconstructed from
 public reference implementations and has since been confirmed against a live
 account. See docs/features/degiro-sync.md "Known limitations" for what remains open.
+
+Completeness gate: a block, row or field this parser relies on that is missing or
+non-numeric raises `PortfolioFormatError` instead of degrading to 0 / an empty list.
+Java trusts the payload — it books `cash + Σ size × price` as the account value,
+writes a daily snapshot and replaces every holding — so a reshaped DEGIRO response
+must fail the sync, never silently value the account at 0 € (same discipline as
+services/bourse-direct-auth/portfolio_parser.py).
 """
+
+
+class PortfolioFormatError(ValueError):
+    """Raised when a DEGIRO block/field this parser depends on is missing or unusable."""
+
+
+def _number(raw, field: str) -> float:
+    """Reads a required numeric field without turning protocol drift into a false zero.
+
+    JSON `null`, a missing key, a boolean or a non-numeric string all raise: DEGIRO's
+    portfolio rows carry real numbers, so anything else means the shape moved.
+    """
+    if raw is None or isinstance(raw, bool):
+        raise PortfolioFormatError(f"Missing {field}")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        try:
+            return float(raw.strip())
+        except ValueError as exc:
+            raise PortfolioFormatError(f"Invalid {field}") from exc
+    raise PortfolioFormatError(f"Invalid {field}")
 
 
 def _sanitize(value):
@@ -54,12 +83,23 @@ def value_pairs_to_dict(item: dict) -> dict:
     return item
 
 
-def parse_cash_eur(cash_funds_rows: list) -> float:
-    for row in cash_funds_rows or []:
+def parse_cash_eur(cash_funds_rows) -> float:
+    """Reads the EUR balance out of the `cashFunds` rows.
+
+    Fails closed: no `cashFunds` block, no EUR row, or an EUR row without a numeric
+    `value` raises rather than returning 0.0 — a French DEGIRO account always carries
+    its EUR base-currency row (confirmed live, even at 0), so its absence means the
+    response was reshaped, not that the account is empty.
+    """
+    if not isinstance(cash_funds_rows, list):
+        raise PortfolioFormatError("Missing cashFunds")
+    for row in cash_funds_rows:
+        if not isinstance(row, dict):
+            continue
         flat = value_pairs_to_dict(row)
         if flat.get("currencyCode") == "EUR":
-            return float(flat.get("value", 0) or 0)
-    return 0.0
+            return _number(flat.get("value"), "cashFunds EUR value")
+    raise PortfolioFormatError("Missing cashFunds EUR row")
 
 
 def is_real_product_id(product_id) -> bool:
@@ -73,7 +113,7 @@ def is_real_product_id(product_id) -> bool:
     return product_id is not None and str(product_id).strip().isdigit()
 
 
-def parse_raw_positions(portfolio_rows: list) -> list[dict]:
+def parse_raw_positions(portfolio_rows) -> list[dict]:
     """Extracts non-zero, real-instrument positions as {productId, size, price,
     breakEvenPrice} — before ISIN/name enrichment. Cash sub-positions (see
     `is_real_product_id`) are skipped: DEGIRO's cashFunds rows already carry
@@ -82,24 +122,51 @@ def parse_raw_positions(portfolio_rows: list) -> list[dict]:
     `price` and `breakEvenPrice` (average cost) are both read from the
     portfolio row itself — confirmed live: DEGIRO's product-info response has
     no `breakEvenPrice` field at all, average cost lives here instead.
+
+    Fails closed: no `portfolio` block, or a real-instrument row whose `size` or
+    `price` is missing/non-numeric, raises `PortfolioFormatError`. Dropping such a
+    row or pricing it at 0 would reach Java as a smaller-but-plausible portfolio and
+    overwrite the last good holdings with it.
     """
+    if not isinstance(portfolio_rows, list):
+        raise PortfolioFormatError("Missing portfolio")
     positions = []
-    for row in portfolio_rows or []:
+    for row in portfolio_rows:
+        if not isinstance(row, dict):
+            raise PortfolioFormatError("Invalid portfolio row")
         flat = value_pairs_to_dict(row)
-        size = float(flat.get("size", 0) or 0)
-        if size == 0:
-            continue
         product_id = flat.get("id") or row.get("id")
         if not is_real_product_id(product_id):
             continue
-        price = float(flat.get("price", 0) or 0)
+        size = _number(flat.get("size"), f"size of product {product_id}")
+        if size == 0:
+            continue
+        price = _number(flat.get("price"), f"price of product {product_id}")
+        break_even = flat.get("breakEvenPrice")
         positions.append({
             "productId": product_id,
             "size": size,
             "price": price,
-            "breakEvenPrice": float(flat.get("breakEvenPrice", price) or price),
+            "breakEvenPrice": price if break_even in (None, "") else _number(
+                break_even, f"breakEvenPrice of product {product_id}"),
         })
     return positions
+
+
+def describe_product_info(data) -> str:
+    """Shape-only summary of a product-info response, safe to log at INFO.
+
+    The full dump is the user's complete portfolio composition (every ISIN, name and
+    price held); the sibling sidecars never log raw financial responses, and neither
+    does this one. Key names and counts are enough to debug a DEGIRO shape change.
+    """
+    if not isinstance(data, dict):
+        return f"type={type(data).__name__}"
+    fields: set[str] = set()
+    for info in data.values():
+        if isinstance(info, dict):
+            fields.update(str(key) for key in info.keys())
+    return f"products={len(data)}; fields={sorted(fields)}"
 
 
 def build_product_info_map(data: dict) -> dict:

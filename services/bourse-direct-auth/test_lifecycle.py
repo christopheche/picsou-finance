@@ -11,6 +11,7 @@ from main import (
     _cleanup_expired,
     _close_all_pending,
     _close_resources,
+    _log_safe,
     _pending,
     _pending_lock,
     _portfolio_http_exception,
@@ -114,6 +115,17 @@ class PendingAuthenticationLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(raised.exception.detail, "UPSTREAM_UNAVAILABLE")
+
+
+class LogSafetyTest(unittest.TestCase):
+    def test_control_characters_cannot_forge_a_log_line(self):
+        forged = _log_safe("/accounts\r\nINFO:bourse-direct-auth:all clear")
+        self.assertNotIn("\n", forged)
+        self.assertNotIn("\r", forged)
+        self.assertTrue(forged.startswith("/accounts"))
+
+    def test_the_logged_path_is_bounded(self):
+        self.assertEqual(len(_log_safe("/" + "a" * 5000)), 200)
 
 
 class RequestContractTest(unittest.TestCase):

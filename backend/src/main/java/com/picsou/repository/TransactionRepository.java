@@ -29,10 +29,6 @@ public interface TransactionRepository extends JpaRepository<Transaction, Long> 
 
     List<Transaction> findByAccountIdAndTxTypeInOrderByDateAscIdAsc(Long accountId, List<TransactionType> types);
 
-    /** Earliest transaction date across all accounts */
-    @Query("SELECT MIN(t.date) FROM Transaction t")
-    LocalDate findEarliestDate();
-
     /**
      * Manually entered transactions of manual accounts whose ticker is 12 characters long — the
      * length of an ISIN, which the caller confirms with {@code OpenFigiIsinConverter.isIsin}

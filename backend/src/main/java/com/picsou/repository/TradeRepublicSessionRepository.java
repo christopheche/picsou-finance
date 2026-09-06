@@ -7,8 +7,6 @@ import java.util.Optional;
 
 public interface TradeRepublicSessionRepository extends JpaRepository<TradeRepublicSession, Long> {
 
-    Optional<TradeRepublicSession> findTopByOrderByCreatedAtDesc();
-
     // memberId-scoped queries
     Optional<TradeRepublicSession> findByMemberId(Long memberId);
 }

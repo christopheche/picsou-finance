@@ -1,0 +1,16 @@
+-- V80: drop chk_goal_deadline so a goal whose deadline has passed stays writable.
+--
+-- V2 declared CHECK (deadline > CURRENT_DATE) on `goal`. PostgreSQL re-evaluates a table CHECK
+-- on every UPDATE of the row, whatever column changed, so the constraint stopped being a rule
+-- about new goals the day after the deadline: from then on *every* write to that row is
+-- rejected. GoalService.extendHistory and extendHistoryByMonth only set history_start_month
+-- (plus the audited updated_at), so the "extend history" and "+ previous month" backfill
+-- actions raise a check violation -> HTTP 500 on exactly the goals a backfill is for.
+--
+-- A passed deadline is a supported state, not corruption: toProgressResponse treats it as "the
+-- whole remaining amount is the monthly need" (docs/features/goals.md). The rule the constraint
+-- meant to express -- a *new* deadline must be in the future -- is enforced where it belongs, by
+-- @Future on GoalRequest.deadline, which the controller validates on create and on update alike.
+--
+-- IF EXISTS because an instance restored from a hand-repaired dump may already be without it.
+ALTER TABLE goal DROP CONSTRAINT IF EXISTS chk_goal_deadline;

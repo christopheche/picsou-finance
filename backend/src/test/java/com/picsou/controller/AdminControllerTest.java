@@ -5,6 +5,7 @@ import com.picsou.dto.AdminEnableBankingRequest;
 import com.picsou.dto.AdminSecurityRequest;
 import com.picsou.dto.EnableBankingImportRequest;
 import com.picsou.dto.EnableBankingKeypairResponse;
+import com.picsou.exception.InvalidKeyMaterialException;
 import com.picsou.service.EnableBankingKeyPairService;
 import com.picsou.service.IntegrationsService;
 import com.picsou.service.SetupService;
@@ -21,6 +22,7 @@ import java.util.Optional;
 
 import static com.picsou.service.SetupService.*;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
@@ -104,14 +106,15 @@ class AdminControllerTest {
     }
 
     @Test
-    void importPrivateKey_invalid_returns422() {
-        when(keyPairService.importPrivateKey("bad")).thenThrow(new IllegalArgumentException("not a PKCS8 pem"));
+    void importPrivateKey_invalid_propagatesToTheGlobalHandler() {
+        // No try/catch in the controller (error-handling.md): the service's
+        // InvalidKeyMaterialException reaches GlobalExceptionHandler, which maps it to 422.
+        when(keyPairService.importPrivateKey("bad"))
+            .thenThrow(new InvalidKeyMaterialException("Not a valid PKCS#8 private key PEM."));
 
-        var response = controller.importEnableBankingPrivateKey(new EnableBankingImportRequest("bad"));
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
-        assertThat(response.getBody()).isInstanceOf(ProblemDetail.class);
-        assertThat(((ProblemDetail) response.getBody()).getDetail()).isEqualTo("not a PKCS8 pem");
+        assertThatThrownBy(() -> controller.importEnableBankingPrivateKey(new EnableBankingImportRequest("bad")))
+            .isInstanceOf(InvalidKeyMaterialException.class)
+            .hasMessage("Not a valid PKCS#8 private key PEM.");
     }
 
     @Test

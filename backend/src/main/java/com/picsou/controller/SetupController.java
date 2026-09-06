@@ -168,14 +168,9 @@ public class SetupController {
         if (!consumeRateLimitToken(httpRequest)) return rateLimited();
         requireNotComplete();
 
-        try {
-            String publicPem = keyPairService.importPrivateKey(request.privatePem());
-            return ResponseEntity.ok(new EnableBankingKeypairResponse(publicPem, false));
-        } catch (IllegalArgumentException ex) {
-            ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.UNPROCESSABLE_ENTITY);
-            pd.setDetail(ex.getMessage());
-            return ResponseEntity.unprocessableEntity().body(pd);
-        }
+        // A bad PEM raises InvalidKeyMaterialException, mapped to 422 by GlobalExceptionHandler.
+        String publicPem = keyPairService.importPrivateKey(request.privatePem());
+        return ResponseEntity.ok(new EnableBankingKeypairResponse(publicPem, false));
     }
 
     @PostMapping("/integrations/enablebanking/test")
@@ -195,8 +190,13 @@ public class SetupController {
 
     // ─── BoursoBank ──────────────────────────────────────────────────────────
 
-    @GetMapping("/integrations/boursobank/health")
-    public ResponseEntity<BoursoBankHealthResponse> boursoBankHealth(HttpServletRequest httpRequest) {
+    /**
+     * A POST, not a GET, because a successful probe <em>enables</em> the integration
+     * and writes an audit row (api-rest.md: GET reads, POST acts). Mirrors
+     * {@code /integrations/enablebanking/test}.
+     */
+    @PostMapping("/integrations/boursobank/test")
+    public ResponseEntity<BoursoBankHealthResponse> testBoursoBank(HttpServletRequest httpRequest) {
         if (!consumeRateLimitToken(httpRequest)) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).build();
         }

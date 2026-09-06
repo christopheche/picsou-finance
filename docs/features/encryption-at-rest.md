@@ -79,7 +79,7 @@ Read credential:
 
 ## Gotchas / Pitfalls
 
-- **Key is mandatory**: The app will not start without `CRYPTO_ENCRYPTION_KEY`. Generate with: `openssl rand -base64 32`.
+- **Key is mandatory and validated at startup**: The app will not start without `CRYPTO_ENCRYPTION_KEY`, and it also refuses a key that is not Base64 or does not decode to 16, 24 or 32 bytes (a hand-typed value, or the 48-byte `JWT_SECRET` pasted by mistake) — otherwise `SecretKeySpec` would accept it and every `encrypt()` would fail with a 500 at first use. Generate with: `openssl rand -base64 32`.
 - **Lost key = re-enter credentials**: If the encryption key is lost, encrypted data cannot be recovered. The user must re-add crypto exchanges and re-authenticate Trade Republic.
 - **V15 truncates existing sessions**: After deploying V15, all crypto exchange sessions and TR sessions are cleared. Users must re-enter API keys and re-authenticate TR. This is a one-time migration cost.
 - **Column widths**: Encrypted values are ~1.4x larger than plaintext (Base64 overhead + 12-byte IV + 16-byte tag). Columns are sized with headroom: `api_key` 500, `api_secret` 500, `session_token` 2000, `refresh_token` 4000.
@@ -88,7 +88,8 @@ Read credential:
 
 ## Tests
 
-- No dedicated tests for the encryption-at-rest integration (CryptoEncryption is tested via `CryptoEncryptionTest` for roundtrip correctness)
+- `CryptoEncryptionTest` (plain JUnit, no Spring) — round-trip incl. non-ASCII, a fresh IV per call (two ciphertexts of the same plaintext differ and both decrypt), tampered ciphertext and wrong key both fail with `"Decryption failed"`, null in / null out, all three AES key sizes accepted, and the fail-fast constructor: blank key, non-Base64 key and a wrong-length key (e.g. 20 or 48 bytes) each throw `IllegalStateException` at startup with the `openssl rand -base64 32` hint (ADR 2026-04-08) instead of a 500 on the first `encrypt()`
+- No dedicated tests for the encryption-at-rest *integration* (the services that call `CryptoEncryption` mock it)
 - Manual verification: add an exchange, inspect the `api_key` and `api_secret` columns in the database -- both should be Base64 strings, not readable keys
 
 ## Links

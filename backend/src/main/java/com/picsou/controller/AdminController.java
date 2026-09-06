@@ -11,8 +11,6 @@ import com.picsou.service.IntegrationsService;
 import com.picsou.service.SetupService;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -114,16 +112,12 @@ public class AdminController {
         return ResponseEntity.ok(new EnableBankingKeypairResponse(publicPem, !existedBefore));
     }
 
+    /** A bad PEM raises {@code InvalidKeyMaterialException}, mapped to 422 by {@code GlobalExceptionHandler}. */
     @PostMapping("/settings/enablebanking/keypair/import")
-    public ResponseEntity<?> importEnableBankingPrivateKey(@Valid @RequestBody EnableBankingImportRequest request) {
-        try {
-            String publicPem = keyPairService.importPrivateKey(request.privatePem());
-            return ResponseEntity.ok(new EnableBankingKeypairResponse(publicPem, false));
-        } catch (IllegalArgumentException ex) {
-            ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.UNPROCESSABLE_ENTITY);
-            pd.setDetail(ex.getMessage());
-            return ResponseEntity.unprocessableEntity().body(pd);
-        }
+    public ResponseEntity<EnableBankingKeypairResponse> importEnableBankingPrivateKey(
+            @Valid @RequestBody EnableBankingImportRequest request) {
+        String publicPem = keyPairService.importPrivateKey(request.privatePem());
+        return ResponseEntity.ok(new EnableBankingKeypairResponse(publicPem, false));
     }
 
     @PatchMapping("/settings/integrations/{key}")

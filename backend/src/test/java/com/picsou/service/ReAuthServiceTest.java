@@ -40,7 +40,8 @@ class ReAuthServiceTest {
         when(mfaService.isEnabled(user)).thenReturn(true);
         when(mfaService.verifyTotp(user, "000000")).thenReturn(false);
         assertThatThrownBy(() -> service.verify(user, new ReAuthDto(null, "000000")))
-            .isInstanceOf(ReAuthService.ReAuthFailedException.class);
+            .isInstanceOf(ReAuthService.ReAuthFailedException.class)
+            .hasMessage("The verification code is incorrect.");
     }
 
     @Test
@@ -62,7 +63,9 @@ class ReAuthServiceTest {
         when(mfaService.isEnabled(user)).thenReturn(false);
         when(passwordEncoder.matches("wrong", "$2a$hash")).thenReturn(false);
         assertThatThrownBy(() -> service.verify(user, new ReAuthDto("wrong", null)))
-            .isInstanceOf(ReAuthService.ReAuthFailedException.class);
+            .isInstanceOf(ReAuthService.ReAuthFailedException.class)
+            // A user-facing sentence, not an internal phrase ("invalid password").
+            .hasMessage("Your password is incorrect.");
     }
 
     @Test

@@ -239,7 +239,7 @@ Upsert Account (type=CRYPTO, no ticker)
 
 ## Tests
 
-> `CryptoEncryptionTest` and `BitcoinKeyUtilsTest` were listed here for a long time without existing. AES-GCM round-tripping and BIP32 derivation are still untested — treat that as a known gap, not as coverage.
+> `CryptoEncryptionTest` and `BitcoinKeyUtilsTest` were listed here for a long time without existing. `CryptoEncryptionTest` now exists (see [`encryption-at-rest.md`](./encryption-at-rest.md)); BIP32 derivation is still untested — treat that as a known gap, not as coverage.
 
 - `CryptoExchangeSyncServiceTest` -- credential contract: blank key rejected, missing secret rejected for an exchange that needs one and stray secret rejected for one that doesn't (both **before** `testConnection`, so no wasted round-trip), blank secret normalised to `NULL` for a single-key exchange, Binance still requires both, a failed adapter marks the session `ERROR` without touching `accountService` (no snapshot, no holdings), and an exchange with no adapter fails as a readable 422. Plus the two refusals and their messages: an existing account's balance is left standing when nothing can be valued (**stub the account**, or the test runs the first-sync path and passes for an unrelated reason), and a deleted account tells the user to remove the session — both assert the specific text, since the generic catch used to replace it with "try again later", and that no session write happens on either path
 - `CryptoExchangePositionRepositoryTest` -- the delete-then-reinsert rewrite against the real `uq_crypto_exchange_position`, the exact quantities it leaves behind, a product no longer held disappearing, and — with a second seeded account — that the bulk delete filters by account rather than emptying the table

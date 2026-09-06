@@ -2,6 +2,7 @@ package com.picsou.adapter;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.picsou.adapter.util.JsonRpcResponse;
+import com.picsou.exception.WalletRpcException;
 import com.picsou.model.Chain;
 import com.picsou.port.WalletPort;
 import org.slf4j.Logger;
@@ -23,6 +24,7 @@ public class SolanaWalletAdapter implements WalletPort {
     private static final String RPC_URL = "https://api.mainnet-beta.solana.com";
     private static final BigDecimal LAMPORTS_PER_SOL = new BigDecimal("1000000000");
     private static final String SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    private static final Duration RPC_TIMEOUT = Duration.ofSeconds(10);
 
     /**
      * Hand-curated mint → symbol map. We only resolve to a known ticker if
@@ -70,14 +72,8 @@ public class SolanaWalletAdapter implements WalletPort {
             "params", new Object[]{address}
         );
 
-        JsonNode response = webClient.post()
-            .bodyValue(rpcRequest)
-            .retrieve()
-            .bodyToMono(JsonNode.class)
-            .timeout(Duration.ofSeconds(10))
-            .block();
-
-        JsonNode result = JsonRpcResponse.requireResult(response, "Solana getBalance");
+        String context = "Solana getBalance";
+        JsonNode result = JsonRpcResponse.requireResult(rpc(rpcRequest, context), context);
         long lamports = result.path("value").asLong(0);
         BigDecimal sol = new BigDecimal(lamports).divide(LAMPORTS_PER_SOL, 9, RoundingMode.HALF_UP);
 
@@ -102,15 +98,9 @@ public class SolanaWalletAdapter implements WalletPort {
             )
         );
 
-        JsonNode response = webClient.post()
-            .bodyValue(rpcRequest)
-            .retrieve()
-            .bodyToMono(JsonNode.class)
-            .timeout(Duration.ofSeconds(10))
-            .block();
-
+        String context = "Solana getTokenAccountsByOwner";
         JsonNode accounts = JsonRpcResponse
-            .requireResult(response, "Solana getTokenAccountsByOwner")
+            .requireResult(rpc(rpcRequest, context), context)
             .path("value");
         if (!accounts.isArray()) {
             log.warn("Solana getTokenAccountsByOwner returned non-array 'value': {}", accounts);
@@ -142,5 +132,26 @@ public class SolanaWalletAdapter implements WalletPort {
             tokens.add(new WalletBalance(symbol, amount));
         }
         return tokens;
+    }
+
+    /**
+     * One JSON-RPC POST with the same transport-error classification as the EVM adapter:
+     * anything the transport raises (HTTP 429 from the public RPC, 5xx, connection reset,
+     * timeout) is wrapped as a {@link WalletRpcException} inside the chain -- before
+     * {@code block()}, which would otherwise deliver a checked {@code TimeoutException}
+     * reactor-wrapped -- so {@code WalletSyncService} logs it as an expected WARN/422 rather
+     * than an ERROR-level bug. An empty body is left to {@code requireResult}, which rejects
+     * a null response. Envelope validation stays with the caller.
+     */
+    private JsonNode rpc(Map<String, Object> rpcRequest, String context) {
+        return webClient.post()
+            .bodyValue(rpcRequest)
+            .retrieve()
+            .bodyToMono(JsonNode.class)
+            .timeout(RPC_TIMEOUT)
+            .onErrorMap(ex -> ex instanceof WalletRpcException ? ex
+                : new WalletRpcException(
+                    context + ": RPC failed (" + ex.getClass().getSimpleName() + ") - " + ex.getMessage(), ex))
+            .block();
     }
 }

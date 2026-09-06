@@ -25,8 +25,9 @@ public interface WalletPort {
      *
      * <p>Throws {@link IllegalArgumentException} (surfaced as HTTP 400) when the format
      * is wrong. The default accepts anything — a chain whose format is not cheaply
-     * checkable offline (Bitcoin's several encodings, Solana's base58) keeps deferring
-     * to the RPC call, which is the current behaviour for those adapters.
+     * checkable offline (Solana's base58, plain Bitcoin addresses in their several
+     * encodings) keeps deferring to the RPC call. Bitcoin overrides it for extended keys
+     * only: an unsupported script type (ypub, pkh(, sh() or a key that does not parse.
      */
     default void validateAddress(String address) {
         // No offline format check for this chain -- fetchBalances is the gate.

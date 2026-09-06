@@ -23,14 +23,17 @@ import com.picsou.model.RealEstateMetadata;
 import com.picsou.model.ValuationMode;
 import com.picsou.port.BankConnectorPort;
 import com.picsou.repository.AccountHoldingRepository;
+import com.picsou.repository.AccountOwnershipRepository;
 import com.picsou.repository.AccountRepository;
 import com.picsou.repository.BalanceSnapshotRepository;
 import com.picsou.repository.DebtRepository;
 import com.picsou.repository.PropertyValuationRepository;
 import com.picsou.repository.RealEstateMetadataRepository;
 import com.picsou.repository.TransactionRepository;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -71,6 +74,7 @@ public class AccountService {
     private final RealEstateMetadataRepository realEstateMetadataRepository;
     private final PropertyValuationRepository propertyValuationRepository;
     private final DebtRepository debtRepository;
+    private final AccountOwnershipRepository ownershipRepository;
     private final PriceService priceService;
     private final LoanAmortizationService loanAmortizationService;
     private final AccountAccessResolver accessResolver;
@@ -84,6 +88,7 @@ public class AccountService {
         RealEstateMetadataRepository realEstateMetadataRepository,
         PropertyValuationRepository propertyValuationRepository,
         DebtRepository debtRepository,
+        AccountOwnershipRepository ownershipRepository,
         PriceService priceService,
         LoanAmortizationService loanAmortizationService,
         AccountAccessResolver accessResolver,
@@ -96,6 +101,7 @@ public class AccountService {
         this.realEstateMetadataRepository = realEstateMetadataRepository;
         this.propertyValuationRepository = propertyValuationRepository;
         this.debtRepository = debtRepository;
+        this.ownershipRepository = ownershipRepository;
         this.priceService = priceService;
         this.loanAmortizationService = loanAmortizationService;
         this.accessResolver = accessResolver;
@@ -145,10 +151,12 @@ public class AccountService {
 
         account = accountRepository.save(account);
 
-        // Create initial snapshot if balance is provided
+        // Create initial snapshot if balance is provided. Both figures come from the one
+        // valuation, in EUR: the stored balance is native (a USD figure, a BTC quantity), and a
+        // row written in that unit sits in a series every other writer records in EUR.
         if (account.getCurrentBalance().compareTo(BigDecimal.ZERO) > 0) {
-            BigDecimal invested = calculateInvestedAmount(account);
-            createSnapshot(account, account.getCurrentBalance(), invested, LocalDate.now());
+            Valuation valuation = valuation(account);
+            createSnapshot(account, valuation.liveEur(), valuation.investedEur(), LocalDate.now());
         }
 
         return toResponse(account);
@@ -159,6 +167,8 @@ public class AccountService {
         Account account = getOrThrow(id, memberId);
 
         String previousProvider = account.getProvider();
+
+        refuseRetypeOfSplitAccount(account, req.type());
 
         account.setName(req.name());
         account.setType(req.type());
@@ -179,11 +189,32 @@ public class AccountService {
             BigDecimal oldBalance = account.getCurrentBalance();
             account.setCurrentBalance(req.currentBalance());
             if (req.currentBalance().compareTo(oldBalance) != 0) {
-                upsertSnapshot(account, req.currentBalance(), LocalDate.now());
+                // Same source as dailySnapshots, so an edit does not overwrite this morning's
+                // EUR row with the native figure just typed (a 1000 USD account read 1000,
+                // then 920, then 1000 again with nothing having moved).
+                Valuation valuation = valuation(account);
+                upsertSnapshot(account, valuation.liveEur(), valuation.investedEur(), LocalDate.now());
             }
         }
 
         return toResponse(accountRepository.save(account));
+    }
+
+    /**
+     * An ownership split only means something on a property or a loan, and
+     * {@link AccountOwnershipService#replace} refuses to write one on anything else. Retyping a
+     * split account to CHECKING would slip past that refusal with the rows still attached: the
+     * dashboard would show half a checking account and the co-owner would keep reading it —
+     * exactly the joint-current-account semantics the ownership ADR declined to support.
+     */
+    private void refuseRetypeOfSplitAccount(Account account, AccountType newType) {
+        if (newType == account.getType() || AccountOwnershipService.isSplittable(newType)) {
+            return;
+        }
+        if (!ownershipRepository.findByAccountId(account.getId()).isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
+                "Clear the ownership split before changing this account to a type that cannot be shared");
+        }
     }
 
     /**
@@ -225,37 +256,103 @@ public class AccountService {
             country != null ? country : BankConnectorPort.DEFAULT_COUNTRY, institutionId, provider);
     }
 
+    /**
+     * Soft-deletes the account and severs the {@code debt} links that point at it.
+     *
+     * <p>Soft deletion never fires V19's {@code ON DELETE SET NULL}, so without this a loan's
+     * {@code linked_account_id} keeps naming a property that no longer exists — and the
+     * property's own debt row keeps naming a deleted loan. {@code Account} carries
+     * {@code @SQLRestriction("deleted_at IS NULL")}, which Hibernate applies when it loads a
+     * lazy proxy by id: the first read of a non-id field on that proxy ({@code getName()} in
+     * {@code DebtResponse.from} on every accounts list, {@code getMember()} in
+     * {@code RealEstateSummaryService.loansFor}) then finds no row and throws, and the whole
+     * accounts page 500s until the loan is edited by hand. Cutting the link here keeps a
+     * deleted account from being reachable through a row that is not itself hidden.
+     */
     @Transactional
     public void delete(Long id, Long memberId) {
         Account account = getOrThrow(id, memberId);
+        for (Debt debt : debtRepository.findByLinkedAccountId(id)) {
+            debt.setLinkedAccount(null);
+            debtRepository.save(debt);
+        }
+        if (account.getType() == AccountType.LOAN) {
+            debtRepository.findByAccountId(id).ifPresent(debt -> {
+                debt.setLinkedAccount(null);
+                debtRepository.save(debt);
+            });
+        }
         account.setDeletedAt(Instant.now());
         accountRepository.save(account);
     }
 
+    /**
+     * Records the balance the user says the account had on a date.
+     *
+     * <p>The figure is typed in the account's own unit and converted before it is stored, like
+     * every other snapshot writer — a native row in an EUR series reads as a move that never
+     * happened. A past date is converted at today's rate, the trade-off the FX-conversion ADR
+     * already accepts for the chart as a whole.
+     *
+     * <p>The cost basis is derived from the row's own date, never from the account as it stands
+     * today: a snapshot backfilled six months ago used to carry <em>today's</em> balance as its
+     * invested amount, and the chart then printed a loss the size of everything saved since.
+     */
     @Transactional
     public BalanceSnapshot addManualSnapshot(Long accountId, Long memberId, SnapshotRequest req) {
         Account account = getOrThrow(accountId, memberId);
 
         // Update current balance if this is the most recent snapshot
         Optional<BalanceSnapshot> latest = snapshotRepository.findLatestByAccountId(accountId);
-        if (latest.isEmpty() || !req.date().isBefore(latest.get().getDate())) {
+        boolean backdated = latest.isPresent() && req.date().isBefore(latest.get().getDate());
+        if (!backdated) {
             account.setCurrentBalance(req.balance());
             account.setLastSyncedAt(Instant.now());
             accountRepository.save(account);
         }
 
-        return upsertSnapshot(account, req.balance(), req.date());
+        BigDecimal balanceEur = priceService.toEur(req.balance(), account.getCurrency(), account.getTicker());
+        BigDecimal invested = manualSnapshotInvested(account, balanceEur, req.date(), backdated);
+        return upsertSnapshot(account, balanceEur, invested, req.date());
     }
 
+    /**
+     * The cost basis to store alongside a hand-entered balance.
+     *
+     * <p>A loan or an account without holdings has no cost distinct from its value — the same
+     * rule {@link #valuation} applies — so the balance itself is stored and the P&L is zero by
+     * construction. An account with holdings keeps its live cost basis when the row is current;
+     * for a past date that figure counts positions bought since, so the nearest row on or
+     * before that date stands in, and the balance itself when there is none.
+     */
+    private BigDecimal manualSnapshotInvested(Account account, BigDecimal balanceEur,
+                                              LocalDate date, boolean backdated) {
+        if (account.getType() == AccountType.LOAN
+            || holdingRepository.findByAccount_Id(account.getId()).isEmpty()) {
+            return balanceEur;
+        }
+        if (!backdated) {
+            return calculateInvestedAmount(account);
+        }
+        return snapshotRepository.findFirstByAccountIdAndDateLessThanEqualOrderByDateDesc(account.getId(), date)
+            .map(BalanceSnapshot::getInvestedAmount)
+            .orElse(balanceEur);
+    }
+
+    // Read paths guard with requireReadable, not getOrThrow: a co-owner reads a co-owned account
+    // and counts their part (ownership ADR, rule 4). getOrThrow matches the administrative
+    // owner only, which 404'd the loan view and the balance history of a co-owned mortgage for
+    // the very member it was shared with.
+
     public List<BalanceSnapshot> getHistory(Long accountId, Long memberId, LocalDate from, LocalDate to) {
-        getOrThrow(accountId, memberId); // validate account exists
+        accessResolver.requireReadable(accountId, memberId);
         LocalDate effectiveTo = to != null ? to : LocalDate.now();
         LocalDate effectiveFrom = from != null ? from : effectiveTo.minusMonths(12);
         return snapshotRepository.findByAccountIdAndDateBetweenOrderByDateAsc(accountId, effectiveFrom, effectiveTo);
     }
 
     public List<HoldingResponse> getHoldings(Long accountId, Long memberId) {
-        Account account = getOrThrow(accountId, memberId); // validate account exists
+        Account account = accessResolver.requireReadable(accountId, memberId);
         List<AccountHolding> holdings = holdingRepository.findByAccountIdOrderByCurrentPriceDesc(accountId);
         Map<String, PriceService.Quote> quotes = quotesFor(account, holdings);
         return holdings.stream()
@@ -264,7 +361,7 @@ public class AccountService {
     }
 
     public List<TransactionResponse> getTransactions(Long accountId, Long memberId) {
-        getOrThrow(accountId, memberId); // validate account exists
+        accessResolver.requireReadable(accountId, memberId);
         return transactionRepository.findByAccountIdOrderByDateDesc(accountId).stream()
             .map(TransactionResponse::from)
             .toList();
@@ -320,9 +417,10 @@ public class AccountService {
     // ─── Package-private helpers used by other services ──────────────────────
 
     /**
-     * Calculate the invested amount (cost basis) for an account.
+     * Calculate the invested amount (cost basis) for an account, in EUR.
      * For accounts with holdings: SUM(quantity × averageBuyIn), excluding assets that could
-     * not be valued at all. For cash accounts: same as the current balance.
+     * not be valued at all. For cash accounts and loans: the EUR value itself, so their P&L
+     * is zero whatever currency or ticker the balance is kept in.
      */
     public BigDecimal calculateInvestedAmount(Account account) {
         return valuation(account).investedEur();
@@ -418,19 +516,28 @@ public class AccountService {
      * render</em>, which is how a brief rate-limit sustains itself.
      */
     public Valuation valuation(Account account) {
+        // No holdings, no cost distinct from the value: the cost basis IS the EUR value, so the
+        // P&L is zero by construction. Returning the raw stored balance instead — a USD amount,
+        // a BTC quantity — paired an EUR value with a native cost and stamped a permanent
+        // phantom P&L into every daily snapshot of a foreign-currency or single-asset account.
         if (account.getType() == AccountType.LOAN) {
             BigDecimal outstanding = debtRepository.findByAccountId(account.getId())
+                // A Debt row saved without both dates (only the principal is required — the
+                // form is how a loan gets its lender name or its linked property) yields a
+                // schedule of zero installments, whose "remaining" is the full principal. That
+                // must not replace an outstanding balance the user entered or a sync reported.
+                .filter(AccountService::hasSchedule)
                 .map(debt -> loanAmortizationService.computeRemainingBalance(debt, LocalDate.now()))
                 .orElseGet(() -> priceService.toEur(
                     account.getCurrentBalance(), account.getCurrency(), account.getTicker()));
-            return new Valuation(outstanding, account.getCurrentBalance(), true, true, false);
+            return new Valuation(outstanding, outstanding, true, true, false);
         }
 
         List<AccountHolding> holdings = holdingRepository.findByAccount_Id(account.getId());
         if (holdings.isEmpty()) {
             BigDecimal cash = priceService.toEur(
                 account.getCurrentBalance(), account.getCurrency(), account.getTicker());
-            return new Valuation(cash, account.getCurrentBalance(), true, true, false);
+            return new Valuation(cash, cash, true, true, false);
         }
 
         Map<String, PriceService.Quote> quotes = quotesFor(account, holdings);
@@ -541,6 +648,16 @@ public class AccountService {
             anyHoldingPriced = true;
         }
         return new Valuation(liveValue, invested, allHoldingsPriced, anyHoldingPriced, anyStale);
+    }
+
+    /**
+     * Whether the Debt row can produce an amortization schedule at all — the same test
+     * {@code LoanAmortizationService.computeTotalInstallments} applies. Without both dates the
+     * schedule is empty and the "remaining balance" it reports is the untouched principal.
+     */
+    private static boolean hasSchedule(Debt debt) {
+        return debt.getStartDate() != null && debt.getEndDate() != null
+            && debt.getEndDate().isAfter(debt.getStartDate());
     }
 
     /**
@@ -790,7 +907,7 @@ public class AccountService {
     }
 
     public LoanAmortizationService.LoanScheduleResponse getLoanSummary(Long accountId, Long memberId) {
-        Account account = getOrThrow(accountId, memberId);
+        Account account = accessResolver.requireReadable(accountId, memberId);
         if (account.getType() != AccountType.LOAN) {
             throw new IllegalArgumentException("Account is not a loan");
         }

@@ -1,6 +1,6 @@
 # Feature: Bank Sync
 
-> Last updated: 2026-08-10 (sync-flow hardening: OAuth `state` correlation, reconnect path, visible errors — merged with the bank search country picker: `listCountries`, `GET /api/sync/countries`, `DEFAULT_COUNTRY`; on top of PSU types, 2026-08-01)
+> Last updated: 2026-09-06 (sync never changes an account's type — no `detectType()` exists; previously 2026-08-10: sync-flow hardening: OAuth `state` correlation, reconnect path, visible errors — merged with the bank search country picker: `listCountries`, `GET /api/sync/countries`, `DEFAULT_COUNTRY`; on top of PSU types, 2026-08-01)
 
 > **Status (1.0.0).** Enable Banking is the only enabled provider. The Powens
 > adapter ships in the codebase but is **experimental and untested** —
@@ -129,7 +129,7 @@ SyncController.complete() --> SyncService.completeConnection()
         |               BankConnectorPort.fetchBalances(session_id)
         |                         |
         |                         v
-        |               upsertAccount() with detectType()
+        |               upsertAccount() (new accounts: CHECKING, see known gap)
         |                         |
         |                         v
         |               AccountService.upsertSnapshot()
@@ -189,7 +189,7 @@ Because the text fields (Application ID + Redirect URI) live in Postgres while t
 - **OAuth `state` correlation**: each initiation stores a random single-use nonce on the requisition; the callback resolves the requisition by it (member derived from the row — this is what makes admin-impersonated connections complete correctly). See [ADR 2026-07-08](../decisions/2026-07-08-oauth-state-requisition-correlation.md).
 - **Session identifiers stay out of logs**: Enable Banking session ids are opaque references that still identify a long-lived PSD2 consent. Use the internal requisition id and institution name for log correlation; never print the raw session id.
 - **One bank-status query key**: bank-sync feature hooks own `syncKeys.banks()`, and every complete/retry/reconnect/delete mutation invalidates it. Components must use those hooks rather than introducing a parallel key such as `['sync', 'connections']`, or another sync surface can remain stale until its polling interval elapses.
-- **Type upgrade on resync**: If the user has not customized an account's type, `upsertAccount()` will upgrade it from CHECKING to the detected type on the next sync. Manual user changes are preserved (only CHECKING is auto-upgraded).
+- **Sync never changes an account's type**: `upsertAccount()` creates every Enable Banking account as `CHECKING` and its update path only refreshes the balance, `lastSyncedAt`, logo and requisition link — `type` is never read or written by sync. A Livret A or PEA synced through Enable Banking keeps whatever type the user set by hand; there is no auto-upgrade on resync (see the *Known gap* under "Account type detection" for the intended detection).
 - **Both providers are optional**: The app starts fine without either. No `BankConnectorPort` bean is required at startup.
 - **A business bank in the list can still fail at authorization**: Enable Banking
   lets an ASPSP declare `required_psu_headers` that must accompany `/auth`.

@@ -127,7 +127,7 @@ sets a new password. The current `passwordHash` is **not** cleared — the old
 credential keeps working until the user actually completes the reset, so a
 mistakenly-issued reset link does not lock anyone out. Distinct from
 `POST /members/{id}/activate`, which deliberately rejects already-activated
-users (`FamilyService.generateActivationToken` line 92).
+users (`FamilyService.generateActivationToken`).
 
 `FamilyMemberResponse` now exposes `loginName` (= `AppUser.username` or `null`)
 so the admin UI can show both the display name and the login side-by-side.
@@ -170,8 +170,9 @@ persist a member + linked `AppUser`, flush, and assert `deleteMember` succeeds �
 reproducing `TransientObjectException` on the pre-fix code. That isn't feasible
 here: the schema is PostgreSQL-specific (`TIMESTAMPTZ`, native enum types, Flyway
 `ON DELETE CASCADE`) and does not replay on the H2 in-memory database used for
-tests, and the project deliberately avoids Testcontainers (see
-`docs/conventions/testing.md`) — every test is a Mockito unit test. The regression
+tests, and Testcontainers is reserved for data-mutating migrations, the schema↔entity
+check and ORM behaviour a mock cannot show (see `docs/conventions/testing.md`) — a
+flush-ordering guard does not justify a container. The regression
 is therefore guarded by `FamilyServiceTest.deleteMember_withLogin_deletesUserBeforeMember`,
 which uses Mockito `InOrder` to assert `userRepository.delete(user)` is invoked
 **before** `memberRepository.delete(member)`. It cannot reproduce the flush

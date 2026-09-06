@@ -37,10 +37,16 @@ Bucket4j (`io.github.bucket4j`) enforces rate limits, keyed by IP for anonymous 
 | `POST /api/auth/mfa/enroll/init`              | 10 / IP / 1 h                               |
 | `POST /api/auth/change-password`, `/api/auth/mfa/disable`, `/api/auth/mfa/recovery-codes/regenerate` | 5 / user / 15 min (step-up password checks) |
 | `POST /api/sync/initiate`                     | Throttled                                   |
-| `POST /api/tr/auth/initiate`                  | Throttled                                   |
+| `GET /api/sync/institutions`                  | 60 / IP / min — typeahead budget on its own `ip:institutions` bucket (uncached provider fetch, but the search box fires per keystroke) |
+| `POST /api/tr/auth/initiate`                  | 3 / IP / 10 min (each attempt sends an SMS) |
+| `POST /api/tr/auth/complete`                  | 5 / IP / 15 min on its own bucket (anti-bruteforce on the 4-digit TAN; sharing the SMS budget would lock a member out mid-login) |
 | `POST /api/bourse-direct/auth/initiate`, `/complete` | Throttled                            |
 | `POST /api/degiro/auth/initiate`, `/complete` | Throttled (anti-bruteforce on 6-digit code) |
-| `GET /api/me/export`                          | Throttled (GDPR export)                     |
+| `POST /api/amundi/auth/initiate`, `/complete` | Throttled                                   |
+| `POST /api/finary/check-totp`, `/api-sync/preview`, `/api-sync/auto` | 5 / IP / 15 min — each runs a full Clerk sign-in with the stored credentials |
+| Sync and upload entry points (`/api/tr/sync`, `/api/tr/import`, `/api/degiro/sync`, `/api/bourse-direct/sync`, `/api/amundi/sync`, `/api/bourso/sync`, `/api/finary/preview`, `/api/accounts/{id}/transactions/import`) | 10 / IP / min, shared `syncBuckets` |
+| `POST /api/ibkr/sync`                         | 6 / IP / min                                |
+| `POST /api/me/export`                         | 5 / user / h (GDPR export)                  |
 
 When a limit is exceeded, the controller returns a 429 ProblemDetail directly (not via the exception handler).
 

@@ -78,6 +78,14 @@ IDLE -> QUEUED -> RUNNING -> SUCCESS
                          -> FAILED
 ```
 
+`POST /sync` is throttled on the shared per-IP `syncBuckets` (10/minute), like
+every other sync entry point: queueing takes a row lock, decrypts the stored
+session and can hand a browser-backed job to the sidecar, and while `queueSync`
+refuses to stack jobs, nothing otherwise stops a caller re-queueing the moment
+each one finishes. It draws on a different budget from `/auth/initiate` and
+`/auth/complete`, so exhausting one never locks the member out of the other.
+Past the budget the controller answers 429 with a ProblemDetail.
+
 Only one job can be queued or running for a member. A job carries the database
 session ID that created it; a cleared or replaced session prevents that old job
 from committing. Jobs interrupted by a backend restart are marked `FAILED` on

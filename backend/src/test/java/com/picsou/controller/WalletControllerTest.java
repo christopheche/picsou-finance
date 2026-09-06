@@ -46,6 +46,39 @@ class WalletControllerTest {
 
     @InjectMocks WalletController controller;
 
+    private static final jakarta.validation.Validator VALIDATOR =
+        jakarta.validation.Validation.buildDefaultValidatorFactory().getValidator();
+
+    /**
+     * {@code wallet_address.label} is VARCHAR(100). {@code WalletSyncService} guards the address
+     * length explicitly ("so a pasted seed phrase ... reaches the insert and comes back as a
+     * 500") but nothing guarded the label, so a long one hit the insert and rolled back the
+     * on-chain sync that had already run.
+     */
+    @Test
+    void addWalletRequest_labelLongerThanColumn_isRejected() {
+        var violations = VALIDATOR.validate(
+            new WalletController.AddWalletRequest(Chain.BITCOIN, "bc1qexample", "x".repeat(101)));
+
+        assertThat(violations).singleElement()
+            .extracting(v -> v.getPropertyPath().toString()).isEqualTo("label");
+    }
+
+    @Test
+    void addWalletRequest_missingChain_isRejected() {
+        var violations = VALIDATOR.validate(
+            new WalletController.AddWalletRequest(null, "bc1qexample", null));
+
+        assertThat(violations).singleElement()
+            .extracting(v -> v.getPropertyPath().toString()).isEqualTo("chain");
+    }
+
+    @Test
+    void addWalletRequest_realisticPayload_passes() {
+        assertThat(VALIDATOR.validate(
+            new WalletController.AddWalletRequest(Chain.EVM, "0xabc", "Ledger"))).isEmpty();
+    }
+
     @Test
     void addWallet_forwardsRequestFieldsAndTheResolvedMemberId() {
         when(userContext.currentMemberId()).thenReturn(MEMBER_ID);

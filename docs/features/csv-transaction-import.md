@@ -74,7 +74,9 @@ execute(token, mapping, dialect) ─► re-parse ─► map rows ─► saveAll(
   investment accounts are rejected before preview data is cached or transactions are saved, so a
   CSV cannot replace provider-owned positions.
 - Multipart limit was raised to **10 MB** (`application.yml`) for multi-year histories; the endpoint
-  is member-scoped and throttled.
+  is member-scoped and throttled. Both nginx configs (`docker/nginx.conf`, `frontend/nginx.conf`)
+  set `client_max_body_size 10m` on `/api` to match — nginx's 1 MB default would otherwise answer
+  an HTML 413 before the upload reaches the backend.
 - Demo mode returns `{}` for unhandled endpoints — UI consumers must guard accordingly.
 
 ## Tests

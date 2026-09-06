@@ -1,15 +1,18 @@
-# Dev-only Dockerfile — runs Vite dev server with HMR
-# Used automatically via docker-compose.override.yml
-FROM node:20-alpine
+# Dev-only Dockerfile — runs the Vite dev server with HMR.
+# Not wired into any compose file: opt in with a (gitignored)
+# docker-compose.override.yml that sets
+#   services.frontend.build.dockerfile: Dockerfile.dev
+# Same toolchain as the production image: bun + bun.lock.
+FROM oven/bun:1-alpine
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm install --quiet
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY . .
 
 EXPOSE 8080
 
 # Vite dev server — proxies /api/* to backend, HMR on websocket
-CMD ["npx", "vite", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["bunx", "vite", "--host", "0.0.0.0", "--port", "8080"]

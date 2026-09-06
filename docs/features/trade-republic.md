@@ -93,7 +93,7 @@ it rejected using the untagged `current_price` column as a fallback.
 
 ### Scheduled sync
 
-`SchedulerService.dailyBankSync()` calls `TradeRepublicSyncService.resyncIfSessionActive()`, which is a no-op if no session exists. An expired session token is not a reason to skip: the sync attempts the stored refresh token first (the daily 08:00 run is always past the 2 h token window, so the refresh path IS the scheduled-sync path).
+`SchedulerService.dailyBankSync()` calls `TradeRepublicSyncService.resyncIfSessionActive()`, which is a no-op if no session exists. An expired session token is not a reason to skip: the sync attempts the stored refresh token first (the daily 08:00 run is always past the 2 h token window, so the refresh path IS the scheduled-sync path). The call site wraps it in a try/catch like IBKR's: `resyncIfSessionActive` swallows sync failures itself, but the service is class-level `@Transactional`, so a repository failure inside the sync (the `account_holding (account_id, ticker)` unique violation, say) marks the transaction rollback-only through the repository's proxy and the commit at the proxy exit throws `UnexpectedRollbackException` after the internal catch. Without the wrapper that aborted every remaining connector of the member and every remaining member (`SchedulerServiceTest.dailyBankSync_connectorFailureDoesNotStopOtherConnectorsOrMembers`).
 
 ### Key files
 
@@ -225,6 +225,7 @@ Both compose files (`docker-compose.yml` at repo root and `docker/docker-compose
 - `TradeRepublicSyncServiceTest#sync_mergesDuplicateTickersWithVwap` -- wiring test: two ISINs → same ticker → VWAP-merged `averageBuyIn` persisted
 - `TradeRepublicSyncServiceTest#sync_deletesOldHoldingsWhenPortfolioReturnsEmpty` -- regression test: an authoritative empty WebSocket portfolio clears previous holdings
 - `frontend/src/pages/sync/TradeRepublicTab.test.tsx` and `frontend/src/components/shared/AddAccountModal.test.tsx` -- frontend regression tests for initiation failure staying on phone/PIN and TAN completion failure staying on the verification-code step
+- `services/tr-auth/test_main.py` -- sidecar helpers (phone normalisation/masking, TR headers, cookie parsing) and the `/initiate`, `/complete`, `/refresh`, `/health` contract with Trade Republic stubbed through `httpx.MockTransport` and the WAF-token fetch replaced; run by the `tr-sidecar` CI job inside the built image
 - Manual integration testing against real TR accounts (auth flow, session refresh, CSV import)
 
 ## Links

@@ -17,8 +17,8 @@ JWT authentication via **HttpOnly cookies with `SameSite=Lax`** — no Authoriza
 | ------------------- | ------------------------- | ----------------------------------------------------------------------------- |
 | `access_token`      | 15 minutes                | Authenticates requests; carries `uid`, `role`, `tv` (token-version) claims    |
 | `refresh_token`     | 7 days                    | Rotated on every use via `POST /api/auth/refresh`                             |
-| `mfa_challenge`     | 5 minutes                 | Issued after correct password when 2FA is required; consumed by `/api/mfa/verify` |
-| `persistent_token`  | 30 days (configurable)    | Opaque rotating "Remember Me" token; silent re-login via `PersistentTokenAuthFilter` |
+| `mfa_challenge_token` | 5 minutes               | Issued after correct password when 2FA is required; consumed by `POST /api/auth/mfa/verify` |
+| `persistent_token`  | 90 days (configurable)    | Opaque rotating "Remember Me" token; silent re-login via `PersistentTokenAuthFilter` |
 
 - `JwtAuthenticationFilter` reads `access_token` and populates the `SecurityContext`. It also verifies the `tv` claim against `AppUser.tokenVersion` so a password change immediately invalidates outstanding tokens.
 - `PersistentTokenAuthFilter` re-issues a fresh access token from a valid `persistent_token` and rotates the persistent token on every use (theft detection: a re-used old token revokes the family).
@@ -28,12 +28,14 @@ JWT authentication via **HttpOnly cookies with `SameSite=Lax`** — no Authoriza
 
 ### Rate limiting
 
-Bucket4j (`io.github.bucket4j`) enforces per-IP rate limits. Buckets are created in `RateLimitConfig` and consumed in controller methods.
+Bucket4j (`io.github.bucket4j`) enforces rate limits, keyed by IP for anonymous endpoints and by user/member id for authenticated ones. Buckets are created in `RateLimitConfig` and consumed in controller methods.
 
 | Endpoint group                                | Limit                                       |
 | --------------------------------------------- | ------------------------------------------- |
 | `POST /api/auth/login`                        | 5 requests / IP / 15 min                    |
-| `POST /api/mfa/verify`, `/api/mfa/challenge`  | Throttled (anti-bruteforce on 6-digit code) |
+| `POST /api/auth/mfa/verify`                   | 5 / 15 min per account (the challenge's `uid`) — anti-bruteforce on the 6-digit code |
+| `POST /api/auth/mfa/enroll/init`              | 10 / IP / 1 h                               |
+| `POST /api/auth/change-password`, `/api/auth/mfa/disable`, `/api/auth/mfa/recovery-codes/regenerate` | 5 / user / 15 min (step-up password checks) |
 | `POST /api/sync/initiate`                     | Throttled                                   |
 | `POST /api/tr/auth/initiate`                  | Throttled                                   |
 | `POST /api/bourse-direct/auth/initiate`, `/complete` | Throttled                            |

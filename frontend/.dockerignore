@@ -1,0 +1,13 @@
+# Build context for frontend/Dockerfile and frontend/Dockerfile.dev.
+# Keeps host-only state out of the image: dependencies are installed from
+# bun.lock inside the build, and Vite would otherwise inline a developer's
+# local .env* (VITE_* values) into the production bundle.
+node_modules/
+dist/
+.vite/
+.local/
+.env
+.env.*
+e2e/
+test-results/
+playwright-report/

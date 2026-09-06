@@ -13,11 +13,14 @@ with a guided, web-based flow the first time the app is opened.
 
 The bootstrap runs on two levels.
 
-- **Invisible (Docker entrypoint)** auto-generates `JWT_SECRET`, `CRYPTO_ENCRYPTION_KEY`,
-  `POSTGRES_PASSWORD` into `/data/.secrets/` when the corresponding env vars are unset.
-  This happens before `supervisord` starts Spring, because those three secrets are
-  consumed by bean constructors (`JwtUtil`, `CryptoEncryption`) and by Flyway before any
-  DB-backed config is available.
+- **Invisible (Docker entrypoint)** auto-generates `JWT_SECRET` and `CRYPTO_ENCRYPTION_KEY`
+  into `/data/.secrets/` when the corresponding env vars are unset. This happens before
+  `supervisord` starts Spring, because those secrets are consumed by bean constructors
+  (`JwtUtil`, `CryptoEncryption`) before any DB-backed config is available. The database
+  password is *not* generated there: Postgres initialises its role from the db service's own
+  `POSTGRES_PASSWORD` before the app starts, so `docker/docker-compose.yml` derives
+  `SPRING_DATASOURCE_PASSWORD` from the same `${POSTGRES_PASSWORD:-picsou}` expression
+  (see [docker-deployment.md](./docker-deployment.md)).
 - **Visible (web wizard)** is served at `/setup` while `setup.state != COMPLETE`. It
   walks the user through: admin account → CORS & secure cookies → integration picker →
   per-integration sub-flows → Done (with confetti + auto-login).
@@ -78,7 +81,7 @@ Frontend:
 First boot
     │
     ▼
-docker entrypoint.sh  ──► writes /data/.secrets/{jwt_secret,crypto_key,postgres_password}
+docker entrypoint.sh  ──► writes /data/.secrets/{jwt_secret,crypto_key}
                               (only if env vars unset — idempotent)
     │
     ▼

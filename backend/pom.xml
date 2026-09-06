@@ -153,11 +153,13 @@
             <artifactId>spring-boot-starter-webflux</artifactId>
         </dependency>
 
-        <!-- Apache POI - Excel file parsing -->
+        <!-- Apache POI - Excel file parsing (user-uploaded XLSX).
+             5.4.1+ required: 5.4.0 is affected by CVE-2025-31672 (duplicate
+             OOXML zip entry names parsed inconsistently). -->
         <dependency>
             <groupId>org.apache.poi</groupId>
             <artifactId>poi-ooxml</artifactId>
-            <version>5.4.0</version>
+            <version>5.4.1</version>
         </dependency>
 
         <!-- Lombok -->

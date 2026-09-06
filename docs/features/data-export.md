@@ -206,20 +206,12 @@ Frontend:
 Backend:
 
 - `CsvWriterTest` — RFC 4180 quoting, BOM, and formula-injection neutralisation (`=`/`@`/tab/CR, signed formulas vs signed plain numbers).
-- `*ExporterTest` (one per `EntityExporter`) — fixtures → expected JSON node + CSV rows. Each includes a *negative* assertion: the produced bytes do not contain known-secret tokens.
 - `DataExportServiceTest` — verifies ZIP file list given options, presence/absence of `balance_snapshots.csv` based on toggle, presence of `README.txt`. Wires **all** `EntityExporter` beans (matching production Spring injection, not a subset) with one fixture per entity carrying a unique tripwire literal in every sensitive, non-exported field (e.g. `Requisition.authLink`); asserts none of the tripwires appear anywhere in the archive bytes. **New exporter ⇒ new wiring + new tripwire(s) in this test** — the net only protects what it exercises, and a partial exporter list (as this test shipped with for a while) silently blinds it to whichever exporters are missing.
 - `BalanceSnapshotsExporterTest` — drives the exporter directly (2 accounts × 3 snapshots): asserts CSV/JSON row order (account, then date) and, via `Mockito.verify`, exactly one `balanceSnapshotRepository.findByAccountIdOrderByDateAsc` call per account per pass (2 passes) — never a whole-member collecting call.
-- `MeExportControllerTest` (`@WebMvcTest`) — happy path, re-auth fail (password), re-auth fail (TOTP), missing body, rate-limit exceeded.
-- `DataExportIntegrationTest` (`@SpringBootTest` + H2) — seed an `AppUser` with **all** entity types populated **and** every secret-bearing entity (MFA secret, recovery codes, BoursoSession ciphertext, requisition tokens, persistent session). Hit the endpoint, parse the ZIP in memory, assert:
-  - all expected files present
-  - row counts match seeded entity counts
-  - **raw byte grep**: no occurrence of the seeded `passwordHash`, MFA secret bytes, requisition token bytes, BoursoSession ciphertext bytes, persistent-session token hash bytes
-  - This is the principal GDPR safety net.
+- `MeExportControllerTest` (pure Mockito, per `docs/conventions/testing.md`) — the step-up gate: a failed re-auth (`ReAuthFailedException` → 401 via `GlobalExceptionHandler`) propagates **before** the streaming body is built, so `DataExportService` is never touched; a drained per-user bucket returns 429 without consulting `ReAuthService`; the rate limit is consumed before re-auth so guessing a password/TOTP costs a slot; the happy path streams the authenticated `AppUser` with the requested `ExportContext` and sets `Content-Disposition: attachment; filename="picsou-export-<username>-<UTC stamp>.zip"`.
+- There is **no** end-to-end `@SpringBootTest` seeding every entity and grepping the ZIP bytes: `DataExportServiceTest`'s tripwire net (above) is the GDPR safety net, and per-exporter unit tests exist only for `BalanceSnapshotsExporter`. A new exporter is covered by adding its wiring and tripwire literal to `DataExportServiceTest`.
 
-Frontend:
-
-- `ExportDataDialog.test.tsx` — renders TOTP field if `user.mfaEnabled`, else password; submit calls API with right payload; shows loading state; surfaces 401/429 via `extractErrorMessage`.
-- `useExportData.test.ts` — mutation triggers blob download via `<a download>` (DOM stub).
+Frontend: no unit test yet for `ExportDataDialog` (`frontend/src/pages/settings/security/ExportDataDialog.tsx`); the dialog is exercised manually (TOTP vs password field, 401/429 surfaced through `extractErrorMessage`, blob download).
 
 ## Documentation
 

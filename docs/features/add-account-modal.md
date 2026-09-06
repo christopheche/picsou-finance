@@ -1,6 +1,6 @@
 # Feature: Add Account Modal
 
-> Last updated: 2026-09-03
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -12,6 +12,11 @@ The `AddAccountModal` is a state-machine dialog with two levels:
 
 1. **Selector screen** — buttons in a grid (Banks, Exchanges, Wallets, Trade Republic, BoursoBank, Bourse Direct, DEGIRO, Interactive Brokers, Amundi, Finary, Property, Manual). Each sync button enters its wizard or panel; the Manual button opens the existing `AccountForm` in a separate dialog.
 2. **Wizard screens** — Each sync type has its own compact wizard with a back button. Each wizard manages its own loading and error state inline.
+
+The `step` resets to the selector when the dialog **closes** (`handleDialogChange(false)`), not
+when it opens: `AccountsPage` opens the modal by flipping the `open` prop, and Radix never calls
+`onOpenChange(true)` for that, so a reset-on-open never ran and Escape from a wizard used to
+reopen the dialog straight onto that wizard.
 
 ### Key files
 
@@ -44,7 +49,21 @@ AccountsPage → "Add account" button
 
 ### Error handling
 
-Each wizard owns its error state as a local `useState<string | null>`. On mutation failure, the backend `detail` field is extracted (falling back to `err.message`, then a translated i18n key). Errors are shown in a dismissible red banner inside the wizard, and cleared on the next attempt.
+Each wizard owns its error state as a local `useState<string | null>`. Errors are shown in a dismissible red banner inside the wizard, and cleared on the next attempt.
+
+The Finary wizard formats every failure (login, TOTP check, API preview, file preview, execute)
+through a local `formatFinaryError(err, fallbackKey)`: a 502 becomes
+`sync.finary.serviceUnavailable`, everything else goes through `formatApiError` with a
+step-specific fallback (`sync.finary.authFailed` for login, `sync.finary.syncFailed` for the API
+path, `sync.finary.importFailed` for the file path). It never renders `err.message` (axios
+boilerplate) and never uses the `common.retry` button label as a message. A login failure is
+shown too — it used to only stop the spinner. The bank, exchange and wallet wizards still read
+the backend `detail` first and fall back to a translated key.
+
+The Finary API path passes `apiSync: true` explicitly to `executeWithMappings` from the preview
+callback: the `isApiSync` state it sets in the same tick is not visible to that closure yet, and
+reading it sent the API `syncToken` to `POST /finary/import`, whose cache had never seen it.
+`FinaryTab` (`pages/sync/FinaryTab.tsx`) carries the same closure and is not fixed here.
 
 The Trade Republic wizard follows the same state rules as the dedicated Sync
 page: initiation errors keep the phone/PIN form visible and clear any stale
@@ -77,6 +96,29 @@ Validation is layered:
 
 This closed issue #9: a free-text code like `AMAT` used to throw a `RangeError` from
 `Intl.NumberFormat`, bubble to the root `ErrorBoundary`, and make the account unreachable/undeletable.
+
+### Manual form (`AccountForm`)
+
+`AccountForm` is a Dialog shell around `AccountFormBody`, which is mounted only while `open`
+(the key-remount pattern from `docs/conventions/frontend.md`): the fields seed from
+`defaultValues` once, on mount, with no reset-on-open effect. A parent re-render with a fresh
+`defaultValues` object no longer resets the form under the user.
+
+- **Validation is visible.** The zod schema stores i18n keys as its messages
+  (`common.validation.required` / `tooLong` / `invalidNumber` / `nonNegative` / `percentage`)
+  and the body renders `formState.errors` under each field with `aria-invalid`. A negative
+  balance, a lone `-` in a `NumericInput` (NaN) or an over-long name now say why Save did nothing.
+- **A rejected `onSubmit` is shown.** `handleFormSubmit` awaits `onSubmit` and renders
+  `formatApiError(err, t)` above the footer (`role="alert"`); the dialog stays open. Callers
+  should let the mutation reject rather than swallow it.
+- **Properties and loans are submitted as manual.** The checkbox is hidden for `REAL_ESTATE`
+  and `LOAN`, so `handleFormSubmit` sets `isManual: true` for them. The previous
+  `<input type="hidden" value="true">` was a no-op: react-hook-form submits its own values, not
+  the DOM's.
+- **Loan create is two requests.** `AddAccountModal.handleManualSubmit` creates the account, then
+  saves the debt metadata. It keeps `createdAccountId` in state so a retry after the second
+  request failed reuses the account instead of creating a twin (the guard `AddPropertyModal`
+  already had); the id is cleared on success and when the form closes.
 
 ### Bank field (manual form)
 
@@ -135,7 +177,8 @@ four locales, and the partial maps are gone.
 
 - `frontend/src/lib/utils.test.ts` — `formatCurrency` regression case: an invalid code does not throw
   and the raw code appears in the output (issue #9).
-- `frontend/src/components/shared/AddAccountModal.test.tsx` — Trade Republic wizard regression cases; Bourse Direct, Amundi, and IBKR wizard flow tests (mock panel → `onOpenChange(false)`).
+- `frontend/src/components/shared/AddAccountModal.test.tsx` — Trade Republic wizard regression cases; Bourse Direct, Amundi, and IBKR wizard flow tests (mock panel → `onOpenChange(false)`); Finary wizard (auto-mapped API sync hits the API endpoint, login 422/502 and preview 500 messages); dismissing a wizard returns to the selector; manual loan retry reuses the created account.
+- `frontend/src/components/shared/AccountForm.test.tsx` — bank field submission; visible zod errors (negative balance, empty name) with no submit; a rejected `onSubmit` rendered as an alert; a loan submitted with `isManual: true`; seeding from `defaultValues` on open without losing edits on re-render.
 - `backend/src/test/java/com/picsou/validation/CurrencyValidatorTest.java` — accepts valid ISO 4217
   codes, rejects unknown ones, leaves null/blank to `@NotBlank`.
 

@@ -13,6 +13,15 @@ const { initiateTrAuth, completeTrAuth, addCryptoExchange } = vi.hoisted(() => (
   addCryptoExchange: vi.fn(),
 }))
 
+const { finaryLogin, previewFinaryApi, importFinary, executeFinaryApiSync, finaryStatus } = vi.hoisted(() => ({
+  finaryLogin: vi.fn(),
+  previewFinaryApi: vi.fn(),
+  importFinary: vi.fn(),
+  executeFinaryApiSync: vi.fn(),
+  /** Mutable so a test can open the wizard on the "connected" branch. */
+  finaryStatus: { current: { connected: false } as { connected: boolean; maskedEmail?: string } },
+}))
+
 /** Mutable so each test can seed the institution list the BankWizard renders. */
 const { institutionSearch } = vi.hoisted(() => ({
   institutionSearch: {
@@ -33,12 +42,12 @@ vi.mock('@/features/sync/hooks', () => ({
   useCompleteTrAuth: () => ({ mutate: completeTrAuth, isPending: false }),
   useAddCryptoExchange: () => ({ mutate: addCryptoExchange, isPending: false }),
   useAddCryptoWallet: () => ({ mutate: vi.fn(), isPending: false }),
-  useFinaryConnectionStatus: () => ({ data: { connected: false } }),
-  useFinaryLogin: () => ({ mutate: vi.fn(), isPending: false }),
+  useFinaryConnectionStatus: () => ({ data: finaryStatus.current }),
+  useFinaryLogin: () => ({ mutate: finaryLogin, isPending: false }),
   usePreviewFinaryFile: () => ({ mutate: vi.fn(), isPending: false }),
-  usePreviewFinaryApi: () => ({ mutate: vi.fn(), isPending: false }),
-  useImportFinary: () => ({ mutate: vi.fn(), isPending: false }),
-  useExecuteFinaryApiSync: () => ({ mutate: vi.fn(), isPending: false }),
+  usePreviewFinaryApi: () => ({ mutate: previewFinaryApi, isPending: false }),
+  useImportFinary: () => ({ mutate: importFinary, isPending: false }),
+  useExecuteFinaryApiSync: () => ({ mutate: executeFinaryApiSync, isPending: false }),
   useCheckFinaryTotp: () => ({ mutate: vi.fn(), isPending: false }),
 }))
 
@@ -66,6 +75,12 @@ vi.mock('@/components/sync/IbkrPanel', () => ({
   ),
 }))
 
+// jsdom lacks matchMedia, which DateInput (loan dates) probes for the touch/native date picker.
+vi.stubGlobal('matchMedia', (query: string) => ({
+  matches: false, media: query, onchange: null,
+  addEventListener: () => {}, removeEventListener: () => {},
+  addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
+}))
 vi.stubGlobal('ResizeObserver', class {
   observe() {}
   unobserve() {}
@@ -285,5 +300,149 @@ describe('AddAccountModal IBKR wizard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'ibkr-wizard' }))
 
     expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+})
+
+describe('AddAccountModal Finary wizard', () => {
+  beforeEach(() => {
+    finaryLogin.mockReset()
+    previewFinaryApi.mockReset()
+    importFinary.mockReset()
+    executeFinaryApiSync.mockReset()
+    finaryStatus.current = { connected: false }
+  })
+
+  function openFinaryWizard() {
+    render(<AddAccountModal open onOpenChange={vi.fn()} />)
+    fireEvent.click(screen.getByText('sync.finary.title'))
+  }
+
+  /**
+   * The preview's onSuccess set `isApiSync` and then executed in the same tick, so the closure
+   * still read the state as false and posted the API sync token to the file-import endpoint,
+   * whose cache has never seen it ("Preview expired or invalid").
+   */
+  it('executes an auto-mapped API sync through the API endpoint, not the file import', () => {
+    finaryStatus.current = { connected: true, maskedEmail: 'j***@example.com' }
+    const mappings = [{ finaryId: 'f1', finaryName: 'Livret', finaryCategory: 'Savings', action: 'MAP_EXISTING', targetAccountId: 7 }]
+    previewFinaryApi.mockImplementation((_totp, options: { onSuccess: (data: unknown) => void }) => {
+      options.onSuccess({
+        accounts: [], existingPicsouAccounts: [], totalTransactionCount: 0,
+        fileToken: 'api-token', autoMapped: true, suggestedMappings: mappings,
+      })
+    })
+    openFinaryWizard()
+
+    fireEvent.click(screen.getByRole('button', { name: 'sync.finary.sync' }))
+
+    expect(executeFinaryApiSync).toHaveBeenCalledWith(
+      { syncToken: 'api-token', mappings },
+      expect.any(Object),
+    )
+    expect(importFinary).not.toHaveBeenCalled()
+  })
+
+  it('shows the backend reason when the Finary login is rejected', async () => {
+    finaryLogin.mockImplementation((_creds, options: { onError: (error: unknown) => void }) => {
+      options.onError({
+        response: { status: 422, data: { detail: 'Finary sign-in failed. Please check your credentials and try again.' } },
+      })
+    })
+    openFinaryWizard()
+
+    fireEvent.change(screen.getByLabelText('sync.finary.email'), { target: { value: 'j@example.com' } })
+    fireEvent.change(screen.getByLabelText('sync.finary.password'), { target: { value: 'secret' } })
+    fireEvent.click(screen.getByRole('button', { name: 'sync.finary.login' }))
+
+    expect(await screen.findByText('Finary sign-in failed. Please check your credentials and try again.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'sync.finary.login' })).toBeEnabled()
+  })
+
+  it('names the Finary outage on a 502 instead of the generic server error', async () => {
+    finaryLogin.mockImplementation((_creds, options: { onError: (error: unknown) => void }) => {
+      options.onError({ response: { status: 502, data: { detail: 'Finary service is temporarily unavailable' } } })
+    })
+    openFinaryWizard()
+
+    fireEvent.change(screen.getByLabelText('sync.finary.email'), { target: { value: 'j@example.com' } })
+    fireEvent.change(screen.getByLabelText('sync.finary.password'), { target: { value: 'secret' } })
+    fireEvent.click(screen.getByRole('button', { name: 'sync.finary.login' }))
+
+    expect(await screen.findByText('sync.finary.serviceUnavailable')).toBeInTheDocument()
+  })
+
+  /** Axios' own message is boilerplate ("Request failed with status code 500"), never a banner. */
+  it('translates a 500 on preview rather than echoing the axios message', async () => {
+    finaryStatus.current = { connected: true }
+    previewFinaryApi.mockImplementation((_totp, options: { onError: (error: unknown) => void }) => {
+      const err = Object.assign(new Error('Request failed with status code 500'), { response: { status: 500, data: {} } })
+      options.onError(err)
+    })
+    openFinaryWizard()
+
+    fireEvent.click(screen.getByRole('button', { name: 'sync.finary.sync' }))
+
+    expect(await screen.findByText('common.errors.serverError')).toBeInTheDocument()
+    expect(screen.queryByText(/Request failed/)).not.toBeInTheDocument()
+    expect(screen.queryByText('common.retry')).not.toBeInTheDocument()
+  })
+})
+
+describe('AddAccountModal reopening', () => {
+  /**
+   * The parent opens this dialog by flipping `open`, for which Radix never calls onOpenChange,
+   * so a reset-on-open never ran: Escape from a wizard reopened the dialog on that wizard.
+   */
+  it('returns to the source selector when the dialog is dismissed from a wizard', () => {
+    const onOpenChange = vi.fn()
+    render(<AddAccountModal open onOpenChange={onOpenChange} />)
+    fireEvent.click(screen.getByText('sync.exchanges.title'))
+    expect(screen.getByLabelText('sync.exchanges.apiKey')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+    expect(screen.queryByLabelText('sync.exchanges.apiKey')).not.toBeInTheDocument()
+    expect(screen.getByText('addAccount.title')).toBeInTheDocument()
+    expect(screen.getByText('sync.exchanges.title')).toBeInTheDocument()
+  })
+})
+
+describe('AddAccountModal manual loan', () => {
+  beforeEach(() => {
+    createAccount.mockReset()
+    updateDebtMetadata.mockReset()
+    institutionSearch.current = { data: undefined, isError: false, isLoading: false, error: null }
+  })
+
+  function openManualForm() {
+    render(<AddAccountModal open onOpenChange={vi.fn()} />)
+    fireEvent.click(screen.getByText('addAccount.manual'))
+    fireEvent.change(screen.getByLabelText('accounts.accountName'), { target: { value: 'Prêt immo' } })
+    fireEvent.change(screen.getByLabelText('accounts.accountType'), { target: { value: 'LOAN' } })
+    fireEvent.change(screen.getByLabelText('debt.borrowedAmount'), { target: { value: '100000' } })
+  }
+
+  /**
+   * A loan is two requests: create the account, then save its debt metadata. When the second
+   * one failed the dialog used to stay open with no message, and Save again created a twin.
+   */
+  it('shows the failure and reuses the created account on retry', async () => {
+    createAccount.mockResolvedValue({ id: 42 })
+    updateDebtMetadata
+      .mockRejectedValueOnce({ response: { status: 500, data: {} } })
+      .mockResolvedValueOnce({})
+    openManualForm()
+
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('common.errors.serverError')
+    expect(screen.getByLabelText('accounts.accountName')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }))
+
+    await waitFor(() => expect(updateDebtMetadata).toHaveBeenCalledTimes(2))
+    expect(createAccount).toHaveBeenCalledTimes(1)
+    expect(updateDebtMetadata.mock.calls[1][0]).toMatchObject({ id: 42 })
+    await waitFor(() => expect(screen.queryByLabelText('accounts.accountName')).not.toBeInTheDocument())
   })
 })

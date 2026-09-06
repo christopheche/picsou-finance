@@ -16,7 +16,7 @@ The `TradeRepublicAdapter` delegates auth to the `tr-auth` Python microservice (
 2. **`POST /complete`** -- Sends processId + verification code (4-digit code in the current Trade Republic flow). Returns `sessionToken` + `refreshToken`.
 3. **`POST /refresh`** -- Sends refreshToken. Returns new sessionToken (+ possibly rotated refreshToken).
 
-Credentials (phone/PIN) are never stored -- they are used only for the `/initiate` call and discarded.
+Credentials (phone/PIN) are never stored -- they are used only for the `/initiate` call and discarded. The sidecar keeps no pending state between `/initiate` and `/complete` either: the `processId` round-trips through Java and Trade Republic validates it, and `/complete` always fetches a fresh WAF token. Request bodies are validated like the other sidecars' (`extra="forbid"`, bounded lengths); `processId` (`^[A-Za-z0-9._:-]{1,100}$`) and `tan` (`^\d{4,6}$`) are constrained **and** percent-encoded because they are interpolated into the TR path -- a malformed TAN is answered `400 VALIDATION_CODE_INVALID` (the code the adapter and frontend already map), anything else `400 INVALID_DATA`, before any browser or TR call.
 
 Frontend auth state deliberately separates initiation failures from verification
 failures:

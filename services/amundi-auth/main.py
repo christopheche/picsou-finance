@@ -48,8 +48,16 @@ TOKEN_HEADER = "x-noee-authorization"
 PENDING_TTL_SECONDS = 600
 PENDING_SWEEP_SECONDS = 30
 RESOURCE_CLOSE_TIMEOUT_SECONDS = 5
+# `AmundiAdapter.DEFAULT_AUTH_TIMEOUT`: /initiate must answer inside it, or Java
+# reports a plain wrong password as UPSTREAM_UNAVAILABLE and gives up while the
+# sidecar still holds a Chromium open.
+BACKEND_AUTH_TIMEOUT_SECONDS = 45
 # The espace épargnant is a slow SPA: give the dashboard time to fire its first
-# authenticated call, which is where the bearer is harvested from.
+# authenticated call, which is where the bearer is harvested from. This is the
+# whole budget after "Connexion" is clicked -- the second-factor poll below runs
+# inside it, not before it (see `_token_capture_budget`), because a rejected
+# password shows neither a prompt nor a bearer and would otherwise burn both
+# waits back to back.
 TOKEN_CAPTURE_TIMEOUT_SECONDS = 30
 MFA_PROMPT_TIMEOUT_SECONDS = 20
 LOGIN_FORM_TIMEOUT_SECONDS = 25
@@ -455,6 +463,16 @@ def _decode_session(raw: str) -> tuple[dict[str, Any], str]:
     return storage_state, token
 
 
+def _token_capture_budget() -> int:
+    """Seconds left for the bearer once the second-factor poll has run dry.
+
+    The poll already watches `collector.token`, so the two waits share one
+    deadline: a login that shows no prompt and no bearer is a rejected password
+    and must be reported inside the backend's auth timeout.
+    """
+    return max(1, TOKEN_CAPTURE_TIMEOUT_SECONDS - MFA_PROMPT_TIMEOUT_SECONDS)
+
+
 async def _capture_session(
     context: BrowserContext,
     collector: TokenCollector,
@@ -483,28 +501,38 @@ async def _new_browser(
     storage_state: dict[str, Any] | None = None,
 ) -> tuple[Browser, BrowserContext, TokenCollector]:
     await _acquire_browser_slot()
+    browser: Browser | None = None
     try:
         browser = await pw.chromium.launch(headless=True, args=LAUNCH_ARGS)
+        context = await browser.new_context(
+            locale="fr-FR",
+            timezone_id="Europe/Paris",
+            user_agent=USER_AGENT,
+            storage_state=storage_state,
+        )
+        # Images are left alone -- the login flow was verified with them loading,
+        # and the saving is not worth re-validating for. Fonts and media are dead
+        # weight either way.
+        await context.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("media", "font")
+            else route.continue_(),
+        )
+        collector = TokenCollector()
+        collector.attach(context)
     except BaseException:
+        # The caller's `browser` local is still None when this raises, so
+        # `_close_resources` would neither close it nor give the slot back --
+        # the guarantee its docstring relies on has to hold past `launch`. A
+        # Java-supplied storage state Playwright rejects lands here too.
+        if browser is not None:
+            try:
+                await asyncio.wait_for(browser.close(), timeout=RESOURCE_CLOSE_TIMEOUT_SECONDS)
+            except Exception:
+                log.warning("Amundi browser cleanup after a failed context failed", exc_info=True)
         await _release_browser_slot()
         raise
-    context = await browser.new_context(
-        locale="fr-FR",
-        timezone_id="Europe/Paris",
-        user_agent=USER_AGENT,
-        storage_state=storage_state,
-    )
-    # Images are left alone -- the login flow was verified with them loading,
-    # and the saving is not worth re-validating for. Fonts and media are dead
-    # weight either way.
-    await context.route(
-        "**/*",
-        lambda route: route.abort()
-        if route.request.resource_type in ("media", "font")
-        else route.continue_(),
-    )
-    collector = TokenCollector()
-    collector.attach(context)
     return browser, context, collector
 
 
@@ -598,7 +626,8 @@ async def initiate(req: InitiateRequest) -> dict:
 
         # No second factor asked for: either this device is already trusted, or
         # the credentials were rejected and we are still sitting on the form.
-        session_state = await _capture_session(context, collector, TOKEN_CAPTURE_TIMEOUT_SECONDS)
+        # Only the remainder of the capture budget is spent here.
+        session_state = await _capture_session(context, collector, _token_capture_budget())
         await _close_resources(context, browser, pw)
         context = browser = pw = None
         if not session_state:

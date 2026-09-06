@@ -26,6 +26,7 @@ import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -380,6 +381,72 @@ class CryptoExchangeSyncServiceTest {
         verify(accountService).upsertHolding(any(), eq(MEMBER_ID), eq("BTC"), eq("BTC"),
             eq(new BigDecimal("0.5")), eq(new BigDecimal("54619")));
         verify(accountService).upsertSnapshot(any(), eq(new BigDecimal("27309.50")), any());
+    }
+
+    @Test
+    void sync_prunesTheHoldingsOfAssetsTheExchangeNoLongerReports() {
+        // BTC was sold; the exchange now reports USDT only. Without a prune the BTC row stays and
+        // AccountService.valuation keeps counting it at live price — in the dashboard and in
+        // every daily snapshot — while currentBalance says 100. Keyed on what is held, never on
+        // what priced: a CoinGecko outage must not empty the set and wipe every holding.
+        CryptoExchangePort adapter = singleKeyAdapter();
+        CryptoExchangeSession session = session(ExchangeType.MERIA, "enc:" + KEY, null);
+        when(sessionRepository.findByIdAndMemberId(7L, MEMBER_ID)).thenReturn(Optional.of(session));
+        when(encryption.decrypt("enc:" + KEY)).thenReturn(KEY);
+        when(encryption.decrypt(null)).thenReturn(null);
+        when(adapter.fetchPositions(KEY, null)).thenReturn(List.of(
+            ExchangePosition.spot("USDT", new BigDecimal("100")),
+            ExchangePosition.spot("SUI", new BigDecimal("3"))));   // held, but unmapped: no price
+        arrangeAccountResolutionWithoutPrices();
+        when(priceService.refreshCryptoQuotes(any())).thenReturn(Map.of(
+            "USDT", new PriceService.Quote(new BigDecimal("0.9"), LocalDate.now(), true)));
+
+        serviceWith(adapter).sync(7L, MEMBER_ID);
+
+        // Both held assets survive the prune; whatever else the account holds (the sold BTC) goes.
+        verify(accountService).pruneHoldings(any(), eq(Set.of("USDT", "SUI")));
+        verify(accountService, never()).upsertHolding(any(), any(), eq("SUI"), any(), any(), any());
+    }
+
+    @Test
+    void sync_marksTheSessionErrorWhenTheStoredCredentialsCannotBeDecrypted() {
+        // A rotated CRYPTO_ENCRYPTION_KEY used to escape as a generic 500 before the guarded
+        // block, leaving the exchange CONNECTED with no hint of what to do.
+        CryptoExchangePort adapter = singleKeyAdapter();
+        CryptoExchangeSession session = session(ExchangeType.MERIA, "enc:" + KEY, null);
+        when(sessionRepository.findByIdAndMemberId(7L, MEMBER_ID)).thenReturn(Optional.of(session));
+        IllegalStateException badTag = new IllegalStateException("Decryption failed");
+        when(encryption.decrypt("enc:" + KEY)).thenThrow(badTag);
+
+        assertThatThrownBy(() -> serviceWith(adapter).sync(7L, MEMBER_ID))
+            .isInstanceOf(SyncException.class)
+            .hasMessageContaining("encryption key may have changed")
+            .hasCause(badTag);
+
+        verify(statusWriter).markError(7L);
+        verify(adapter, never()).fetchPositions(any(), any());
+        verifyNoInteractions(accountService);
+    }
+
+    @Test
+    void resyncAll_keepsGoingWhenOneSessionFailsUnexpectedly() {
+        // A session row that vanished between the listing and the sync throws before sync()'s
+        // own guard; the scheduled run must log it with its trace and still sync the others.
+        CryptoExchangePort adapter = singleKeyAdapter();
+        CryptoExchangeSession gone = CryptoExchangeSession.builder()
+            .id(6L).exchangeType(ExchangeType.MERIA).status("CONNECTED").build();
+        CryptoExchangeSession alive = session(ExchangeType.MERIA, "enc:" + KEY, null);
+        when(sessionRepository.findAllByMemberId(MEMBER_ID)).thenReturn(List.of(gone, alive));
+        when(sessionRepository.findByIdAndMemberId(6L, MEMBER_ID)).thenReturn(Optional.empty());
+        when(sessionRepository.findByIdAndMemberId(7L, MEMBER_ID)).thenReturn(Optional.of(alive));
+        when(encryption.decrypt("enc:" + KEY)).thenReturn(KEY);
+        when(encryption.decrypt(null)).thenReturn(null);
+        when(adapter.fetchPositions(KEY, null)).thenReturn(List.of());
+        arrangeAccountResolution();
+
+        assertThatCode(() -> serviceWith(adapter).resyncAll(MEMBER_ID)).doesNotThrowAnyException();
+
+        verify(adapter).fetchPositions(KEY, null);
     }
 
     @Test

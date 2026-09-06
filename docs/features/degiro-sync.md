@@ -139,6 +139,34 @@ DEGIRO's internal `productId` to an ISIN via
 position. Holdings that resolve to the same ticker are merged with
 `HoldingDedup.vwapMerge` (shared with Bourso/IBKR/TR).
 
+A position with **neither ISIN nor symbol** cannot be keyed as a holding.
+`DegiroAdapter` reads the sidecar's text fields through `textOrNull`, so an
+absent key, a JSON `null` (what the sidecar sends after sanitising DEGIRO's
+literal `"NULL"`) and a blank string all reach the service as `null` — Jackson's
+`asText()` alone answers the *string* `"null"` for a JSON null, and every such
+position used to collapse into one `account_holding` keyed `""` or `"null"`,
+VWAP-blended across unrelated instruments. `upsertAccount` now skips the
+holding with a WARN naming the instrument, but keeps DEGIRO's own
+`quantity × currentPrice` for it in the account total: that money is real, and
+dropping it would understate the balance and the day's snapshot.
+
+`upsertAccount` also refuses to rebuild a **soft-deleted** account
+(`existsSoftDeletedByExternalAccountIdAndMemberId`, the guard every other
+connector already had — see the
+[account-deletion ADR](../decisions/2026-08-11-account-deletion-removes-its-connection.md)).
+Deleting the DEGIRO account clears the session with it, so hitting the guard
+means a sync raced the deletion; it throws `SyncException` rather than insert a
+live duplicate sharing the external id with the deleted row's history.
+
+The **post-auth sync** (`storeSessionAndSync`) is the one run the user never
+sees the result of: `completeAuth` returns the session status. A
+`SyncException` there (sidecar down, DEGIRO refusing `/portfolio`) is logged at
+WARN, anything else at ERROR with its trace, and both record
+`last_error = INITIAL_SYNC_FAILED` on the row. The status deliberately stays
+`ACTIVE`: the session itself is valid, `FAILED` renders as "not connected" in
+`DegiroPanel` and would send the user back through TOTP over a transient
+failure, and the real message resurfaces on the next manual sync.
+
 ### Key files
 
 - `services/degiro-auth/main.py` — FastAPI sidecar: `/initiate`, `/complete`, `/portfolio`, `/health`
@@ -291,8 +319,12 @@ keeping an eye on across future syncs, especially the 2FA response shape.
   auth flow, sync upsert + holding dedup, expired-session → `REAUTH_REQUIRED`
   transition (asserted through `DegiroSessionStatusWriter`, since an
   in-transaction write would be rolled back by the rethrow), the non-expiry
-  failure path leaving the status alone, and the status/clear endpoints. Run
-  with `mvn test -Dtest=DegiroSyncServiceTest` — 10/10 passing. The full
+  failure path leaving the status alone, positions without ISIN or symbol kept
+  in the balance but not persisted as a holding, the soft-deleted account
+  guard, a failed post-auth sync recorded as `INITIAL_SYNC_FAILED` on a still
+  `ACTIVE` session, and the status/clear endpoints. Run with
+  `mvn test -Dtest=DegiroSyncServiceTest`. `DegiroAdapterTest` pins
+  `textOrNull` (JSON null → `null`, never the string `"null"`). The full
   backend suite (`mvn test`) is the CI gate; no absolute count is recorded here
   because it drifts with every unrelated PR.
 - Frontend: `tsc --noEmit` and `eslint .` both clean; no dedicated

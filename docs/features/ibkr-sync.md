@@ -1,6 +1,6 @@
 # Feature: Interactive Brokers (IBKR) sync
 
-> Last updated: 2026-09-03
+> Last updated: 2026-09-06
 
 ## Context
 
@@ -119,6 +119,18 @@ See the [ADR](../decisions/2026-07-19-ibkr-flex-web-service.md) for the full API
   reaches the controller) — `IbkrStatusWriter.markError` runs in its own `REQUIRES_NEW`
   transaction instead, so the `ERROR` status commits independently of the outer
   rollback on both the manual and scheduled paths.
+- **Nothing priced is a blank, not a zero.** Every IBKR holding is Yahoo-priced ("Interactive
+  Brokers" is not in `AccountService.PROVIDER_VALUED`), so a Yahoo outage or rate-limit at
+  08:00 values the account at 0 with `Valuation.anyPriced() == false`. `upsertAccount` used to
+  persist that as `currentBalance = 0` and stamp today's `BalanceSnapshot` with it — and the
+  08:05 `dailySnapshots` guard could not repair the day, since it only writes when the row is
+  absent (the 2026-08-01 crypto incident, on the broker side). It now reads
+  `accountService.valuation(account)` and, when holdings were persisted but none priced, throws
+  `SyncException` (→ `ERROR` status through `IbkrStatusWriter`, on both paths): the balance
+  and the snapshot are left as they were — the manual path rolls the whole sync back, the
+  scheduled path (which catches inside the transaction) keeps the fresh holdings and withholds
+  only the valuation. A *partial* valuation still writes, as everywhere else. A genuinely
+  emptied account (zero holdings) still records 0.
 - **`GetStatement` `q` parameter.** Uses the **reference code** returned by `SendRequest`
   (not the query id). Confirmed against a live statement on 2026-07-21.
 
@@ -128,7 +140,8 @@ See the [ADR](../decisions/2026-07-19-ibkr-flex-web-service.md) for the full API
   names, SUMMARY/LOT distinction, empty statement)
 - `IbkrSyncServiceTest` — mapping: cost-basis → base-currency conversion, LOT filtering,
   "not connected" error, error-status persistence, derivative asset-category filtering,
-  zero-net-quantity positions
+  zero-net-quantity positions, and the refusal to record a zero balance when holdings exist
+  but none could be priced
 - `HoldingDedupTest` — VWAP merge (shared with TR/Bourso), including the sign-aware
   cases IBKR can trigger (opposite-sign netting, netting to exactly zero)
 

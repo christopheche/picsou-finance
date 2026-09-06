@@ -49,7 +49,7 @@ class AdminMfaControllerTest {
             .build();
         when(userRepository.findByMemberId(42L)).thenReturn(Optional.of(target));
 
-        ResponseEntity<Void> res = controller.forceDisable(admin, 42L);
+        ResponseEntity<?> res = controller.forceDisable(admin, 42L);
 
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         verify(mfaService).disable(target);
@@ -72,7 +72,7 @@ class AdminMfaControllerTest {
         // Admin's own AppUser as target — same id => self.
         when(userRepository.findByMemberId(1L)).thenReturn(Optional.of(admin));
 
-        ResponseEntity<Void> res = controller.forceDisable(admin, 1L);
+        ResponseEntity<?> res = controller.forceDisable(admin, 1L);
 
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
         verify(mfaService, never()).disable(any());

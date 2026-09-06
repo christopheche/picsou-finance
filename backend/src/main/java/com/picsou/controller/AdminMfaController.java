@@ -6,6 +6,7 @@ import com.picsou.repository.AppUserRepository;
 import com.picsou.service.MfaService;
 import com.picsou.service.PersistentSessionService;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -42,7 +43,7 @@ public class AdminMfaController {
     }
 
     @DeleteMapping("/{memberId}/mfa")
-    public ResponseEntity<Void> forceDisable(
+    public ResponseEntity<?> forceDisable(
         @AuthenticationPrincipal AppUser admin,
         @PathVariable Long memberId
     ) {
@@ -50,7 +51,9 @@ public class AdminMfaController {
             .orElseThrow(() -> new ResourceNotFoundException("Member not found"));
 
         if (target.getId().equals(admin.getId())) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).build();
+            // ProblemDetail like every other error (api-rest.md): the client shows `detail`.
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(ProblemDetail.forStatusAndDetail(
+                HttpStatus.FORBIDDEN, "Use Settings > Security to disable your own two-factor authentication"));
         }
 
         mfaService.disable(target);

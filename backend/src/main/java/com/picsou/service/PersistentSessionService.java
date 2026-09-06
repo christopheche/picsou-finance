@@ -179,9 +179,14 @@ public class PersistentSessionService {
     /**
      * Returns true iff the cookie's series_id belongs to {@code user}, the
      * session is currently active, and {@code trusted_for_2fa = true}. Does NOT
-     * validate the token hash — call this only AFTER the request has already
-     * been authenticated by other means (typically: the persistent filter set
-     * SecurityContext on this same request, having validated the hash itself).
+     * validate the token hash — the series id is not a secret (it survives
+     * rotation and is readable from any stale copy of the cookie), so on its own
+     * this proves nothing about possession. Callers MUST first establish that the
+     * hash was checked on the current request: either
+     * {@code PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR} names this cookie's
+     * series (the filter validated and rotated it), or the caller ran
+     * {@link #validateAndRotate(String)} itself. {@code AuthController.login} is
+     * the reference implementation of that contract.
      */
     public boolean isTrustedDeviceFor(AppUser user, String cookieValue) {
         return parseCookie(cookieValue)

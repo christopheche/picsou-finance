@@ -3,6 +3,7 @@ package com.picsou.controller;
 import com.picsou.config.AuthCookieWriter;
 import com.picsou.config.ClientIp;
 import com.picsou.config.JwtUtil;
+import com.picsou.config.PersistentTokenAuthFilter;
 import com.picsou.config.RateLimitConfig;
 import com.picsou.dto.ActivationRequest;
 import com.picsou.dto.LoginRequest;
@@ -50,6 +51,7 @@ public class AuthController {
     private final JwtUtil jwtUtil;
     private final Map<String, Bucket> loginBuckets;
     private final Map<String, Bucket> mfaVerifyBuckets;
+    private final Map<String, Bucket> reauthBuckets;
     private final AuthCookieWriter cookieWriter;
     private final MfaService mfaService;
     private final PersistentSessionService persistentSessionService;
@@ -70,6 +72,7 @@ public class AuthController {
         JwtUtil jwtUtil,
         @org.springframework.beans.factory.annotation.Qualifier("loginBuckets") Map<String, Bucket> loginBuckets,
         @org.springframework.beans.factory.annotation.Qualifier("mfaVerifyBuckets") Map<String, Bucket> mfaVerifyBuckets,
+        @org.springframework.beans.factory.annotation.Qualifier("reauthBuckets") Map<String, Bucket> reauthBuckets,
         AuthCookieWriter cookieWriter,
         MfaService mfaService,
         PersistentSessionService persistentSessionService,
@@ -81,6 +84,7 @@ public class AuthController {
         this.jwtUtil = jwtUtil;
         this.loginBuckets = loginBuckets;
         this.mfaVerifyBuckets = mfaVerifyBuckets;
+        this.reauthBuckets = reauthBuckets;
         this.cookieWriter = cookieWriter;
         this.mfaService = mfaService;
         this.persistentSessionService = persistentSessionService;
@@ -160,10 +164,11 @@ public class AuthController {
         // MFA gate: if 2FA is on AND this device is not already a trusted one,
         // we hand back a short-lived mfa_challenge cookie and demand the user
         // complete /api/auth/mfa/verify before access/refresh are issued.
+        boolean trustedDevice = false;
         if (mfaService.isEnabled(user)) {
             String existingPersistent = extractCookie(httpReq, AuthCookieWriter.PERSISTENT_COOKIE);
-            boolean trustedDevice = existingPersistent != null
-                && persistentSessionService.isTrustedDeviceFor(user, existingPersistent);
+            trustedDevice = existingPersistent != null && !existingPersistent.isBlank()
+                && isHashValidatedTrustedDevice(user, existingPersistent, httpReq, httpRes);
 
             if (!trustedDevice) {
                 // Password is correct but the second factor is still outstanding, so
@@ -180,10 +185,26 @@ public class AuthController {
                     "username", user.getUsername()
                 ));
             }
-            // Trusted device — fall through to issue access/refresh + rotate persistent.
+            // Trusted device — fall through to issue access/refresh.
         }
 
-        completeAuthenticatedSession(user, req.rememberMe(), false, httpReq, httpRes);
+        if (trustedDevice) {
+            // The device KEEPS its existing trusted series: isHashValidatedTrustedDevice has
+            // already rotated it (or PersistentTokenAuthFilter did, on this same request),
+            // so no new PersistentSession is issued even if Remember Me was re-ticked.
+            // Minting a fresh series here would (a) overwrite the trusted cookie with an
+            // untrusted one — trust is granted only by a successful TOTP verify, never
+            // inherited — which the filter then discards at first use, and (b) orphan the
+            // trusted row in Settings → Sessions. Access/refresh are written with Remember-Me
+            // TTLs and the refresh token stays bound to the series (sid) so "log out this
+            // device" still cuts its chain.
+            setTokenCookies(httpRes,
+                jwtUtil.generateAccessToken(user),
+                rotatedRefreshToken(user, true, seriesToBind(httpReq, null)),
+                true);
+        } else {
+            completeAuthenticatedSession(user, req.rememberMe(), false, httpReq, httpRes);
+        }
         return ResponseEntity.ok(userPayload(user));
     }
 
@@ -193,15 +214,6 @@ public class AuthController {
         HttpServletRequest httpReq,
         HttpServletResponse httpRes
     ) {
-        String ip = getClientIp(httpReq);
-        Bucket bucket = mfaVerifyBuckets.computeIfAbsent(ip, k -> RateLimitConfig.createMfaVerifyBucket());
-        if (!bucket.tryConsume(1)) {
-            cookieWriter.clearMfaChallenge(httpRes);
-            ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.TOO_MANY_REQUESTS);
-            detail.setDetail("Too many verification attempts. Please log in again in 15 minutes.");
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(detail);
-        }
-
         String challengeCookie = extractCookie(httpReq, AuthCookieWriter.MFA_CHALLENGE_COOKIE);
         if (challengeCookie == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
@@ -218,10 +230,25 @@ public class AuthController {
         }
         if (!jwtUtil.isMfaChallengeToken(claims)) {
             cookieWriter.clearMfaChallenge(httpRes);
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                .body(ProblemDetail.forStatusAndDetail(HttpStatus.UNAUTHORIZED, "Invalid MFA challenge"));
         }
 
+        // Throttle per ACCOUNT (the challenge's uid), not per IP: the 6-digit space being
+        // brute-forced belongs to one account, and a family behind a single NAT must not
+        // lock each other out — five bad codes from one member would otherwise clear every
+        // pending challenge behind that IP. Only a signed challenge names an account, so the
+        // bucket is consumed after the (cheap, HMAC-only, no DB) signature check above.
         Long userId = claims.get("uid", Long.class);
+        Bucket bucket = mfaVerifyBuckets.computeIfAbsent(
+            String.valueOf(userId), k -> RateLimitConfig.createMfaVerifyBucket());
+        if (!bucket.tryConsume(1)) {
+            cookieWriter.clearMfaChallenge(httpRes);
+            ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.TOO_MANY_REQUESTS);
+            detail.setDetail("Too many verification attempts. Please log in again in 15 minutes.");
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(detail);
+        }
+
         AppUser user = userRepository.findByIdWithMember(userId)
             .orElseThrow(() -> new BadCredentialsException("User not found"));
 
@@ -235,9 +262,16 @@ public class AuthController {
                 .body(ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "Invalid verification code"));
         }
 
-        boolean rememberMe = jwtUtil.getRememberMeClaim(claims);
+        // For a 2FA-enabled user (the only kind that reaches this endpoint) a persistent
+        // session is issued ONLY together with "Trust this device": PersistentTokenAuthFilter
+        // refuses to re-mint a session from an untrusted persistent_token when MFA is on
+        // (the cookie alone must not bypass the second factor), so a Remember-Me-without-
+        // trust series would be rotated once, discarded at first use and left as a phantom
+        // "active session". Remember Me without trust therefore yields a normal session-
+        // scoped login; the rememberMe claim carried by the challenge is deliberately not
+        // consulted on its own.
         boolean trustDevice = Boolean.TRUE.equals(req.trustDevice());
-        completeAuthenticatedSession(user, rememberMe || trustDevice, trustDevice, httpReq, httpRes);
+        completeAuthenticatedSession(user, trustDevice, trustDevice, httpReq, httpRes);
         cookieWriter.clearMfaChallenge(httpRes);
         return ResponseEntity.ok(userPayload(user));
     }
@@ -297,13 +331,17 @@ public class AuthController {
         }
 
         // No usable refresh_token: honour a persistent-token ("Remember Me") restoration
-        // for THIS SAME request. PersistentTokenAuthFilter runs before this controller and,
-        // on a valid persistent_token, both rotates the series and sets the SecurityContext
-        // principal -- so a bare access_token-derived principal (no persistent_token at all)
-        // also lands here, which is why we still (re)mint cookies below rather than trusting
-        // whatever the filter may or may not have already written: the endpoint's contract
-        // is "200 = fresh cookies were issued", never a phantom win with zero Set-Cookie.
-        if (persistentPrincipal != null) {
+        // for THIS SAME request -- and only that. PersistentTokenAuthFilter runs before this
+        // controller and, on a valid persistent_token, rotates the series, sets the
+        // SecurityContext principal AND stamps VALIDATED_SERIES_ATTR on the request. A
+        // principal WITHOUT that stamp came from JwtAuthenticationFilter, i.e. from a bare
+        // access_token: it must not be upgraded into a fresh 7-day refresh_token here,
+        // otherwise the access token's 15-minute TTL would contain nothing at all. On the
+        // stamped path we still (re)mint below rather than trusting what the filter already
+        // wrote: the endpoint's contract is "200 = fresh cookies were issued", never a
+        // phantom win with zero Set-Cookie.
+        if (persistentPrincipal != null
+            && httpReq.getAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR) != null) {
             boolean persistent = isPersistentDevice(httpReq, persistentPrincipal);
             setTokenCookies(httpRes,
                 jwtUtil.generateAccessToken(persistentPrincipal),
@@ -324,12 +362,23 @@ public class AuthController {
 
     @PostMapping("/logout")
     public ResponseEntity<Void> logout(HttpServletRequest httpReq, HttpServletResponse httpRes) {
-        // Best-effort revoke the persistent series so the cookie can't be replayed
-        // even if the browser failed to honour Set-Cookie Max-Age=0.
+        // Best-effort revoke the persistent series so the cookie can't be replayed even if
+        // the browser failed to honour Set-Cookie Max-Age=0 -- but only for a series this
+        // request has PROVEN to hold (token hash compared in constant time). The series id
+        // alone is not a secret, so revoking on it would let any caller log a device out
+        // with a stale copy of the cookie.
         String persistent = extractCookie(httpReq, AuthCookieWriter.PERSISTENT_COOKIE);
-        if (persistent != null) {
-            persistentSessionService.seriesFromCookie(persistent)
-                .ifPresent(persistentSessionService::revokeBySeriesId);
+        if (persistent != null && !persistent.isBlank()) {
+            if (httpReq.getAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR) instanceof UUID validated) {
+                // PersistentTokenAuthFilter validated (and rotated) this cookie on the way in.
+                persistentSessionService.revokeBySeriesId(validated);
+            } else {
+                // A valid access_token authenticated the request, so the filter skipped the
+                // cookie: check the hash here. A mismatch is left to validateAndRotate's own
+                // theft detection (series wiped + WARN), the designed fail-safe.
+                persistentSessionService.validateAndRotate(persistent)
+                    .ifPresent(v -> persistentSessionService.revokeBySeriesId(v.session().getSeriesId()));
+            }
         }
         clearTokenCookies(httpRes);
         return ResponseEntity.noContent().build();
@@ -369,6 +418,12 @@ public class AuthController {
         HttpServletRequest httpReq,
         HttpServletResponse httpRes
     ) {
+        // Step-up password check from an already-authenticated session: throttle it like
+        // /login, per user, or a hijacked session cookie becomes a bcrypt-speed oracle for
+        // the account password (and from there full takeover). See RateLimitConfig#reauthBuckets.
+        if (!consumeReauthToken(user)) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(reauthRateLimited());
+        }
 
         if (!passwordEncoder.matches(req.currentPassword(), user.getPasswordHash())) {
             throw new BadCredentialsException("Current password is incorrect");
@@ -477,11 +532,7 @@ public class AuthController {
                 jwtUtil.generateAccessToken(user),
                 jwtUtil.generateRefreshToken(user, session.getSeriesId()),
                 true);
-            long secondsUntilExpiry = Math.max(
-                ChronoUnit.SECONDS.between(Instant.now(), session.getExpiresAt()),
-                0
-            );
-            cookieWriter.setPersistent(httpRes, issued.cookieValue(), secondsUntilExpiry);
+            cookieWriter.setPersistent(httpRes, issued.cookieValue(), secondsUntilExpiry(session));
         } else {
             cookieWriter.setAccessAndRefresh(httpRes,
                 jwtUtil.generateAccessToken(user),
@@ -501,6 +552,69 @@ public class AuthController {
                 cookieWriter.clearPersistent(httpRes);
             }
         }
+    }
+
+    /**
+     * Whether the {@code persistent_token} on this request PROVES a device that {@code user}
+     * marked as trusted for 2FA. "Proves" means the cookie's token hash was compared in constant
+     * time on this very request -- a series-id-only lookup ({@link PersistentSessionService#isTrustedDeviceFor})
+     * would accept {@code <victim-series>:<anything>}, and the series id is no secret: it survives
+     * rotation and sits in every stale copy of the cookie and in refresh JWTs' {@code sid} claim.
+     * Combined with a valid access_token of ANY account (which makes {@link PersistentTokenAuthFilter}
+     * bail out before validating) and a phished password, that lookup alone would skip the
+     * second factor without ever tripping theft detection.
+     *
+     * <p>Two ways to satisfy the proof:
+     * <ol>
+     *   <li>{@link PersistentTokenAuthFilter} validated + rotated this cookie and stamped
+     *       {@code VALIDATED_SERIES_ATTR} with its series. It has already written the rotated
+     *       cookie; we must NOT validate again -- the request still carries the pre-rotation
+     *       token, which would only pass via the grace window and emit a second, conflicting
+     *       {@code Set-Cookie: persistent_token}.</li>
+     *   <li>The filter bailed out (a valid access_token authenticated the request), so nothing
+     *       has checked the hash yet: run {@code validateAndRotate} here -- constant-time compare,
+     *       rotation, theft detection -- and write the rotated value ourselves. A forged or stale
+     *       token then wipes the series and logs a WARN instead of granting a session.</li>
+     * </ol>
+     */
+    private boolean isHashValidatedTrustedDevice(
+        AppUser user,
+        String cookie,
+        HttpServletRequest httpReq,
+        HttpServletResponse httpRes
+    ) {
+        if (httpReq.getAttribute(PersistentTokenAuthFilter.VALIDATED_SERIES_ATTR) instanceof UUID validated) {
+            return persistentSessionService.seriesFromCookie(cookie).filter(validated::equals).isPresent()
+                && persistentSessionService.isTrustedDeviceFor(user, cookie);
+        }
+        Optional<PersistentSessionService.ValidationResult> result = persistentSessionService.validateAndRotate(cookie);
+        if (result.isEmpty()) return false;
+        PersistentSession session = result.get().session();
+        if (!session.getUser().getId().equals(user.getId()) || !session.isTrustedFor2fa()) {
+            // Rotated but not trusted for THIS user: the MFA-required branch clears the
+            // cookie anyway, so the rotated value is deliberately not written.
+            return false;
+        }
+        cookieWriter.setPersistent(httpRes, result.get().rotatedCookieValue(), secondsUntilExpiry(session));
+        return true;
+    }
+
+    /** Remaining lifetime of a persistent session, for the persistent_token cookie's Max-Age. */
+    private static long secondsUntilExpiry(PersistentSession session) {
+        return Math.max(ChronoUnit.SECONDS.between(Instant.now(), session.getExpiresAt()), 0);
+    }
+
+    /** One step-up password check against {@code user}'s reauth budget; false once it is exhausted. */
+    private boolean consumeReauthToken(AppUser user) {
+        Bucket bucket = reauthBuckets.computeIfAbsent(
+            String.valueOf(user.getId()), k -> RateLimitConfig.createReauthBucket());
+        return bucket.tryConsume(1);
+    }
+
+    private static ProblemDetail reauthRateLimited() {
+        ProblemDetail detail = ProblemDetail.forStatus(HttpStatus.TOO_MANY_REQUESTS);
+        detail.setDetail("Too many password attempts. Try again in 15 minutes.");
+        return detail;
     }
 
     private Map<String, Object> userPayload(AppUser user) {

@@ -107,7 +107,7 @@ class SessionControllerTest {
     void revoke_returns204_onSuccess() {
         when(persistentSessionService.revoke(42L, user)).thenReturn(true);
 
-        ResponseEntity<Void> res = controller.revoke(user, 42L);
+        ResponseEntity<?> res = controller.revoke(user, 42L);
 
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
     }
@@ -116,7 +116,7 @@ class SessionControllerTest {
     void revoke_returns404_whenServiceReturnsFalse() {
         when(persistentSessionService.revoke(99L, user)).thenReturn(false);
 
-        ResponseEntity<Void> res = controller.revoke(user, 99L);
+        ResponseEntity<?> res = controller.revoke(user, 99L);
 
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }

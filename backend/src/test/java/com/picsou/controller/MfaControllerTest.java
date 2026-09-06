@@ -20,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.web.MockHttpServletRequest;
 
@@ -43,6 +44,7 @@ class MfaControllerTest {
     @Mock PersistentSessionService persistentSessionService;
 
     Map<String, Bucket> mfaEnrollBuckets;
+    Map<String, Bucket> reauthBuckets;
     MfaController controller;
     AppUser user;
     MockHttpServletRequest httpReq;
@@ -50,7 +52,8 @@ class MfaControllerTest {
     @BeforeEach
     void setUp() {
         mfaEnrollBuckets = new HashMap<>();
-        controller = new MfaController(mfaService, persistentSessionService, mfaEnrollBuckets);
+        reauthBuckets = new HashMap<>();
+        controller = new MfaController(mfaService, persistentSessionService, mfaEnrollBuckets, reauthBuckets);
         user = AppUser.builder()
             .id(7L).username("alice")
             .role(UserRole.MEMBER).activated(true)
@@ -128,7 +131,17 @@ class MfaControllerTest {
             controller.enrollInit(user, new EnrollInitRequest("pw"), httpReq);
 
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        // RFC 7807 like every other error, so the client can show *why* (api-rest.md).
+        assertThat((Object) res.getBody()).isInstanceOf(ProblemDetail.class);
+        assertThat(((ProblemDetail) (Object) res.getBody()).getDetail()).containsIgnoringCase("try again");
         verifyNoInteractions(mfaService);
+    }
+
+    /** A per-user reauth bucket with no attempts left. */
+    private void drainReauthBucketFor(long userId) {
+        Bucket bucket = RateLimitConfig.createReauthBucket();
+        while (bucket.tryConsume(1)) { /* drain */ }
+        reauthBuckets.put(String.valueOf(userId), bucket);
     }
 
     // ─── /enroll/verify ──────────────────────────────────────────────────
@@ -207,6 +220,35 @@ class MfaControllerTest {
     }
 
     @Test
+    void disable_returns429ProblemDetail_beforeCheckingPassword_whenReauthBucketExhausted() {
+        // The step-up password check must not be a bcrypt-speed oracle for whoever holds a
+        // hijacked session cookie: same per-user budget as /login, consumed before anything
+        // (password OR code) is looked at.
+        drainReauthBucketFor(7L);
+
+        ResponseEntity<Void> res = controller.disable(user,
+            new DisableMfaRequest("guess", "123456", false));
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat((Object) res.getBody()).isInstanceOf(ProblemDetail.class);
+        verifyNoInteractions(mfaService, persistentSessionService);
+    }
+
+    @Test
+    void disable_reauthBudget_isKeyedByUserId_andSharedWithRegenerate() {
+        when(mfaService.verifyTotpOrRecovery(user, "123456", false)).thenReturn(true);
+        when(mfaService.verifyTotp(user, "123456")).thenReturn(true);
+        when(mfaService.regenerateRecoveryCodes(user)).thenReturn(List.of("11111111"));
+
+        controller.disable(user, new DisableMfaRequest("pw", "123456", false));
+        controller.regenerateRecoveryCodes(user, new RegenerateCodesRequest("pw", "123456"));
+
+        // One bucket for the account (5 / 15 min), two step-up checks consumed from it.
+        assertThat(reauthBuckets).containsOnlyKeys("7");
+        assertThat(reauthBuckets.get("7").getAvailableTokens()).isEqualTo(3L);
+    }
+
+    @Test
     void disable_throwsBeforeVerifyingCode_whenPasswordWrong() {
         org.mockito.Mockito.doThrow(new MfaException("Current password is incorrect"))
             .when(mfaService).requireReauth(user, "bad");
@@ -235,6 +277,18 @@ class MfaControllerTest {
         verify(mfaService).requireReauth(user, "pw");
         // Critically: regenerate does NOT revoke persistent sessions — user keeps them.
         verifyNoInteractions(persistentSessionService);
+    }
+
+    @Test
+    void regenerate_returns429ProblemDetail_whenReauthBucketExhausted() {
+        drainReauthBucketFor(7L);
+
+        ResponseEntity<RecoveryCodesResponse> res =
+            controller.regenerateRecoveryCodes(user, new RegenerateCodesRequest("guess", "123456"));
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
+        assertThat((Object) res.getBody()).isInstanceOf(ProblemDetail.class);
+        verifyNoInteractions(mfaService);
     }
 
     @Test

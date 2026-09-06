@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { QUERY_STALE_TIMES } from '@/lib/constants'
+import { invalidateWealthQueries } from '@/features/accounts/hooks'
 import {
   bankSyncApi,
   trApi,
@@ -82,8 +83,7 @@ export function useInitiateBankSync() {
     }) => bankSyncApi.initiate(institutionId, institutionName),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.banks() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -97,8 +97,7 @@ export function useCompleteBankSync() {
       bankSyncApi.complete(code, state),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.banks() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -109,8 +108,7 @@ export function useRetryBankSync() {
     mutationFn: (id: number) => bankSyncApi.retry(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.banks() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -135,8 +133,7 @@ export function useDeleteBankConnection() {
     mutationFn: (id: number) => bankSyncApi.deleteConnection(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.banks() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -168,8 +165,7 @@ export function useCompleteTrAuth() {
       trApi.completeAuth(processId, tan),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.tr() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -180,8 +176,7 @@ export function useSyncTradeRepublic() {
     mutationFn: () => trApi.sync(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.tr() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -192,8 +187,7 @@ export function useImportTrCsv() {
     mutationFn: (file: File) => trApi.importCsv(file),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.tr() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -204,8 +198,7 @@ export function useClearTrSession() {
     mutationFn: () => trApi.clearSession(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.tr() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -230,8 +223,7 @@ export function useBoursoSessionStatus() {
 
   useEffect(() => {
     if (!succeeded || !completedAt) return
-    queryClient.invalidateQueries({ queryKey: ['accounts'] })
-    queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+    invalidateWealthQueries(queryClient)
   }, [completedAt, queryClient, succeeded])
 
   return query
@@ -276,8 +268,7 @@ export function useClearBoursoSession() {
     mutationFn: boursoApi.clearSession,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.bourso() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -308,8 +299,7 @@ export function useCompleteDegiroAuth() {
       degiroApi.completeAuth(processId, code),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.degiro() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -320,8 +310,7 @@ export function useSyncDegiro() {
     mutationFn: () => degiroApi.sync(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.degiro() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
     // A sync that meets an expired session flips the stored status to
     // REAUTH_REQUIRED server-side. Without invalidating on failure too, the
@@ -363,8 +352,7 @@ export function useBourseDirectStatus() {
 
   useEffect(() => {
     if (!succeeded || !completedAt) return
-    queryClient.invalidateQueries({ queryKey: ['accounts'] })
-    queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+    invalidateWealthQueries(queryClient)
   }, [completedAt, queryClient, succeeded])
 
   return query
@@ -410,8 +398,7 @@ export function useClearBourseDirectSession() {
     mutationFn: bourseDirectApi.clearSession,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.bourseDirect() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -436,8 +423,7 @@ export function useAmundiStatus() {
 
   useEffect(() => {
     if (!succeeded || !completedAt) return
-    queryClient.invalidateQueries({ queryKey: ['accounts'] })
-    queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+    invalidateWealthQueries(queryClient)
   }, [completedAt, queryClient, succeeded])
 
   return query
@@ -483,8 +469,7 @@ export function useClearAmundiSession() {
     mutationFn: amundiApi.clearSession,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.amundi() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -521,8 +506,7 @@ export function useSyncIbkr() {
     mutationFn: ibkrApi.sync,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.ibkr() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -555,8 +539,7 @@ export function useAddCryptoExchange() {
       cryptoExchangeApi.add(type, apiKey, apiSecret),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.exchanges() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -567,8 +550,7 @@ export function useSyncCryptoExchange() {
     mutationFn: (id: number) => cryptoExchangeApi.sync(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.exchanges() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -579,8 +561,7 @@ export function useRemoveCryptoExchange() {
     mutationFn: (id: number) => cryptoExchangeApi.remove(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.exchanges() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -605,8 +586,7 @@ export function useAddCryptoWallet() {
       cryptoWalletApi.add(chain, address, label),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.wallets() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -617,8 +597,7 @@ export function useSyncCryptoWallet() {
     mutationFn: (id: number) => cryptoWalletApi.sync(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.wallets() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -629,8 +608,7 @@ export function useRemoveCryptoWallet() {
     mutationFn: (id: number) => cryptoWalletApi.remove(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.wallets() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -671,8 +649,7 @@ export function useFinaryDeleteSession() {
     mutationFn: () => finaryApi.deleteSession(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: syncKeys.finary() })
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -694,8 +671,7 @@ export function useImportFinary() {
   return useMutation({
     mutationFn: (request: FinaryImportRequest) => finaryApi.import(request),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -706,8 +682,7 @@ export function useExecuteFinaryApiSync() {
     mutationFn: ({ syncToken, mappings }: { syncToken: string; mappings: FinaryAccountMapping[] }) =>
       finaryApi.executeApiSync(syncToken, mappings),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      invalidateWealthQueries(queryClient)
     },
   })
 }
@@ -718,8 +693,7 @@ export function useFinaryAutoSync() {
     mutationFn: () => finaryApi.autoSync(),
     onSuccess: (data) => {
       if (data.status === 'OK') {
-        queryClient.invalidateQueries({ queryKey: ['accounts'] })
-        queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+        invalidateWealthQueries(queryClient)
         queryClient.invalidateQueries({ queryKey: syncKeys.finary() })
       }
     },

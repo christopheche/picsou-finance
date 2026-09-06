@@ -97,6 +97,18 @@ switch into their profile and browse their data:
   the UI. Non-admin and demo sessions do not call `/family/members`; they keep
   the simple Settings account link. Independent members remain listed in Family
   settings and on the family dashboard.
+- **Frontend (self-heal of a stale target):** `activeMemberId` is persisted in
+  localStorage and only cleared at login/logout, so an admin who had a managed member
+  selected when that member activated used to be locked out — every page load fired a
+  GET with `?memberId=X`, got the 403 above, and the global GET-403 redirect sent the
+  browser to `/error/403` before the sidebar switcher (the only in-app way to clear the
+  target) could render. The response interceptor in `frontend/src/lib/api-client.ts`
+  now recognises that case (admin, GET, `params.memberId === activeMemberId`, first
+  attempt): it calls `useProfileStore.getState().reset()`, strips `memberId` from the
+  config and replays the request once under the admin's own scope; a second 403 falls
+  through to the normal `/error/403` redirect. Mutations are deliberately excluded —
+  replaying a write under another member would silently store data on the wrong
+  profile — so a stale target on a POST/PUT surfaces as the usual error toast.
 
 This is an automatic confidentiality guarantee, not a toggle. **Voluntary sharing is
 unaffected** — anything an independent member chooses to share via `SharingSettings`
@@ -200,7 +212,7 @@ Step 3 is critical: without it, the next request would fail because the old JWT 
 - `backend/src/main/java/com/picsou/controller/AuthController.java` — `/api/auth/activate/{token}`
 
 **Frontend:**
-- `frontend/src/stores/profile-store.ts` — `activeMemberId`, `viewMode` (own/managed/family)
+- `frontend/src/stores/profile-store.ts` — `activeMemberId` (persisted impersonation target; `null` = own profile)
 - `frontend/src/features/family/hooks.ts` — TanStack Query hooks for members, sharing, dashboard
 - `frontend/src/features/family/api.ts` — API functions
 - `frontend/src/features/family/members.ts` — `selectSwitchableMembers()` helper used by the admin switcher; excludes independent members
@@ -267,7 +279,8 @@ Admin selects their own account
 
 - `GoalServiceTest` — goal CRUD scoped by memberId
 - `HistoryServiceTest` — history scoped by memberId, incl. `buildHistory_rejectsAccountsOwnedByAnotherMember` and `buildHistory_rejectsNullMemberId`
-- `api-client.test.ts` (frontend) — `?memberId` is attached only for admins, never for a non-admin with a stale `activeMemberId`
+- `api-client.test.ts` (frontend) — `?memberId` is attached only for admins, never for a non-admin with a stale `activeMemberId`; the 403 self-heal drops a refused target and replays the GET without `memberId` (a genuine 403, a second 403 on the replay, and a mutation 403 keep their existing behaviour)
+- `frontend/src/stores/profile-store.test.ts` — the target persists across reloads and is cleared by `reset()`
 - `frontend/src/features/mfa/hooks.test.ts` (frontend) — login-side `resetClientState`: wipes the cache + impersonation target on a non-MFA login and on MFA verify, and performs **no** reset on the `mfaRequired` branch
 - `FamilyServiceTest` — username derivation, activation/reset, and **member deletion**:
   `deleteMember_withLogin_deletesUserBeforeMember` (Mockito `InOrder` guard for the

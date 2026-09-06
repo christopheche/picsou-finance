@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { usePortfolio, type PortfolioLine } from '@/features/accounts/hooks'
+import { portfolioLineLabel, usePortfolio, type PortfolioLine } from '@/features/accounts/hooks'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
 import { PriceFreshnessDot } from '@/components/shared/PriceFreshnessDot'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -24,6 +24,7 @@ const SORT_OPTIONS: { value: SortBy; labelKey: string }[] = [
 function PortfolioItem({ line }: { line: PortfolioLine }) {
   const { t } = useTranslation()
   const isPositive = (line.pnlEur ?? 0) >= 0
+  const name = portfolioLineLabel(line, t)
 
   return (
     <div className="flex items-center gap-4 rounded-xl bg-muted/30 px-4 py-3 transition-colors hover:bg-muted/60">
@@ -32,12 +33,12 @@ function PortfolioItem({ line }: { line: PortfolioLine }) {
         className="flex size-12 shrink-0 items-center justify-center rounded-lg border text-sm font-semibold"
         style={{ borderColor: line.accountColor }}
       >
-        {line.ticker ? line.ticker.slice(0, 4) : line.name.slice(0, 3).toUpperCase()}
+        {line.ticker ? line.ticker.slice(0, 4) : name.slice(0, 3).toUpperCase()}
       </div>
 
       {/* Info */}
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium">{line.name}</p>
+        <p className="truncate text-sm font-medium">{name}</p>
         {line.ticker && (
           <p className="text-sm text-muted-foreground">
             {line.accountName}
@@ -88,7 +89,7 @@ export function PortfolioView() {
     if (search) {
       const q = search.toLowerCase()
       result = result.filter(l =>
-        l.name.toLowerCase().includes(q) ||
+        portfolioLineLabel(l, t).toLowerCase().includes(q) ||
         (l.ticker ?? '').toLowerCase().includes(q) ||
         l.accountName.toLowerCase().includes(q)
       )
@@ -101,7 +102,7 @@ export function PortfolioView() {
     }
 
     return result
-  }, [lines, sortBy, search])
+  }, [lines, sortBy, search, t])
 
   const totalValue = useMemo(
     () => (sorted ?? []).reduce((sum, l) => sum + l.valueEur, 0),

@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { usePriceHistory, type PortfolioLine } from '@/features/accounts/hooks'
+import { portfolioLineLabel, usePriceHistory, type PortfolioLine } from '@/features/accounts/hooks'
 import { NetWorthChart } from '@/components/shared/NetWorthChart'
 import { EmptyChartState } from '@/components/shared/EmptyChartState'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
@@ -94,7 +94,7 @@ export function HoldingDetailModal({ line, onClose }: HoldingDetailModalProps) {
           <>
             <DialogHeader>
               <div className="flex items-center gap-3">
-                <DialogTitle className="text-lg">{line.name}</DialogTitle>
+                <DialogTitle className="text-lg">{portfolioLineLabel(line, t)}</DialogTitle>
                 {line.ticker && (
                   <Badge variant="outline" className="font-mono text-xs">
                     {line.ticker}

@@ -127,7 +127,7 @@ a manual-entry badge and a delete button, both only on manual entries. For manua
 without a name, it combines the `txType` enum with the canonical ticker through frontend i18n.
 Provider descriptions on synced transactions remain unchanged.
 
-After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the `transactions`, `history`, `account`, and `dashboard` queries.
+After submit, `useAddTransaction` / `useDeleteTransaction` hooks invalidate the account's `transactions` and `history` queries plus every net-worth surface through `invalidateWealthQueries()` (`frontend/src/features/accounts/hooks.ts`: `['accounts']`, `['dashboard']`, `['history']`, `['pnl']`, `['net-worth-intraday']`, `['real-estate']`). The same helper backs every sync, snapshot and import mutation, so the dashboard total, chart, P&L header and 24H series never disagree after a change.
 
 ### Key files
 

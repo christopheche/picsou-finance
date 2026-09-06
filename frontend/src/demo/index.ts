@@ -1,5 +1,12 @@
 import type { AxiosResponse, InternalAxiosRequestConfig } from 'axios'
-import type { GoalProgress } from '@/types/api'
+import type {
+  Account,
+  BourseDirectSessionStatus,
+  DegiroSessionStatus,
+  FinaryConnectionStatus,
+  FinaryPreviewResponse,
+  GoalProgress,
+} from '@/types/api'
 import { mockAccounts } from './data/accounts'
 import { mockDashboard } from './data/dashboard'
 import { mockGoals } from './data/goals'
@@ -34,6 +41,9 @@ for (let i = 1; i <= mockAccounts.length; i++) {
 }
 
 // Account CRUD
+// `satisfies Account` on the inline account mocks: a member added to the real DTO
+// (e.g. `logoUrl`/`logoKey`) is then a typecheck failure here instead of a demo-only
+// `undefined` that behaves differently from the backend.
 handlers.set(key('POST', '/accounts'), (config) => {
   const body = JSON.parse(config.data || '{}')
   return {
@@ -48,8 +58,10 @@ handlers.set(key('POST', '/accounts'), (config) => {
     isManual: body.isManual ?? true,
     color: body.color ?? '#6366f1',
     ticker: body.ticker ?? null,
+    logoUrl: null,
+    logoKey: null,
     createdAt: new Date().toISOString(),
-  }
+  } satisfies Account
 })
 handlers.set(key('PUT', '/accounts/1'), (config) => {
   const body = JSON.parse(config.data || '{}')
@@ -57,10 +69,12 @@ handlers.set(key('PUT', '/accounts/1'), (config) => {
 })
 handlers.set(key('DELETE', '/accounts/1'), () => ({}))
 
-// Account details: holdings for PEA (id=2), Compte Titres (id=3), Crypto (id=6)
-handlers.set(key('GET', '/accounts/2/holdings'), () => mockHoldings[2] ?? [])
-handlers.set(key('GET', '/accounts/3/holdings'), () => mockHoldings[3] ?? [])
-handlers.set(key('GET', '/accounts/6/holdings'), () => mockHoldings[6] ?? [])
+// Account details: holdings for every account. Only PEA (id=2), Compte Titres (id=3)
+// and Crypto (id=6) have any; the rest answer `[]` because the detail page queries
+// holdings for every account type and `{}` (the unmatched fallback) has no `.map`.
+for (const account of mockAccounts) {
+  handlers.set(key('GET', `/accounts/${account.id}/holdings`), () => mockHoldings[account.id] ?? [])
+}
 
 // Per-product breakdown. Only the crypto account (id=6) has one, exactly like a real crypto
 // exchange account; every other account falls back to the flat holdings table.
@@ -474,7 +488,7 @@ handlers.set(key('POST', '/sync/initiate'), () => ({
 
 // Sync - complete (real backend: GET /api/sync/complete?code=...&state=...)
 handlers.set(key('GET', '/sync/complete'), () => ([
-  { id: 100, name: 'Demo Bank Account', type: 'CHECKING' as const, provider: 'Demo Bank', currency: 'EUR', currentBalance: 5000, currentBalanceEur: 5000, lastSyncedAt: new Date().toISOString(), isManual: false, color: '#3b82f6', ticker: null, createdAt: new Date().toISOString() }
+  { id: 100, name: 'Demo Bank Account', type: 'CHECKING' as const, provider: 'Demo Bank', currency: 'EUR', currentBalance: 5000, currentBalanceEur: 5000, lastSyncedAt: new Date().toISOString(), isManual: false, color: '#3b82f6', ticker: null, logoUrl: null, logoKey: null, createdAt: new Date().toISOString() } satisfies Account,
 ]))
 
 // Sync - retry
@@ -500,9 +514,7 @@ handlers.set(key('POST', '/ibkr/sync'), () => [])
 handlers.set(key('DELETE', '/ibkr/connection'), () => null)
 
 // Amundi Épargne Salariale — same demo convention: reads report a disconnected
-// session, mutations fake-succeed with the real response shapes. Bourse Direct
-// has no handlers at all, which leaves its panel reading `isActive: undefined`
-// in demo mode; do not copy that gap here.
+// session, mutations fake-succeed with the real response shapes.
 const demoAmundiStatus = {
   isActive: false,
   syncStatus: 'IDLE',
@@ -535,6 +547,32 @@ handlers.set(key('POST', '/bourso/auth/initiate'), () => ({
 handlers.set(key('POST', '/bourso/auth/complete'), () => demoBoursoStatus)
 handlers.set(key('POST', '/bourso/sync'), () => demoBoursoStatus)
 handlers.set(key('DELETE', '/bourso/session'), () => null)
+
+// Bourse Direct — same convention (typed against the real union so the panel never
+// reads `isActive: undefined` off the `{}` fallback).
+const demoBourseDirectStatus: BourseDirectSessionStatus = {
+  isActive: false,
+  expiresAt: null,
+  syncStatus: 'IDLE',
+  lastSyncStartedAt: null,
+  lastSyncCompletedAt: null,
+  lastSyncError: null,
+}
+handlers.set(key('GET', '/bourse-direct/status'), () => demoBourseDirectStatus)
+handlers.set(key('POST', '/bourse-direct/auth/initiate'), () => ({
+  processId: null, mfaRequired: false, mfaType: null,
+}))
+handlers.set(key('POST', '/bourse-direct/auth/complete'), () => demoBourseDirectStatus)
+handlers.set(key('POST', '/bourse-direct/sync'), () => demoBourseDirectStatus)
+handlers.set(key('DELETE', '/bourse-direct/session'), () => null)
+
+// DEGIRO — same convention.
+const demoDegiroStatus: DegiroSessionStatus = { isActive: false, status: null, lastSyncedAt: null }
+handlers.set(key('GET', '/degiro/status'), () => demoDegiroStatus)
+handlers.set(key('POST', '/degiro/auth/initiate'), () => ({ totpRequired: false, processId: null }))
+handlers.set(key('POST', '/degiro/auth/complete'), () => demoDegiroStatus)
+handlers.set(key('POST', '/degiro/sync'), () => mockAccounts[1])
+handlers.set(key('DELETE', '/degiro/session'), () => null)
 
 // Trade Republic - session status
 handlers.set(key('GET', '/tr/status'), () => ({ isActive: false, expiresAt: null }))
@@ -575,8 +613,8 @@ handlers.set(key('DELETE', '/crypto/exchange/2'), () => null)
 
 // Crypto wallet - add
 handlers.set(key('POST', '/crypto/wallet'), () => ({
-  id: Date.now(), name: 'ETH Wallet', type: 'CRYPTO' as const, provider: null, currency: 'ETH', currentBalance: 0, currentBalanceEur: 0, lastSyncedAt: null, isManual: false, color: '#8b5cf6', ticker: 'ETH', createdAt: new Date().toISOString()
-}))
+  id: Date.now(), name: 'ETH Wallet', type: 'CRYPTO' as const, provider: null, currency: 'ETH', currentBalance: 0, currentBalanceEur: 0, lastSyncedAt: null, isManual: false, color: '#8b5cf6', ticker: 'ETH', logoUrl: null, logoKey: null, createdAt: new Date().toISOString(),
+} satisfies Account))
 
 // Crypto wallet - sync
 handlers.set(key('POST', '/crypto/wallet/1/sync'), () => [])
@@ -584,7 +622,6 @@ handlers.set(key('POST', '/crypto/wallet/1/sync'), () => [])
 // Crypto wallet - remove
 handlers.set(key('DELETE', '/crypto/wallet/1'), () => null)
 
-// Finary - configured
 // Settings — security (2FA off in demo, one active session)
 handlers.set(key('GET', '/auth/mfa/status'), () => ({
   enabled: false,
@@ -682,7 +719,12 @@ handlers.set(key('GET', '/family/sharing'), (config) => {
   }
 })
 
-handlers.set(key('GET', '/finary/configured'), () => true)
+// Finary — connection status (finaryApi.getStatus). The handler used to be keyed on
+// the retired `GET /finary/configured` route, so the tab read its status off `{}`.
+const demoFinaryStatus: FinaryConnectionStatus = {
+  connected: false, sessionId: null, status: null, lastSyncedAt: null, maskedEmail: null,
+}
+handlers.set(key('GET', '/finary/status'), () => demoFinaryStatus)
 
 // Finary - preview file
 handlers.set(key('POST', '/finary/preview'), () => ({
@@ -708,14 +750,16 @@ handlers.set(key('POST', '/finary/import'), () => ({
 }))
 
 // Finary - API sync preview
+// The backend's FinaryPreviewResponse carries the API-sync token as `fileToken` too
+// (FinaryApiSyncService hands a UUID through that field); the tab reads `data.fileToken`.
 handlers.set(key('POST', '/finary/api-sync/preview'), () => ({
   accounts: [
     { finaryId: 'checking-1', finaryName: 'Compte Courant', finaryInstitution: 'BoursoBank', finaryCategory: 'checking', suggestedType: 'CHECKING' as const, currentBalance: 2500, nativeCurrency: 'EUR', transactionCount: 42 },
   ],
   existingPicsouAccounts: [],
   totalTransactionCount: 42,
-  syncToken: 'demo-sync-token',
-}))
+  fileToken: 'demo-sync-token',
+} satisfies FinaryPreviewResponse))
 
 // Finary - API sync execute
 handlers.set(key('POST', '/finary/api-sync/execute'), () => ({

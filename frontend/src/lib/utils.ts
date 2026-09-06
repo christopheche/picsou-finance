@@ -159,7 +159,7 @@ export function formatLocalDate(dateStr: string | null | undefined, locale = get
 
 export function formatTimeAgo(dateStr: string | null | undefined, locale = getLocale()): string {
   if (!dateStr) return '—'
-  const diff = Date.now() - new Date(dateStr).getTime()
+  const diff = Date.now() - toDate(dateStr).getTime()
   const minutes = Math.floor(diff / 60_000)
   if (minutes < 1) return new Intl.RelativeTimeFormat(locale, { numeric: 'auto' }).format(0, 'minute')
   if (minutes < 60) return new Intl.RelativeTimeFormat(locale, { numeric: 'auto' }).format(-minutes, 'minute')
@@ -211,7 +211,15 @@ export const FRESHNESS_TEXT_CLASS: Record<FreshnessLevel, string> = {
   unknown: 'text-muted-foreground',
 }
 
+/**
+ * Only a same-origin path may come back: `//evil.example` (protocol-relative) and
+ * `/\evil.example` (browsers normalise the backslash to `/`) both start with `/`
+ * yet resolve to another host — react-router's history falls back to
+ * `window.location.assign` when `pushState` rejects the cross-origin URL, which
+ * turns the post-login redirect into an open redirect.
+ */
 export function safeRedirect(redirect: string | null, fallback = '/'): string {
   if (!redirect || !redirect.startsWith('/')) return fallback
+  if (redirect.startsWith('//') || redirect.startsWith('/\\')) return fallback
   return redirect
 }

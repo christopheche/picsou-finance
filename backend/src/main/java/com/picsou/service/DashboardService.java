@@ -4,6 +4,7 @@ import com.picsou.dto.DashboardResponse;
 import com.picsou.dto.DashboardResponse.DistributionItem;
 import com.picsou.dto.DashboardResponse.NetWorthPoint;
 import com.picsou.dto.GoalProgressResponse;
+import com.picsou.dto.TimeRange;
 import com.picsou.model.Account;
 import com.picsou.model.AccountHolding;
 import com.picsou.model.AccountType;
@@ -123,14 +124,12 @@ public class DashboardService {
 
         // Build history using shared HistoryService
         List<Long> allAccountIds = accounts.stream().map(Account::getId).toList();
-        int months = switch (range != null ? range : "1Y") {
-            case "7D", "1M" -> 1;
-            case "3M" -> 3;
-            case "YTD" -> LocalDate.now().getMonthValue();
-            case "ALL" -> 1200;
-            default -> 12;
-        };
-        List<NetWorthPoint> updatedHistory = historyService.buildHistory(allAccountIds, months, memberId);
+        // One place decides what a range means: TimeRange. The month count this used to derive
+        // could not express "since 1 January" -- a count is anchored on today, so YTD started at
+        // today minus N months (5 September -> 5 December of the previous year) and only the
+        // frontend's own client-side filter hid it.
+        LocalDate from = TimeRange.fromString(range).fromDate();
+        List<NetWorthPoint> updatedHistory = historyService.buildHistory(allAccountIds, from, false, memberId);
 
         // Percentages are shares of their own side of the balance sheet:
         // assets divide by totalAssets, liabilities by totalLiabilities (issue #18).

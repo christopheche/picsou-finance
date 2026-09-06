@@ -15,11 +15,13 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -72,7 +74,8 @@ class DashboardServiceTest {
         when(accountService.valuation(account))
             .thenReturn(new AccountService.Valuation(
                 new BigDecimal("5000"), new BigDecimal("5000"), false, true, false));
-        when(historyService.buildHistory(List.of(1L), 12, 42L)).thenReturn(List.of());
+        when(historyService.buildHistory(eq(List.of(1L)), any(LocalDate.class), eq(false), eq(42L)))
+            .thenReturn(List.of());
         when(goalRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of());
 
         DashboardResponse response = dashboardService.getDashboard(42L, "1Y");
@@ -100,7 +103,8 @@ class DashboardServiceTest {
         when(accountService.valuation(account))
             .thenReturn(new AccountService.Valuation(
                 new BigDecimal("2000"), new BigDecimal("1000"), true, true, false));
-        when(historyService.buildHistory(List.of(1L), 12, 42L)).thenReturn(List.of());
+        when(historyService.buildHistory(eq(List.of(1L)), any(LocalDate.class), eq(false), eq(42L)))
+            .thenReturn(List.of());
         when(goalRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of());
 
         DashboardResponse response = dashboardService.getDashboard(42L, "1Y");
@@ -164,7 +168,8 @@ class DashboardServiceTest {
         when(priceService.toEur(new BigDecimal("2000"), "EUR", null)).thenReturn(new BigDecimal("2000"));
         when(priceService.toEur(new BigDecimal("6000"), "EUR", null)).thenReturn(new BigDecimal("6000"));
         when(accountService.liveBalanceEur(loanAcc)).thenReturn(new BigDecimal("10000"));
-        when(historyService.buildHistory(List.of(1L, 2L, 10L), 12, 42L)).thenReturn(List.of());
+        when(historyService.buildHistory(eq(List.of(1L, 2L, 10L)), any(LocalDate.class), eq(false), eq(42L)))
+            .thenReturn(List.of());
         when(goalRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of());
 
         DashboardResponse response = dashboardService.getDashboard(42L, "1Y");
@@ -187,7 +192,8 @@ class DashboardServiceTest {
         // Amortization has progressed: remaining capital 9500 < stored 10000.
         when(accountService.liveBalanceEur(loanAcc)).thenReturn(new BigDecimal("9500"));
         when(priceService.toEur(new BigDecimal("2000"), "EUR", null)).thenReturn(new BigDecimal("2000"));
-        when(historyService.buildHistory(List.of(10L, 1L), 12, 42L)).thenReturn(List.of());
+        when(historyService.buildHistory(eq(List.of(10L, 1L)), any(LocalDate.class), eq(false), eq(42L)))
+            .thenReturn(List.of());
         when(goalRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of());
 
         DashboardResponse response = dashboardService.getDashboard(42L, "1Y");
@@ -200,18 +206,39 @@ class DashboardServiceTest {
     }
 
     @Test
-    void getDashboard_rangeSwitch_mapsMonths() {
+    void getDashboard_rangeSwitch_mapsToTheRangeStartDate() {
         Account cashAcc = cashAccount();
         when(accountRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of(cashAcc));
         when(holdingRepository.findByAccount_Id(1L)).thenReturn(List.of());
         when(priceService.toEur(new BigDecimal("2000"), "EUR", null)).thenReturn(new BigDecimal("2000"));
-        when(historyService.buildHistory(List.of(1L), 3, 42L)).thenReturn(List.of());
+        when(historyService.buildHistory(eq(List.of(1L)), any(LocalDate.class), eq(false), eq(42L)))
+            .thenReturn(List.of());
         when(goalRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of());
 
         dashboardService.getDashboard(42L, "3M");
 
-        // Range "3M" maps to a 3-month history window.
-        verify(historyService).buildHistory(List.of(1L), 3, 42L);
+        // Range "3M" starts the history three months back.
+        verify(historyService).buildHistory(
+            List.of(1L), LocalDate.now().minusMonths(3), false, 42L);
+    }
+
+    @Test
+    void getDashboard_ytd_startsOnJanuaryFirst_notTodayMinusNMonths() {
+        // A month count is anchored on today, so "YTD" used to start at today minus N months
+        // (5 September -> 5 December of the previous year). Only the frontend's own client-side
+        // filter hid it; a direct consumer of the endpoint got the wrong window.
+        Account cashAcc = cashAccount();
+        when(accountRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of(cashAcc));
+        when(holdingRepository.findByAccount_Id(1L)).thenReturn(List.of());
+        when(priceService.toEur(new BigDecimal("2000"), "EUR", null)).thenReturn(new BigDecimal("2000"));
+        when(historyService.buildHistory(eq(List.of(1L)), any(LocalDate.class), eq(false), eq(42L)))
+            .thenReturn(List.of());
+        when(goalRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of());
+
+        dashboardService.getDashboard(42L, "YTD");
+
+        verify(historyService).buildHistory(
+            List.of(1L), LocalDate.now().withDayOfYear(1), false, 42L);
     }
 
     /** LOAN 10000 EUR (id 10) + CHECKING 2000 EUR (id 1), no holdings, toEur pass-through. */
@@ -225,7 +252,8 @@ class DashboardServiceTest {
         // row exists), not through the raw stored-balance conversion.
         when(accountService.liveBalanceEur(loanAcc)).thenReturn(new BigDecimal("10000"));
         when(priceService.toEur(new BigDecimal("2000"), "EUR", null)).thenReturn(new BigDecimal("2000"));
-        when(historyService.buildHistory(List.of(10L, 1L), 12, 42L)).thenReturn(List.of());
+        when(historyService.buildHistory(eq(List.of(10L, 1L)), any(LocalDate.class), eq(false), eq(42L)))
+            .thenReturn(List.of());
         when(goalRepository.findAllByMemberIdOrderByCreatedAtAsc(42L)).thenReturn(List.of());
     }
 

@@ -229,8 +229,9 @@ public class FinaryApiSyncService {
                 })
                 .collect(Collectors.toList());
 
-            // Fetch existing Picsou accounts for this member
+            // Fetch the member's accounts that may be mapped onto (manual, unbound or Finary-bound)
             List<AccountResponse> existing = accountRepository.findAllByMemberIdOrderByCreatedAtAsc(memberId).stream()
+                .filter(FinaryPersistenceHelper::isMappable)
                 .map(a -> AccountResponse.from(a, a.getCurrentBalance()))
                 .collect(Collectors.toList());
 
@@ -268,7 +269,7 @@ public class FinaryApiSyncService {
             throw e;
         } catch (Exception e) {
             log.error("Finary API preview failed: {}", e.getMessage(), e);
-            throw new SyncException("Finary API preview failed: " + e.getMessage(), e);
+            throw new SyncException("Finary sync failed. Please try again later.", e);
         }
     }
 
@@ -319,6 +320,11 @@ public class FinaryApiSyncService {
                 account = accountRepository.findByIdAndMemberId(mapping.targetAccountId(), memberId)
                     .orElseThrow(() -> new SyncException(
                         "Account " + mapping.targetAccountId() + " not found"));
+                if (!FinaryPersistenceHelper.isMappable(account)) {
+                    throw new IllegalArgumentException(
+                        "Only manual accounts can be mapped to a Finary account -- '"
+                            + account.getName() + "' is synced by another provider");
+                }
                 account.setCurrentBalance(BigDecimal.valueOf(finaryAcc.balance() != null ? finaryAcc.balance() : 0));
                 account.setCurrency(finaryAcc.currency() != null ? finaryAcc.currency().code() : "EUR");
                 account.setLastSyncedAt(Instant.now());
@@ -445,7 +451,7 @@ public class FinaryApiSyncService {
             throw e;
         } catch (RuntimeException e) {
             log.error("Finary auto-sync failed for member {}: {}", memberId, e.getMessage(), e);
-            throw new SyncException("Finary auto-sync failed: " + e.getMessage(), e);
+            throw new SyncException("Finary sync failed. Please try again later.", e);
         }
     }
 

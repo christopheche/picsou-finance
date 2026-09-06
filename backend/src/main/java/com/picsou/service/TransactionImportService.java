@@ -26,11 +26,14 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -104,9 +107,29 @@ public class TransactionImportService {
             throw new IllegalArgumentException("Preview does not belong to this account");
         }
 
+        if (req.sideValueMap() != null) {
+            for (String target : req.sideValueMap().values()) {
+                if (!TransactionRowMapper.isBuyOrSell(target)) {
+                    throw new IllegalArgumentException(
+                        "Side values can only be mapped to BUY or SELL (got '" + target + "')");
+                }
+            }
+        }
+
         CsvDialect dialect = toDialect(req.dialect());
         List<List<String>> rows = CsvReader.parse(cached.content(), dialect.delimiter());
         List<List<String>> dataRows = req.hasHeaderRow() && !rows.isEmpty() ? rows.subList(1, rows.size()) : rows;
+
+        // Rows already stored for this account, as a multiset of trade keys: re-running an import
+        // (after fixing a mapping) or importing an updated export that overlaps the previous one
+        // must not duplicate trades and double the position. Two identical trades inside one
+        // file are both kept -- only rows that match a persisted one are dropped.
+        Map<String, Integer> alreadyImported = new HashMap<>();
+        for (Transaction existing : transactionRepository.findByAccountIdOrderByDateDesc(account.getId())) {
+            if (existing.isManual() && existing.getTxType() != null) {
+                alreadyImported.merge(tradeKey(existing), 1, Integer::sum);
+            }
+        }
 
         List<Transaction> toSave = new ArrayList<>();
         List<RowError> errors = new ArrayList<>();
@@ -114,8 +137,16 @@ public class TransactionImportService {
 
         for (List<String> row : dataRows) {
             try {
-                toSave.add(rowMapper.map(row, req.mapping(), dialect,
-                    req.sideValueMap(), req.feesIncludedInAmount(), account));
+                Transaction tx = rowMapper.map(row, req.mapping(), dialect,
+                    req.sideValueMap(), req.feesIncludedInAmount(), account);
+                String key = tradeKey(tx);
+                int remaining = alreadyImported.getOrDefault(key, 0);
+                if (remaining > 0) {
+                    alreadyImported.put(key, remaining - 1);
+                    errors.add(new RowError(rowNumber, "Already imported -- an identical transaction exists on this account"));
+                } else {
+                    toSave.add(tx);
+                }
             } catch (IllegalArgumentException ex) {
                 errors.add(new RowError(rowNumber, ex.getMessage()));
             }
@@ -133,6 +164,16 @@ public class TransactionImportService {
     }
 
     // --- Helpers ----------------------------------------------------------------------------
+
+    /** Identity of a trade for idempotency: same day, side, instrument, quantity, price and fees. */
+    private static String tradeKey(Transaction tx) {
+        return tx.getDate() + "|" + tx.getTxType() + "|" + tx.getTicker()
+            + "|" + plain(tx.getQuantity()) + "|" + plain(tx.getPricePerUnit()) + "|" + plain(tx.getFees());
+    }
+
+    private static String plain(BigDecimal v) {
+        return (v == null ? BigDecimal.ZERO : v).stripTrailingZeros().toPlainString();
+    }
 
     private Account getInvestmentAccount(Long accountId, Long memberId) {
         Account account = accountRepository.findByIdAndMemberId(accountId, memberId)

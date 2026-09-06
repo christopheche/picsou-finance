@@ -52,6 +52,26 @@ public class FinaryPersistenceHelper {
     ) {}
 
     /**
+     * External id prefix shared by both Finary paths ({@code finary_<category>_<id>}).
+     */
+    public static final String EXTERNAL_ID_PREFIX = "finary_";
+
+    /**
+     * Whether a Picsou account may be the target of a {@code MAP_EXISTING} mapping.
+     *
+     * <p>Mapping rebinds {@code externalAccountId}, replaces the non-manual transactions and
+     * rebuilds the whole snapshot history from Finary flows. On a provider-synced account
+     * (Trade Republic, IBKR, Enable Banking...) that would orphan the connector's account --
+     * it recreates a duplicate on its next sync -- and erase the daily valuation history, so
+     * only manual accounts that are unbound or already bound to Finary qualify.
+     */
+    public static boolean isMappable(Account account) {
+        return account.isManual()
+            && (account.getExternalAccountId() == null
+                || account.getExternalAccountId().startsWith(EXTERNAL_ID_PREFIX));
+    }
+
+    /**
      * Reconstruct balance snapshots by walking backwards from current balance
      */
     public int reconstructSnapshots(Account account, ParsedFinaryAccount finaryAcc,
@@ -94,12 +114,18 @@ public class FinaryPersistenceHelper {
             .build());
         count++;
 
-        // Walk backwards through transactions
+        // Walk backwards through transactions (date-desc, so a day's rows are contiguous).
+        // A snapshot dated D is the end-of-day balance, like the scheduler's daily row: record
+        // it before subtracting D's own flows, then carry the pre-history balance to the day
+        // before the earliest transaction so the first flow still reads as a step.
         Map<LocalDate, BigDecimal> snapshots = new LinkedHashMap<>();
+        LocalDate earliest = null;
         for (ParsedFinaryTransaction tx : accountTx) {
+            snapshots.putIfAbsent(tx.date(), runningBalance);
             runningBalance = runningBalance.subtract(tx.amount());
-            snapshots.put(tx.date(), runningBalance);
+            earliest = tx.date();
         }
+        snapshots.putIfAbsent(earliest.minusDays(1), runningBalance);
 
         // Remove today to avoid duplicate with the anchor point above
         snapshots.remove(today);
@@ -189,12 +215,15 @@ public class FinaryPersistenceHelper {
             .build());
         count++;
 
-        // Walk backwards through transactions
+        // Walk backwards through transactions -- same end-of-day rule as reconstructSnapshots()
         Map<LocalDate, BigDecimal> snapshots = new LinkedHashMap<>();
+        LocalDate earliest = null;
         for (Transaction tx : accountTx) {
+            snapshots.putIfAbsent(tx.getDate(), runningBalance);
             runningBalance = runningBalance.subtract(tx.getAmount());
-            snapshots.put(tx.getDate(), runningBalance);
+            earliest = tx.getDate();
         }
+        snapshots.putIfAbsent(earliest.minusDays(1), runningBalance);
 
         // Remove today to avoid duplicate with anchor
         snapshots.remove(today);

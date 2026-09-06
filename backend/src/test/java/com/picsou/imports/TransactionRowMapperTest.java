@@ -163,4 +163,28 @@ class TransactionRowMapperTest {
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("ticker");
     }
+
+    @Test
+    void sideValueMapTargetOutsideBuySell_throwsUserSafeMessage() {
+        stubResolver();
+        List<String> row = List.of("2024-01-15", "Achat", "AAPL", "10", "85.20", "0");
+
+        // A localised typo ("ACHAT") must not surface Enum.valueOf's class-name message, and a
+        // non-trade type (DIVIDEND) must not be accepted: holdings only read BUY/SELL.
+        assertThatThrownBy(() -> mapper.map(row, mappingWithPrice(), dialect, Map.of("Achat", "ACHAT"), false, account))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("BUY or SELL")
+            .satisfies(ex -> assertThat(ex.getMessage()).doesNotContain("com.picsou"));
+        assertThatThrownBy(() -> mapper.map(row, mappingWithPrice(), dialect, Map.of("Achat", "DIVIDEND"), false, account))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("BUY or SELL");
+    }
+
+    @Test
+    void isBuyOrSell_acceptsCaseInsensitiveBuySellOnly() {
+        assertThat(TransactionRowMapper.isBuyOrSell(" sell ")).isTrue();
+        assertThat(TransactionRowMapper.isBuyOrSell("BUY")).isTrue();
+        assertThat(TransactionRowMapper.isBuyOrSell("DEPOSIT")).isFalse();
+        assertThat(TransactionRowMapper.isBuyOrSell(null)).isFalse();
+    }
 }

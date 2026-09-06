@@ -130,6 +130,75 @@ class TransactionImportServiceTest {
     }
 
     @Test
+    void executeImport_sideValueMapOutsideBuySell_isRejectedBeforeAnyRowIsParsed() {
+        when(accountRepository.findByIdAndMemberId(2L, 10L)).thenReturn(Optional.of(pea()));
+
+        String token = service.preview(2L, 10L, file(CSV)).fileToken();
+        TransactionImportRequest req = new TransactionImportRequest(
+            token, mapping(), dialect(), true, false, java.util.Map.of("Achat", "ACHAT"));
+
+        assertThatThrownBy(() -> service.executeImport(2L, 10L, req))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("BUY or SELL")
+            .satisfies(ex -> assertThat(ex.getMessage()).doesNotContain("com.picsou"));
+        verify(transactionRepository, org.mockito.Mockito.never()).saveAll(any());
+    }
+
+    @Test
+    void executeImport_rowsAlreadyStoredForTheAccount_areSkippedAsDuplicates() {
+        Account account = pea();
+        when(accountRepository.findByIdAndMemberId(2L, 10L)).thenReturn(Optional.of(account));
+        when(instrumentFieldResolver.resolve(any(), any()))
+            .thenReturn(new InstrumentFieldResolver.ResolvedInstrument("AAPL", "Apple", "Apple"));
+        // The first import's BUY row is already persisted (same day/side/ticker/qty/price/fees,
+        // stored with a different BigDecimal scale); the SELL row is not.
+        Transaction stored = Transaction.builder().account(account).date(java.time.LocalDate.of(2024, 1, 15))
+            .txType(com.picsou.model.TransactionType.BUY).ticker("AAPL")
+            .quantity(new java.math.BigDecimal("10.00000000")).pricePerUnit(new java.math.BigDecimal("85.2"))
+            .fees(new java.math.BigDecimal("1")).amount(new java.math.BigDecimal("-853")).description("Apple")
+            .isManual(true).build();
+        when(transactionRepository.findByAccountIdOrderByDateDesc(2L)).thenReturn(List.of(stored));
+
+        String token = service.preview(2L, 10L, file(CSV)).fileToken();
+        TransactionImportRequest req =
+            new TransactionImportRequest(token, mapping(), dialect(), true, false, null);
+
+        TransactionImportResultResponse result = service.executeImport(2L, 10L, req);
+
+        assertThat(result.imported()).isEqualTo(1);
+        assertThat(result.skipped()).isEqualTo(1);
+        assertThat(result.errors()).hasSize(1);
+        assertThat(result.errors().get(0).rowNumber()).isEqualTo(2);
+        assertThat(result.errors().get(0).message()).contains("Already imported");
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<Transaction>> captor = ArgumentCaptor.forClass(List.class);
+        verify(transactionRepository).saveAll(captor.capture());
+        assertThat(captor.getValue()).hasSize(1);
+        assertThat(captor.getValue().get(0).getTxType()).isEqualTo(com.picsou.model.TransactionType.SELL);
+    }
+
+    @Test
+    void executeImport_identicalRowsWithinOneFile_areBothKept() {
+        when(accountRepository.findByIdAndMemberId(2L, 10L)).thenReturn(Optional.of(pea()));
+        when(instrumentFieldResolver.resolve(any(), any()))
+            .thenReturn(new InstrumentFieldResolver.ResolvedInstrument("AAPL", "Apple", "Apple"));
+
+        // Two partial fills at the same price on the same day are two trades, not a duplicate.
+        String csv = "date,side,ticker,quantity,price,fees\n"
+            + "2024-01-15,BUY,AAPL,10,85.20,1.00\n"
+            + "2024-01-15,BUY,AAPL,10,85.20,1.00\n";
+        String token = service.preview(2L, 10L, file(csv)).fileToken();
+        TransactionImportRequest req =
+            new TransactionImportRequest(token, mapping(), dialect(), true, false, null);
+
+        TransactionImportResultResponse result = service.executeImport(2L, 10L, req);
+
+        assertThat(result.imported()).isEqualTo(2);
+        assertThat(result.skipped()).isZero();
+    }
+
+    @Test
     void preview_headerOnlyFile_reportsZeroDataRows() {
         when(accountRepository.findByIdAndMemberId(2L, 10L)).thenReturn(Optional.of(pea()));
 

@@ -7,7 +7,6 @@ import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
 import java.time.LocalDate;
-import java.time.YearMonth;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
@@ -185,15 +184,36 @@ public class LoanAmortizationService {
 
     private static int computeTotalInstallments(LocalDate startDate, LocalDate endDate) {
         if (startDate == null || endDate == null || !endDate.isAfter(startDate)) return 0;
-        long months = ChronoUnit.MONTHS.between(YearMonth.from(startDate), YearMonth.from(endDate));
-        return (int) Math.max(months, 0);
+        return (int) Math.max(monthsElapsed(startDate, endDate), 0);
     }
 
+    /**
+     * How many installments have fallen due at {@code asOf}.
+     *
+     * <p>Counted on whole dates, not on calendar months, because installment {@code i} is dated
+     * {@code startDate.plusMonths(i)}: a loan starting on the 20th used to be reported as one
+     * installment paid on the 1st of the next month, nineteen days before the schedule's own
+     * date for it, and {@code remainingBalance} — which the daily snapshot of every LOAN account
+     * is taken from — stepped down on that wrong day.
+     */
     private static int computePaidInstallments(LocalDate startDate, LocalDate asOf, int totalInstallments) {
         if (startDate == null || asOf == null || totalInstallments == 0) return 0;
         if (!asOf.isAfter(startDate)) return 0;
-        long months = ChronoUnit.MONTHS.between(YearMonth.from(startDate), YearMonth.from(asOf));
-        return (int) Math.min(Math.max(months, 0), totalInstallments);
+        return (int) Math.min(Math.max(monthsElapsed(startDate, asOf), 0), totalInstallments);
+    }
+
+    /**
+     * The number of monthly anniversaries of {@code from} that are on or before {@code to} —
+     * i.e. the largest {@code n} with {@code from.plusMonths(n) <= to}.
+     *
+     * <p>{@code MONTHS.between} alone is off by one when {@code plusMonths} had to clamp the
+     * day-of-month (31 Jan + 1 month = 28 Feb): it reports an incomplete month where the
+     * schedule dates an installment exactly on {@code to}.
+     */
+    private static long monthsElapsed(LocalDate from, LocalDate to) {
+        long months = ChronoUnit.MONTHS.between(from, to);
+        if (months >= 0 && !from.plusMonths(months + 1).isAfter(to)) months++;
+        return months;
     }
 
     /**

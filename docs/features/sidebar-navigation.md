@@ -25,7 +25,7 @@ The switcher loads family members through `useFamilyMembers({ enabled: canSwitch
 
 ### Mobile: `MobileBottomNav` (hidden on desktop via `md:hidden`)
 
-A fixed bottom bar with the Picsou logo centered and 2 nav items on each side:
+A fixed bottom bar with the Picsou logo centered and the nav items split evenly on each side. The items are `NAV_ITEMS` from `sidebar-nav-items.ts` — the same registry the desktop sidebar renders — plus `CLASSIC_SETTINGS_NAV_ITEM`, since a phone has no profile menu to tuck Settings into. Adding a route to the registry therefore reaches both navs; the bar never keeps its own copy. `end` is derived as `path === '/'`, as in `AppSidebar`.
 
 ```
 [Dashboard] [Accounts] [LOGO] [Goals] [Settings]
@@ -75,6 +75,7 @@ Active nav items keep Lucide icons stroke-only. The item gets `ring-1 ring-borde
 ## Tests
 
 - `frontend/src/components/layout/AppSidebar.test.tsx` covers the admin switcher, query disabling for non-admins, managed-profile filtering, and Query invalidation on profile switch.
+- `frontend/src/components/layout/MobileBottomNav.test.tsx` asserts the bar renders the shared registry (plus Settings) in order, and that only the exact root path activates Dashboard.
 - Sidebar is also covered by E2E via Playwright (`bun run test:e2e`).
 
 ## Links

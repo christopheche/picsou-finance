@@ -244,6 +244,22 @@ All theme color tokens are defined in the `@theme` block of `frontend/src/index.
 
 Use icons from `lucide-react` as direct JSX components (e.g., `<Pencil className="size-4" />`). No other icon libraries.
 
+### Accessible names and states
+
+A control whose only content is an icon, a colour or a shape has no accessible name — a screen
+reader announces a bare "button". Give it one, and expose its state:
+
+- **Icon-only / colour-only buttons**: `aria-label` (a translated key, or the value itself for a
+  colour swatch) plus `title` for the mouse. `ColorPicker` and `LogoPicker` are the reference.
+- **Toggle-like buttons** that are not `ui/` primitives — filter tabs, sort buttons,
+  `TimeRangeSelector`, segment toggles — carry `aria-pressed={isActive}`; the highlight class
+  alone is invisible to assistive tech.
+- **Never label a dismiss control with the literal `x`**: use an `<X />` icon plus
+  `aria-label={t('common.close')}`.
+- **Anything reachable only by hovering** (a treemap tile, a chart hotspot) must be a real
+  `<button>` with the tooltip content in its `aria-label`, and must drive the same highlight from
+  `onFocus`/`onBlur` as from the mouse — otherwise keyboard users can never reach the value.
+
 ## Internationalization
 
 - react-i18next with FR (default), EN, DE, ES.
@@ -251,12 +267,14 @@ Use icons from `lucide-react` as direct JSX components (e.g., `<Pencil className
 - Supported languages live in the `SUPPORTED_LOCALES` registry (`frontend/src/i18n/locales.ts`); selectors and `Intl` formatting derive from it — never hardcode language lists in components. Normalize raw tags with `resolveLocale()`.
 - Flat keys with feature-based grouping.
 - All user-visible text must use `useTranslation()` — no hardcoded strings in any language.
-- Currency/date/number formatting via `Intl.*` through the `frontend/src/lib/utils.ts` helpers (`formatCurrency`, `formatDate`…), which resolve the active locale via `getLocale()`.
+- Currency/date/number formatting via `Intl.*` through the `frontend/src/lib/utils.ts` helpers (`formatCurrency`, `formatDate`, `formatNumber`, `formatPercent`…), which resolve the active locale via `getLocale()`. Bare `value.toLocaleString()` and `toFixed()` read the *browser* locale, not the app language — never use them for displayed figures, chart axis ticks included.
 - Full details: [`docs/features/i18n.md`](../features/i18n.md).
 
 ## Types
 
 `frontend/src/types/api.ts` mirrors backend DTO records exactly (e.g., `AccountResponse`, `GoalProgressResponse`). When a backend DTO changes, update this file to match.
+
+The backend serialises with Jackson `default-property-inclusion: non_null`, so a null member is *omitted*: every `T | null` here is `T | undefined` at runtime. Test such fields with `== null` or optional chaining — `=== null` never matches.
 
 ## Charts
 

@@ -1,6 +1,6 @@
 # Feature: Frontend utility library (`frontend/src/lib/utils.ts`)
 
-> Last updated: 2026-08-07 (date-only values anchored at local midnight)
+> Last updated: 2026-09-06 (`parseApiDate` exported for charts, `toLocalIsoDate`, `formatNumber`)
 
 ## Context
 
@@ -21,12 +21,15 @@ Shared formatting functions used across the frontend. Centralised in one file to
 | `getLocale` | `() => string` | Intl locale (`'fr-FR'`, `'en-US'`, `'de-DE'`, `'es-ES'`) resolved from `document.documentElement.lang` via `localeFromLanguage()` |
 | `localeFromLanguage` | `(language) => string` | Maps i18n/browser language tags to the registry's Intl locale (`resolveLocale().intlLocale`) |
 | `formatCurrency` | `(value, currency='EUR', locale=getLocale())` | `"1 234,50 €"`; falls back to decimal + code for invalid currency values |
+| `parseApiDate` | `(dateStr) => Date` | `"2026-04-08"` → local midnight of 8 April; a value carrying a time is left to `Date` |
+| `toLocalIsoDate` | `(date=new Date()) => string` | `"2026-04-08"` — the *local* calendar day, for values sent to the API as a `LocalDate` |
 | `formatDate` | `(dateStr, locale=getLocale(), format?)` | `"08/04/2026"` (locale) or `"08-04-2026"` (iso) |
 | `parseDate` | `(input, locale=getLocale(), format=store.dateFormat) => string \| null` | `"08/04/2026"` → `"2026-04-08"` (inverse of `formatDate`); `null` if unparseable |
 | `formatDateTime` | `(dateStr, locale=getLocale(), format?)` | `"08/04/2026 14:30"` (locale) or `"08-04-2026 14:30"` (iso) |
 | `normalizeDecimal` | `(value: string \| null \| undefined) => string` | `"12,50"` → `"12.50"` (replaces first `,` with `.`) |
 | `parseAmount` | `(value: string \| null \| undefined) => number` | `"12,50"` → `12.5`; tolerant `parseFloat` over `normalizeDecimal` |
 | `formatLocalDate` | `(dateStr, locale=getLocale())` | `"8 avril 2026"` (long month) |
+| `formatNumber` | `(value, locale=getLocale(), fractionDigits?)` | `"1 234,5"`; with `fractionDigits` pinned like `toFixed(n)` — the app-locale twin of `toLocaleString()` |
 | `formatPercent` | `(value, locale=getLocale())` | `"50,0 %"` — value is a ratio (0.5 → 50%) |
 | `formatTimeAgo` | `(dateStr, locale=getLocale())` | `"il y a 3 heures"` via `Intl.RelativeTimeFormat` |
 | `todayLabel` | `(locale=getLocale(), date=new Date())` | `"Mardi 8 avril 2026"` (weekday + full date, sentence-cased) |
@@ -98,7 +101,9 @@ Wired into the four date fields: `AddTransactionModal` (transaction date),
 - **`formatDate` format resolution**: reads `useAppStore.getState().dateFormat` at call time (`'locale'` or `'iso'`). The optional `format` parameter overrides the store value — used by callers that need a specific format regardless of user preference.
 - **Store import in `utils.ts`**: `formatDate` imports `useAppStore` directly — safe because `app-store.ts` has no dependency on `utils.ts` (no circular dependency).
 - **`formatPercent` expects a ratio** (0.5 = 50%), not a percentage value. Passing `50` instead of `0.5` will output `"5 000 %"`.
-- **Date-only values are anchored at local midnight** — `new Date("2026-04-08")` is specified to parse as *UTC* midnight, so west of UTC every backend `LocalDate` (transaction dates, goal deadlines, `priceAsOf`) rendered as the day before. `formatDate`, `formatDateTime`, `formatLocalDate`, `formatTimeAgo` and `freshnessLevel` all route through a shared `toDate` helper that appends `T00:00:00` to a `yyyy-MM-dd` string and leaves anything carrying a time to `Date` untouched — there the offset is real information, not a parsing artefact. This gotcha used to advise reaching for `formatLocalDate` instead, which had the identical flaw; the choice between them is now purely about long-month vs compact output.
+- **Date-only values are anchored at local midnight** — `new Date("2026-04-08")` is specified to parse as *UTC* midnight, so west of UTC every backend `LocalDate` (transaction dates, goal deadlines, `priceAsOf`) rendered as the day before. `formatDate`, `formatDateTime`, `formatLocalDate`, `formatTimeAgo` and `freshnessLevel` all route through the exported `parseApiDate` helper, which appends `T00:00:00` to a `yyyy-MM-dd` string and leaves anything carrying a time to `Date` untouched — there the offset is real information, not a parsing artefact. Anything that needs the *instant* rather than a label — a time-scale axis (`NetWorthChart`'s `dateMs`), a range filter (`components/shared/chart-range.ts`), a tick formatter, a `Intl.DateTimeFormat.format()` call — must call `parseApiDate` too; a bare `new Date(p.date)` on a backend `LocalDate` puts the point on the previous day west of UTC. This gotcha used to advise reaching for `formatLocalDate` instead, which had the identical flaw; the choice between them is now purely about long-month vs compact output.
+- **Dates sent to the API come from `toLocalIsoDate`, never `toISOString().slice(0, 10)`** — the latter is the UTC day: in Paris it is still yesterday until 01:00/02:00 (a deposit entered just after midnight was dated the day before), and west of UTC an evening entry is dated tomorrow.
+- **Plain numbers go through `formatNumber`, percentages through `formatPercent`** — `value.toLocaleString()` with no argument and `toFixed()` read the *browser* locale, so a French UI in an en-US browser showed `1,234.5 parts` next to `1 234,50 €` on the same row. Chart axis ticks keep a literal `k`/`M` suffix around a `formatNumber` value on purpose: `Intl`'s compact notation spells the unit out in German and Spanish (`1,5 Tsd.`, `1,5 mil`) and no longer fits the axis gutter.
 - **`parseDate` is the strict inverse of `formatDate`** — the year is the last token in every shape we render (`dd-mm-yyyy`, `dd/mm/yyyy`, `mm/dd/yyyy`); only day/month order varies (`mm/dd` for **en-US in non-iso mode**, `dd/mm` otherwise). It accepts `/`, `-`, `.` separators interchangeably, expands 2-digit years to the 2000s, and round-trips impossible dates (e.g. `31/02`) to `null` by re-checking via `new Date`. When changing `formatDate`'s output shape, update `parseDate` and the round-trip test together.
 - **`DateInput` desktop branch never emits an invalid ISO** — `onChange` fires only when `parseDate` succeeds (or `''` on clear). Consumers therefore can't rely on `onChange` firing for every keystroke; the displayed text is internal state until it parses.
 - **`safeRedirect` is a security guard** — always use it before redirecting to a URL from query params to prevent open redirect attacks. It only lets a same-origin *path* through: absolute URLs, protocol-relative `//host` and `/\host` (which browsers normalise to `//host`) all fall back to `/`. The last two matter because react-router's `navigate()` does not treat them as external — `pushState` rejects the cross-origin URL and the history layer falls back to `window.location.assign`, i.e. a real cross-site navigation right after login.
@@ -107,4 +112,4 @@ Wired into the four date fields: `AddTransactionModal` (transaction date),
 
 ## Tests
 
-- `frontend/src/lib/utils.test.ts` — covers `cn`, `formatCurrency` including invalid currency/locale fallback, `formatDate`, `formatPercent`, `formatTimeAgo` (date-only anchoring west of UTC, agreement with `freshnessLevel`), `safeRedirect` (same-origin path kept; absolute, `//host` and `/\host` rejected), and `parseDate` (dd/mm vs mm/dd ordering, iso mode, mixed separators, 2-digit years, impossible-date rejection, malformed input, and the `formatDate`∘`parseDate` round-trip across both formats × both locales).
+- `frontend/src/lib/utils.test.ts` — covers `cn`, `formatCurrency` including invalid currency/locale fallback, `formatDate`, `parseApiDate` (local-midnight anchoring west of UTC), `toLocalIsoDate` (local day on both sides of UTC), `formatNumber`, `formatPercent`, `formatTimeAgo` (date-only anchoring west of UTC, agreement with `freshnessLevel`), `safeRedirect` (same-origin path kept; absolute, `//host` and `/\host` rejected), and `parseDate` (dd/mm vs mm/dd ordering, iso mode, mixed separators, 2-digit years, impossible-date rejection, malformed input, and the `formatDate`∘`parseDate` round-trip across both formats × both locales).

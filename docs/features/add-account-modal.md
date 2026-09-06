@@ -108,6 +108,11 @@ This closed issue #9: a free-text code like `AMAT` used to throw a `RangeError` 
   (`common.validation.required` / `tooLong` / `invalidNumber` / `nonNegative` / `percentage`)
   and the body renders `formState.errors` under each field with `aria-invalid`. A negative
   balance, a lone `-` in a `NumericInput` (NaN) or an over-long name now say why Save did nothing.
+- **Icon-only controls carry an accessible name.** The error banners' dismiss control is an
+  `<X />` icon with `aria-label={t('common.close')}` (it used to be the literal character `x`),
+  and the Finary mapping step's colour swatches get `aria-label`/`title` = the colour and
+  `aria-pressed` for the selected one, like `ColorPicker`. See
+  `docs/conventions/frontend.md` § Accessible names and states.
 - **A rejected `onSubmit` is shown.** `handleFormSubmit` awaits `onSubmit` and renders
   `formatApiError(err, t)` above the footer (`role="alert"`); the dialog stays open. Callers
   should let the mutation reject rather than swallow it.

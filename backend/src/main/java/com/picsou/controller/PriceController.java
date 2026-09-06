@@ -24,6 +24,15 @@ public class PriceController {
         this.priceSnapshotRepository = priceSnapshotRepository;
     }
 
+    /**
+     * Live EUR prices for a comma-separated ticker list.
+     *
+     * <p>The frontend sends every holding of every account here, crypto accounts included, and
+     * knows nothing about which symbol is a coin. {@code refreshHeldPrices} routes the ones held
+     * in a CRYPTO account crypto-only, so an unmapped coin is left unpriced instead of being
+     * shown — and recorded in {@code price_snapshot} — at the share price of the equity trading
+     * under the same symbol.
+     */
     @GetMapping
     public Map<String, BigDecimal> getPrices(@RequestParam String tickers) {
         Set<String> tickerSet = Arrays.stream(tickers.split(","))
@@ -31,7 +40,7 @@ public class PriceController {
             .filter(t -> !t.isBlank())
             .collect(Collectors.toSet());
 
-        return priceService.refreshPrices(tickerSet);
+        return priceService.refreshHeldPrices(tickerSet);
     }
 
     /**

@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useGoal, useGoalMonths, useSetMonthOverride, useDeleteMonthOverride, useSetManualContribution, useDeleteManualContribution, useExtendGoalHistory, useExtendGoalHistoryByMonth } from '@/features/goals/hooks'
+import { monthObjective } from '@/features/goals/objective'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
 import { NumericInput } from '@/components/shared/NumericInput'
 import { PageHeader } from '@/components/shared/PageHeader'
@@ -105,7 +106,7 @@ function ProgressRing({ pct, color, size = 80, stroke = 9 }: {
 function getProgressColor(entry: GoalMonthEntry, isPast: boolean): { color: string; pct: number; label: string; textColor: string } {
   if (!isPast) return { color: COLORS.muted, pct: 0, label: '···', textColor: COLORS.mutedFg }
   if (entry.effective == null) return { color: COLORS.muted, pct: 0, label: '–', textColor: COLORS.mutedFg }
-  const obj = entry.objective ?? 0
+  const obj = monthObjective(entry) ?? 0
   const ratio = obj > 0 ? entry.effective / obj : 1
   if (ratio >= 1) return { color: COLORS.success, pct: ratio, label: `${Math.round(ratio * 100)}%`, textColor: COLORS.success }
   if (ratio >= 0.6) return { color: COLORS.warning, pct: ratio, label: `${Math.round(ratio * 100)}%`, textColor: COLORS.warning }
@@ -220,7 +221,7 @@ function YearGridView({ months, selectedYm, onSelect, onAddPreviousMonth, isAddi
                         </div>
                       </div>
                       <span className="text-[10px] text-muted-foreground leading-none">
-                        obj.&nbsp;{formatCompact(entry.objective, locale, currency)}
+                        obj.&nbsp;{formatCompact(monthObjective(entry), locale, currency)}
                       </span>
                     </button>
                   )
@@ -253,7 +254,7 @@ function TimelineView({ months, selectedYm, onSelect }: {
       <CardContent className="p-4 space-y-1">
         {sorted.map(entry => {
           const isSelected = selectedYm === entry.yearMonth
-          const obj = entry.objective ?? 0
+          const obj = monthObjective(entry) ?? 0
           const eff = entry.effective ?? 0
           const pct = obj > 0 ? Math.min(100, (eff / obj) * 100) : (eff > 0 ? 100 : 0)
           const barClass = pct >= 100 ? 'bg-primary' : pct >= 60 ? 'bg-primary/60' : 'bg-destructive/50'
@@ -329,7 +330,7 @@ function CalendarGridView({ months, selectedYm, onSelect }: {
                           <div className="h-full rounded-full bg-primary/70 transition-[width]" style={{ width: `${Math.min(100, pct * 100)}%` }} />
                         </div>
                         <div className="flex justify-between text-[11px] text-muted-foreground">
-                          <span>obj. <CurrencyDisplay value={entry.objective} className="text-[11px]" /></span>
+                          <span>obj. <CurrencyDisplay value={monthObjective(entry)} className="text-[11px]" /></span>
                           <span><CurrencyDisplay value={entry.effective} className="text-[11px]" /></span>
                         </div>
                       </div>
@@ -569,7 +570,7 @@ export function GoalCalendarPage() {
 
   const pastMonths = (months ?? []).filter(e => isPastOrCurrent(e.yearMonth))
   const achievedCount = pastMonths.filter(
-    e => e.effective != null && e.objective != null && e.effective >= e.objective
+    e => e.effective != null && e.effective >= monthObjective(e)
   ).length
 
   return (

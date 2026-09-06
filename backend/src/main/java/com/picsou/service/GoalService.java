@@ -24,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Clock;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.time.ZoneId;
@@ -47,6 +48,7 @@ public class GoalService {
     private final FamilyMemberRepository familyMemberRepository;
     private final HistoryService historyService;
     private final AccountAccessResolver accessResolver;
+    private final Clock clock;
 
     public GoalService(
         GoalRepository goalRepository,
@@ -57,7 +59,8 @@ public class GoalService {
         GoalManualContributionRepository manualContributionRepository,
         FamilyMemberRepository familyMemberRepository,
         HistoryService historyService,
-        AccountAccessResolver accessResolver
+        AccountAccessResolver accessResolver,
+        Clock clock
     ) {
         this.goalRepository = goalRepository;
         this.accountRepository = accountRepository;
@@ -68,6 +71,17 @@ public class GoalService {
         this.familyMemberRepository = familyMemberRepository;
         this.historyService = historyService;
         this.accessResolver = accessResolver;
+        this.clock = clock;
+    }
+
+    /**
+     * Every date decision (months left, the three-month contribution window, which months are
+     * "past") hangs off this one day. Reading it from the injected clock keeps the goal math
+     * testable on a fixed date; the zone stays the JVM default, matching {@code createdAt}
+     * conversions below.
+     */
+    private LocalDate today() {
+        return LocalDate.ofInstant(clock.instant(), ZoneId.systemDefault());
     }
 
     public List<GoalProgressResponse> findAll(Long memberId) {
@@ -147,7 +161,7 @@ public class GoalService {
             .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         BigDecimal target = goal.getTargetAmount();
-        long monthsLeft = Math.max(0, ChronoUnit.MONTHS.between(LocalDate.now(), goal.getDeadline()));
+        long monthsLeft = Math.max(0, ChronoUnit.MONTHS.between(today(), goal.getDeadline()));
 
         BigDecimal needed = target.subtract(currentTotal);
         BigDecimal monthlyNeeded;
@@ -180,7 +194,9 @@ public class GoalService {
 
     /**
      * Average monthly contribution. Primary source: balance snapshots of linked
-     * accounts over the last 3 months (first vs last, averaged over elapsed months).
+     * accounts over the last 3 months (first vs last, averaged over elapsed months),
+     * summed across accounts -- the goal moves by the sum of its accounts' paces, and
+     * this figure is compared against the goal-level {@code monthlyNeeded}.
      * Fallback for manually-tracked goals (no linked-account snapshot data): the mean
      * of the recorded manual contributions, which backfilled history then refines.
      * Returns null when neither source has data.
@@ -188,7 +204,7 @@ public class GoalService {
     private BigDecimal calculateAvgMonthlyContribution(Goal goal) {
         List<Account> accounts = goal.getAccounts();
 
-        LocalDate threeMonthsAgo = LocalDate.now().minusMonths(3).withDayOfMonth(1);
+        LocalDate threeMonthsAgo = today().minusMonths(3).withDayOfMonth(1);
         BigDecimal totalContribution = BigDecimal.ZERO;
         int accountsWithData = 0;
 
@@ -217,7 +233,7 @@ public class GoalService {
         }
 
         if (accountsWithData > 0) {
-            return totalContribution.divide(BigDecimal.valueOf(accountsWithData), 2, RoundingMode.HALF_UP);
+            return totalContribution;
         }
 
         // Fallback: mean of recorded manual contributions (includes backfilled months).
@@ -243,7 +259,7 @@ public class GoalService {
         YearMonth startMonth = YearMonth.from(
             goal.getCreatedAt().atZone(ZoneId.systemDefault()).toLocalDate()
         );
-        YearMonth currentMonth = YearMonth.now();
+        YearMonth currentMonth = YearMonth.from(today());
         if (!startMonth.isBefore(currentMonth)) return true;
 
         Map<String, BigDecimal> overrideMap = overrideRepository.findByGoalId(goal.getId()).stream()
@@ -307,7 +323,9 @@ public class GoalService {
             BigDecimal actual = calculateActualForMonth(goal, current);
             BigDecimal manualActual = manualMap.get(ym);
             BigDecimal override = overrideMap.get(ym);
-            BigDecimal effective = override != null ? override : (manualActual != null ? manualActual : actual);
+            // An override changes the month's objective, never what was saved: effective stays
+            // manualActual ?? actual, the same reading isOnTrackFromPastMonths applies.
+            BigDecimal effective = manualActual != null ? manualActual : actual;
             entries.add(new GoalMonthEntryResponse(ym, objective, actual, manualActual, override, effective));
             current = current.plusMonths(1);
         }
@@ -372,7 +390,8 @@ public class GoalService {
         BigDecimal actual = calculateActualForMonth(goal, month);
         BigDecimal manualActual = manualContributionRepository.findByGoalIdAndYearMonth(goalId, yearMonth)
             .map(GoalManualContribution::getAmount).orElse(null);
-        return new GoalMonthEntryResponse(yearMonth, objective, actual, manualActual, amount, amount);
+        BigDecimal effective = manualActual != null ? manualActual : actual;
+        return new GoalMonthEntryResponse(yearMonth, objective, actual, manualActual, amount, effective);
     }
 
     @Transactional
@@ -408,8 +427,7 @@ public class GoalService {
         BigDecimal actual = calculateActualForMonth(goal, month);
         BigDecimal override = overrideRepository.findByGoalIdAndYearMonth(goalId, yearMonth)
             .map(GoalMonthOverride::getAmount).orElse(null);
-        BigDecimal effective = override != null ? override : amount;
-        return new GoalMonthEntryResponse(yearMonth, objective, actual, amount, override, effective);
+        return new GoalMonthEntryResponse(yearMonth, objective, actual, amount, override, amount);
     }
 
     @Transactional
@@ -422,8 +440,7 @@ public class GoalService {
         BigDecimal actual = calculateActualForMonth(goal, month);
         BigDecimal override = overrideRepository.findByGoalIdAndYearMonth(goal.getId(), yearMonth)
             .map(GoalMonthOverride::getAmount).orElse(null);
-        BigDecimal effective = override != null ? override : actual;
-        return new GoalMonthEntryResponse(yearMonth, objective, actual, null, override, effective);
+        return new GoalMonthEntryResponse(yearMonth, objective, actual, null, override, actual);
     }
 
     /**
@@ -441,7 +458,7 @@ public class GoalService {
     }
 
     private BigDecimal calculateActualForMonth(Goal goal, YearMonth ym) {
-        if (ym.isAfter(YearMonth.now())) return null;
+        if (ym.isAfter(YearMonth.from(today()))) return null;
 
         LocalDate prevMonthEnd = ym.minusMonths(1).atEndOfMonth();
         LocalDate thisMonthEnd = ym.atEndOfMonth();
@@ -455,7 +472,10 @@ public class GoalService {
             Optional<BalanceSnapshot> curr = snapshotRepository
                 .findFirstByAccountIdAndDateLessThanEqualOrderByDateDesc(account.getId(), thisMonthEnd);
 
-            if (prev.isPresent() && curr.isPresent()) {
+            // Both lookups are "latest snapshot on or before": when nothing was recorded inside
+            // the month, curr resolves to the same row as prev. That is missing data (null, the
+            // month is skipped by isOnTrack), not a month in which nothing was saved (0).
+            if (prev.isPresent() && curr.isPresent() && curr.get().getDate().isAfter(prevMonthEnd)) {
                 BigDecimal delta = curr.get().getBalance().subtract(prev.get().getBalance());
                 // Same sign convention as calculateAvgMonthlyContribution: loan paydown
                 // (balance decrease) counts as positive progress.

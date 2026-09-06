@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
-import { localeFromLanguage } from '@/lib/utils'
+import { localeFromLanguage, parseApiDate } from '@/lib/utils'
 import type { RealEstatePropertyLine } from '@/types/api'
 
 interface PropertyFinancingCardProps {
@@ -69,7 +69,7 @@ export function PropertyFinancingCard({ line }: PropertyFinancingCardProps) {
                   {loan.endDate && (
                     <span className="block text-xs text-muted-foreground">
                       {new Intl.DateTimeFormat(locale, { month: 'short', year: 'numeric' })
-                        .format(new Date(loan.endDate))}
+                        .format(parseApiDate(loan.endDate))}
                     </span>
                   )}
                 </span>

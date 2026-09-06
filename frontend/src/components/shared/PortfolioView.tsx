@@ -10,7 +10,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { ErrorState } from '@/components/shared/ErrorState'
 import { formatApiError } from '@/lib/errors'
-import { cn } from '@/lib/utils'
+import { cn, formatPercent, localeFromLanguage } from '@/lib/utils'
 import { accountTypeLabelKey } from '@/lib/constants'
 import { Search } from 'lucide-react'
 
@@ -22,7 +22,8 @@ const SORT_OPTIONS: { value: SortBy; labelKey: string }[] = [
 ]
 
 function PortfolioItem({ line }: { line: PortfolioLine }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
   const isPositive = (line.pnlEur ?? 0) >= 0
   const name = portfolioLineLabel(line, t)
 
@@ -57,7 +58,7 @@ function PortfolioItem({ line }: { line: PortfolioLine }) {
           <div className="flex flex-col items-end gap-0.5">
             <span className="text-sm text-muted-foreground">{t('portfolio.pnl')}</span>
             <span className={cn('text-sm font-medium tabular-nums', isPositive ? 'text-emerald-500' : 'text-red-500')}>
-              {isPositive ? '+' : ''}{line.pnlPercent?.toFixed(1)}%
+              {isPositive ? '+' : ''}{line.pnlPercent != null ? formatPercent(line.pnlPercent / 100, locale) : '\u2014'}
             </span>
           </div>
         )}
@@ -104,9 +105,11 @@ export function PortfolioView() {
     return result
   }, [lines, sortBy, search, t])
 
+  // Over every line, not the search-filtered ones: the header says "total value" and must
+  // not quietly turn into a subtotal of whatever matches the search box.
   const totalValue = useMemo(
-    () => (sorted ?? []).reduce((sum, l) => sum + l.valueEur, 0),
-    [sorted],
+    () => (lines ?? []).reduce((sum, l) => sum + l.valueEur, 0),
+    [lines],
   )
 
   if (isLoading) {
@@ -190,6 +193,8 @@ export function PortfolioView() {
             {SORT_OPTIONS.map(opt => (
               <button
                 key={opt.value}
+                type="button"
+                aria-pressed={sortBy === opt.value}
                 onClick={() => setSortBy(opt.value)}
                 className={cn(
                   'inline-flex h-10 min-w-32 items-center justify-center whitespace-nowrap rounded-md border px-6 text-sm font-medium transition-[background-color,color,border-color]',

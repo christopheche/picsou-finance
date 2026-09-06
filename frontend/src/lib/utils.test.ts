@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { cn, formatCurrency, formatDate, formatPercent, formatTimeAgo, freshnessLevel, localeFromLanguage, parseDate, safeRedirect, todayLabel } from './utils'
+import { cn, formatCurrency, formatDate, formatNumber, formatPercent, formatTimeAgo, freshnessLevel, localeFromLanguage, parseApiDate, parseDate, safeRedirect, toLocalIsoDate, todayLabel } from './utils'
 
 describe('cn', () => {
   it('merges class names', () => {
@@ -75,6 +75,65 @@ describe('formatDate', () => {
       // rather than a parsing artefact — the date-only rule must not swallow it.
       expect(formatDate('2026-07-31T02:00:00Z', 'fr-FR', 'iso')).toBe('30-07-2026')
     })
+  })
+})
+
+describe('parseApiDate', () => {
+  // The chart components need the instant, not a label, so the local-midnight anchoring that
+  // `formatDate` relies on has to be reachable on its own — otherwise every `new Date(p.date)`
+  // on a backend LocalDate puts the point on the previous day west of UTC.
+  beforeEach(() => { vi.stubEnv('TZ', 'America/New_York') })
+  afterEach(() => { vi.unstubAllEnvs() })
+
+  it('anchors a date-only value at local midnight', () => {
+    const d = parseApiDate('2026-07-31')
+    expect([d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours()]).toEqual([2026, 7, 31, 0])
+  })
+
+  it('leaves a value that carries a time to Date', () => {
+    expect(parseApiDate('2026-07-31T02:00:00Z').getTime()).toBe(Date.UTC(2026, 6, 31, 2))
+  })
+})
+
+describe('toLocalIsoDate', () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs() })
+
+  it('names the local calendar day, not the UTC one, east of UTC', () => {
+    // 22:30Z on the 5th is already 00:30 on the 6th in Paris: the UTC day is yesterday.
+    vi.stubEnv('TZ', 'Europe/Paris')
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-05T22:30:00Z'))
+    expect(toLocalIsoDate()).toBe('2026-09-06')
+  })
+
+  it('names the local calendar day west of UTC', () => {
+    // 03:00Z on the 6th is still 23:00 on the 5th in New York: the UTC day is tomorrow.
+    vi.stubEnv('TZ', 'America/New_York')
+    expect(toLocalIsoDate(new Date('2026-09-06T03:00:00Z'))).toBe('2026-09-05')
+  })
+
+  it('zero-pads month and day', () => {
+    expect(toLocalIsoDate(new Date(2026, 0, 5))).toBe('2026-01-05')
+  })
+})
+
+describe('formatNumber', () => {
+  it('uses the app locale rather than the browser one', () => {
+    expect(formatNumber(1234.5, 'fr-FR')).toBe('1\u202f234,5')
+    expect(formatNumber(1234.5, 'en-US')).toBe('1,234.5')
+  })
+
+  it('keeps toLocaleString()’s default of up to three decimals', () => {
+    expect(formatNumber(0.12345, 'en-US')).toBe('0.123')
+  })
+
+  it('pins the decimals when asked, like toFixed', () => {
+    expect(formatNumber(1.5, 'en-US', 2)).toBe('1.50')
+    expect(formatNumber(1.5, 'fr-FR', 0)).toBe('2')
+  })
+
+  it('falls back to the default locale for an invalid one', () => {
+    expect(formatNumber(1.5, 'not-a-locale', 1)).toBe('1,5')
   })
 })
 

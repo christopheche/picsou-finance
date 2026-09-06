@@ -14,7 +14,7 @@ import {
 } from '@/components/ui/dialog'
 import { TrendingUp, TrendingDown, Loader2 } from 'lucide-react'
 import { type TimeRange } from '@/components/shared/TimeRangeSelector'
-import { formatDate } from '@/lib/utils'
+import { formatDate, formatNumber, formatPercent, localeFromLanguage } from '@/lib/utils'
 import { accountTypeLabelKey } from '@/lib/constants'
 
 type ChartMode = 'holding' | 'price'
@@ -25,12 +25,19 @@ interface HoldingDetailModalProps {
 }
 
 export function HoldingDetailModal({ line, onClose }: HoldingDetailModalProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
   const [range, setRange] = useState<TimeRange>('1Y')
-  const [mode, setMode] = useState<ChartMode>('price')
+  const [selectedMode, setSelectedMode] = useState<ChartMode>('price')
+
+  // The aggregated cash line (ticker 'EUR', quantity 0) and a fully sold position have no unit
+  // price: value / quantity is ∞, and 'EUR' is not a ticker any provider can chart. Those lines
+  // only ever show their total value — no price history, no mode toggle, no insight lookup.
+  const priceable = line != null && !line.isCash && line.quantity > 0
+  const mode: ChartMode = priceable ? selectedMode : 'holding'
 
   const months = range === 'ALL' ? 1200 : range === '3M' ? 3 : range === '1M' || range === '7D' ? 1 : range === 'YTD' ? new Date().getMonth() + 1 : 12
-  const { data: rawHistory, isLoading } = usePriceHistory(line?.ticker ?? null, months, range)
+  const { data: rawHistory, isLoading } = usePriceHistory(priceable ? line.ticker : null, months, range)
 
   const is24H = range === '24H'
 
@@ -105,7 +112,7 @@ export function HoldingDetailModal({ line, onClose }: HoldingDetailModalProps) {
                     className={line.pnlPercent >= 0 ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 gap-1' : 'bg-red-500/10 text-red-600 dark:text-red-400 gap-1'}
                   >
                     {line.pnlPercent >= 0 ? <TrendingUp className="size-3" /> : <TrendingDown className="size-3" />}
-                    {line.pnlPercent >= 0 ? '+' : ''}{line.pnlPercent.toFixed(1)}%
+                    {line.pnlPercent >= 0 ? '+' : ''}{formatPercent(line.pnlPercent / 100, locale)}
                   </Badge>
                 )}
               </div>
@@ -134,13 +141,14 @@ export function HoldingDetailModal({ line, onClose }: HoldingDetailModalProps) {
                   <div className="text-right">
                     <p className="text-xs text-muted-foreground mb-1">{t('holdings.evolution')}</p>
                     <span className={`text-xl font-medium tabular-nums ${priceChange.positive ? 'text-emerald-500' : 'text-red-500'}`}>
-                      {priceChange.positive ? '+' : ''}{priceChange.pct.toFixed(1)}%
+                      {priceChange.positive ? '+' : ''}{formatPercent(priceChange.pct / 100, locale)}
                     </span>
                   </div>
                 ) : null}
               </div>
 
               {/* Chart with mode toggle */}
+              {priceable && (
               <div className="space-y-3">
                 <div className="inline-flex items-center rounded-2xl bg-muted p-1">
                   {([
@@ -149,7 +157,9 @@ export function HoldingDetailModal({ line, onClose }: HoldingDetailModalProps) {
                   ]).map(opt => (
                     <button
                       key={opt.value}
-                      onClick={() => setMode(opt.value)}
+                      type="button"
+                      aria-pressed={mode === opt.value}
+                      onClick={() => setSelectedMode(opt.value)}
                       className={`inline-flex h-10 min-w-32 items-center justify-center rounded-xl px-6 text-sm font-medium transition-[background-color,color] ${
                         mode === opt.value
                           ? 'bg-background text-foreground'
@@ -173,12 +183,13 @@ export function HoldingDetailModal({ line, onClose }: HoldingDetailModalProps) {
                   <EmptyChartState />
                 ) : null}
               </div>
+              )}
 
               {/* Stats grid */}
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 pt-4 border-t">
                 <div>
                   <p className="text-xs text-muted-foreground mb-0.5">{t('holdings.quantity')}</p>
-                  <p className="text-sm font-semibold tabular-nums">{line.quantity.toLocaleString()}</p>
+                  <p className="text-sm font-semibold tabular-nums">{formatNumber(line.quantity, locale)}</p>
                 </div>
                 <div>
                   <p className="text-xs text-muted-foreground mb-0.5">{t('holdings.capitalInvested')}</p>
@@ -187,7 +198,7 @@ export function HoldingDetailModal({ line, onClose }: HoldingDetailModalProps) {
                       <CurrencyDisplay value={line.costBasisEur} className="text-sm font-semibold tabular-nums" />
                       {line.averageBuyIn != null && (
                         <p className="text-[10px] text-muted-foreground tabular-nums mt-0.5">
-                          {line.averageBuyIn.toFixed(2)} {t('holdings.perShare')}
+                          {formatNumber(line.averageBuyIn, locale, 2)} {t('holdings.perShare')}
                         </p>
                       )}
                     </>
@@ -214,7 +225,7 @@ export function HoldingDetailModal({ line, onClose }: HoldingDetailModalProps) {
               </div>
 
               {/* Asset-type & ETF composition insight */}
-              <HoldingInsightSection ticker={line.ticker} name={line.name} open={open} />
+              <HoldingInsightSection ticker={priceable ? line.ticker : null} name={line.name} open={open} />
             </div>
           </>
         )}

@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom'
-import { describe, it, expect, vi, beforeAll } from 'vitest'
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { AddTransactionModal } from './AddTransactionModal'
 
@@ -34,6 +34,27 @@ function fillInvestment({ qty, price, fees }: { qty: string; price: string; fees
   fireEvent.change(numeric[1], { target: { value: price } })
   fireEvent.change(numeric[2], { target: { value: fees } })
 }
+
+describe('AddTransactionModal default date', () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs() })
+
+  it('pre-fills the local calendar day, not the UTC one', async () => {
+    // 22:30Z on the 5th is 00:30 on the 6th in Paris. The default used to come from
+    // toISOString(), so a deposit entered just after midnight was dated yesterday.
+    vi.stubEnv('TZ', 'Europe/Paris')
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-05T22:30:00Z'))
+    const onSubmit = vi.fn().mockResolvedValue(undefined)
+    render(<AddTransactionModal open onOpenChange={vi.fn()} accountId={1} accountType="CHECKING" onSubmit={onSubmit} />)
+
+    fireEvent.change(document.querySelector('input[inputmode="decimal"]')!, { target: { value: '50' } })
+    fireEvent.change(screen.getAllByRole('textbox').find(el => (el as HTMLInputElement).value === '')!, { target: { value: 'Salary' } })
+    fireEvent.click(screen.getByRole('button', { name: 'common.create' }))
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ date: '2026-09-06', description: 'Salary', amount: 50 }))
+  })
+})
 
 describe('AddTransactionModal fees', () => {
   it('BUY amount includes fees: -(qty*price + fees)', async () => {

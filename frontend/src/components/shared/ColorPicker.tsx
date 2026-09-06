@@ -13,6 +13,9 @@ export function ColorPicker({ value, onChange }: ColorPickerProps) {
         <button
           key={color}
           type="button"
+          aria-label={color}
+          aria-pressed={value === color}
+          title={color}
           className={cn(
             'size-8 rounded-full border-2 transition-[border-color,box-shadow]',
             value === color ? 'border-background ring-2 ring-foreground' : 'border-transparent'

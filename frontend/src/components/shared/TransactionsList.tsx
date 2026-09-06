@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { Transaction } from '@/types/api'
 import { CurrencyDisplay } from '@/components/shared/CurrencyDisplay'
@@ -26,34 +26,56 @@ const TRANSACTION_TYPE_LABEL_KEYS = {
   FEE: 'accounts.fee',
 } satisfies Record<TransactionType, string>
 
+/**
+ * Rows rendered before the "show more" button. The endpoint returns an account's whole history
+ * with no paging, and an imported bank account carries years of it: mounting thousands of rows
+ * at once is what made the page stall.
+ */
+export const TRANSACTIONS_PAGE_SIZE = 200
+
 export function TransactionsList({ transactions, onDelete, onEdit }: TransactionsListProps) {
   const { t, i18n } = useTranslation()
   const [search, setSearch] = useState('')
+  const [limit, setLimit] = useState(TRANSACTIONS_PAGE_SIZE)
   const locale = localeFromLanguage(i18n.resolvedLanguage ?? i18n.language)
 
-  const filtered = search
-    ? transactions.filter(tr => {
-        const normalizedSearch = search.toLocaleLowerCase(locale)
-        const displayedDescription = transactionDescription(tr, t).toLocaleLowerCase(locale)
-        return (
-          displayedDescription.includes(normalizedSearch) ||
-          tr.description.toLocaleLowerCase(locale).includes(normalizedSearch)
-        )
-      })
-    : transactions
-  const showYear = new Set(filtered.map(tr => tr.date.slice(0, 4))).size > 1
+  // Memoised on the inputs rather than recomputed per render: the search box re-renders on
+  // every keystroke, and each pass lower-cases two strings per transaction.
+  const filtered = useMemo(() => {
+    if (!search) return transactions
+    const normalizedSearch = search.toLocaleLowerCase(locale)
+    return transactions.filter(tr => {
+      const displayedDescription = transactionDescription(tr, t).toLocaleLowerCase(locale)
+      return (
+        displayedDescription.includes(normalizedSearch) ||
+        tr.description.toLocaleLowerCase(locale).includes(normalizedSearch)
+      )
+    })
+  }, [transactions, search, locale, t])
 
-  // Group by date
-  const grouped = filtered.reduce<Record<string, Transaction[]>>((acc, tr) => {
-    const date = tr.date
-    if (!acc[date]) acc[date] = []
-    acc[date].push(tr)
-    return acc
-  }, {})
+  const visible = useMemo(() => filtered.slice(0, limit), [filtered, limit])
+  const hiddenCount = filtered.length - visible.length
 
-  const sortedDates = Object.keys(grouped).sort((a, b) => b.localeCompare(a))
+  const { grouped, sortedDates, showYear } = useMemo(() => {
+    const showYear = new Set(filtered.map(tr => tr.date.slice(0, 4))).size > 1
+    // Group by date
+    const grouped = visible.reduce<Record<string, Transaction[]>>((acc, tr) => {
+      const date = tr.date
+      if (!acc[date]) acc[date] = []
+      acc[date].push(tr)
+      return acc
+    }, {})
+    const sortedDates = Object.keys(grouped).sort((a, b) => b.localeCompare(a))
+    return { grouped, sortedDates, showYear }
+  }, [filtered, visible])
 
   if (transactions.length === 0) return null
+
+  function handleSearchChange(value: string) {
+    setSearch(value)
+    // A new search starts from the first page again.
+    setLimit(TRANSACTIONS_PAGE_SIZE)
+  }
 
   return (
     <Card>
@@ -64,7 +86,7 @@ export function TransactionsList({ transactions, onDelete, onEdit }: Transaction
         <Input
           placeholder={t('common.search')}
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => handleSearchChange(e.target.value)}
           className="mb-4"
         />
         {sortedDates.map((date, dateIdx) => (
@@ -126,6 +148,17 @@ export function TransactionsList({ transactions, onDelete, onEdit }: Transaction
             </div>
           </div>
         ))}
+        {hiddenCount > 0 && (
+          <div className="mt-4 flex justify-center">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setLimit(current => current + TRANSACTIONS_PAGE_SIZE)}
+            >
+              {t('common.showMore', { count: hiddenCount })}
+            </Button>
+          </div>
+        )}
       </CardContent>
     </Card>
   )
@@ -133,7 +166,9 @@ export function TransactionsList({ transactions, onDelete, onEdit }: Transaction
 
 /** Builds a localized fallback only for manual instrument rows that have no display name. */
 function transactionDescription(transaction: Transaction, translate: (key: string) => string): string {
-  if (!transaction.isManual || !transaction.ticker?.trim() || transaction.name?.trim() || transaction.txType === null) {
+  // `== null`: the backend omits null members (`non_null`), so a missing txType arrives as
+  // `undefined` — a strict null check never matched and the row rendered as "undefined AAPL".
+  if (!transaction.isManual || !transaction.ticker?.trim() || transaction.name?.trim() || transaction.txType == null) {
     return transaction.description
   }
 

@@ -1,6 +1,6 @@
 # Feature: Goals
 
-> Last updated: 2026-09-06 (calendar panel keyed per month; "achieved" counts strictly-past months; goal form surfaces save failures)
+> Last updated: 2026-09-06 (calendar panel keyed per month; "achieved" counts strictly-past months; goal form surfaces save failures; past-deadline goals stay writable — V80)
 
 ## Context
 
@@ -68,7 +68,7 @@ Users often start a goal in Picsou after they've already been saving for it. The
 - `backend/src/main/resources/db/migration/V32__goal_history_start.sql` -- adds the nullable `history_start_month` column
 - `backend/src/main/java/com/picsou/model/GoalMonthOverride.java` -- Per-month objective override (goal_id, yearMonth, amount)
 - `backend/src/main/java/com/picsou/model/GoalManualContribution.java` -- Per-month actual override (goal_id, yearMonth, amount)
-- `backend/src/main/java/com/picsou/repository/GoalRepository.java` -- `findAllWithAccounts()` for eager fetching
+- `backend/src/main/java/com/picsou/repository/GoalRepository.java` -- member-scoped lookups (`findAllByMemberIdOrderByCreatedAtAsc`, `findByIdAndMemberId`, `findByIdInAndMemberId`)
 - `backend/src/main/java/com/picsou/repository/GoalMonthOverrideRepository.java` -- Override lookup by goal + month
 - `backend/src/main/java/com/picsou/repository/GoalManualContributionRepository.java` -- Contribution lookup by goal + month
 - `frontend/src/pages/goals/GoalsPage.tsx` -- Goal list with cards, CRUD dialog, status badges, account chips
@@ -130,12 +130,14 @@ GoalService.setMonthOverride(goalId, yearMonth, amount)
 - **"Today" comes from the injected `java.time.Clock`** (`GoalService.today()`, JVM default zone): `monthsLeft`, the 3-month contribution window and the past/current month boundary all derive from it. `GoalServiceTest` pins the clock to a mid-month date so `plusMonths` never clamps — on a month-end day `deadline = today + 3 months` is only 2 whole months away and `monthlyNeeded` jumps.
 - **Override does not recalculate monthlyNeeded**: Setting a month override changes that month's *objective* (the denominator in the calendar and in `isOnTrack`), not the displayed savings and not the computed `monthlyNeeded`. The auto-computed objective (`objective` in the entry) is always based on `(target - current) / monthsLeft`.
 - **Effective-start to deadline range**: `getMonthlyEntries()` iterates from the effective start month (`min(createdAt, historyStartMonth)`) to the deadline month. If the goal was created mid-month, the first month's actual may be partial. Backfilled months (before `createdAt`) never have snapshot data.
-- **`findAllWithAccounts()` uses a custom query**: Goals are fetched with their accounts eagerly loaded to avoid N+1 queries during progress calculation.
+- **A passed deadline keeps the goal fully writable.** V2 declared `CHECK (deadline > CURRENT_DATE)` on `goal`, and PostgreSQL re-evaluates a table CHECK on every UPDATE of the row whatever column changed — so once the deadline was past, `extendHistory` / `extendHistoryByMonth` (which only set `historyStartMonth`) failed with a check violation and the backfill actions returned 500 on exactly the goals they exist for. `V80__drop_goal_deadline_check.sql` drops the constraint; the rule it meant to express — a *new* deadline must be in the future — lives on `@Future GoalRequest.deadline`, which the controller validates on create and on update alike.
 - **The month detail panel is keyed by `yearMonth`.** Its two inputs are seeded by lazy `useState` initializers (the [key-remount pattern](../conventions/frontend.md)), which only run at mount. Without `key={selectedEntry.yearMonth}` the desktop side panel is one long-lived instance, so selecting another month kept the previously typed amounts on screen and "Save override" / "Save manual" wrote them against the newly selected month.
 - **Account membership is member-scoped (IDOR guard)**: `create`/`update` resolve `accountIds` via `accountRepository.findByIdInAndMemberId(...)`, never the inherited `findAllById`. A caller can only attach accounts they own; a foreign/nonexistent id fails the size check with a generic 400. Do **not** revert this to `findAllById` — that re-opens a cross-member balance-disclosure IDOR (security audit 2026-06-27, CWE-639).
 
 ## Tests
 
+- `GoalDeadlineCheckMigrationTest` -- V80: the constraint is gone and a goal whose deadline has
+  passed still accepts the extend-history write (Testcontainers, skipped without Docker).
 - `GoalServiceTest` -- unit tests for progress calculation, monthly entries, override/manual-contribution writers (member scoping, upsert, override-vs-effective semantics), multi-account pace, months without snapshots, edge cases (deadline passed, no history). Runs on a fixed `Clock`.
 - `frontend/src/features/goals/objective.test.ts` -- `monthObjective` (override as denominator)
 - `frontend/src/pages/goals/GoalCalendarPage.test.tsx` -- selecting another month reloads the panel inputs from that month (the key-remount above), and the "achieved" badge counts only strictly-past months

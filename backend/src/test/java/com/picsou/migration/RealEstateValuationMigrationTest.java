@@ -74,9 +74,10 @@ class RealEstateValuationMigrationTest {
     @BeforeAll
     static void migrateAndSeed() throws SQLException {
         // The trailing "?" makes the target lenient: it means "everything up to 65, and do
-        // not fail if that exact version is absent". It is, since the crypto branch's V65 was
-        // renumbered to V72 when it merged around main's own V64 -- a hard "65" made this the
-        // only test in the suite that a renumber elsewhere could break.
+        // not fail if that exact version is absent". It is: the crypto branch's V65 was
+        // renumbered when it merged around main's own V64 and landed as V74, so no V65 exists
+        // on any branch -- a hard "65" made this the only test in the suite that a renumber
+        // elsewhere could break.
         migrateTo("65?");
 
         try (Connection conn = connect()) {

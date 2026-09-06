@@ -109,8 +109,9 @@ account card (see [accounts-overview.md](./accounts-overview.md#account-card-ana
 ## Gotchas / Pitfalls
 
 - **V66/V67 keep their numbers, below the current highest.** They were numbered above the
-  crypto branch's then-V64/V65, which have since become V71/V72 (renumbered around main's own
-  V64). They are deliberately *not* renumbered upward to match: they collide with nothing,
+  crypto branch's then-V64/V65, which have since landed as V73/V74 (renumbered around main's own
+  V64 and V71, leaving V65 and V72 permanently unused). They are deliberately *not* renumbered
+  upward to match: they collide with nothing,
   `flyway.out-of-order` is enabled for exactly this, and V66 is already applied on running
   instances — renumbering would leave those with an applied migration Flyway cannot resolve,
   and the app would refuse to start. Verified: an instance at main's V70 takes V66/V67 out of

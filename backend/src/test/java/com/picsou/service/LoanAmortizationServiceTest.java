@@ -143,6 +143,36 @@ class LoanAmortizationServiceTest {
         assertThat(remaining).isEqualByComparingTo("11700.00");
     }
 
+    @Test
+    void paidInstallments_countedOnTheSchedulesOwnDates_notOnCalendarMonths() {
+        // Installment i is dated startDate.plusMonths(i), so a loan starting on the 20th has
+        // nothing due on the 1st of the next month. Counting calendar months marked installment
+        // #1 (dated 2026-02-20) as paid on 2026-02-05, nineteen days early, and stepped
+        // remainingBalance down with it.
+        Debt debt = debt("12000", "0", "1000", "2026-01-20", "2027-01-20");
+
+        LoanScheduleResponse before = service.compute(debt, LocalDate.parse("2026-02-05"));
+        assertThat(before.summary().paidInstallments()).isZero();
+        assertThat(before.summary().remainingBalance()).isEqualByComparingTo("12000");
+
+        LoanScheduleResponse onDueDate = service.compute(debt, LocalDate.parse("2026-02-20"));
+        assertThat(onDueDate.summary().paidInstallments()).isEqualTo(1);
+        assertThat(onDueDate.schedule().getFirst().date()).isEqualTo(LocalDate.parse("2026-02-20"));
+        assertThat(onDueDate.summary().remainingBalance()).isEqualByComparingTo("11000.00");
+    }
+
+    @Test
+    void paidInstallments_monthEndStart_countsTheInstallmentDatedOnTheClampedDay() {
+        // 31 January + 1 month is 28 February: the schedule dates installment #1 there, so it is
+        // due that day even though ChronoUnit.MONTHS.between reports an incomplete month.
+        Debt debt = debt("12000", "0", "1000", "2026-01-31", "2027-01-31");
+
+        LoanScheduleResponse out = service.compute(debt, LocalDate.parse("2026-02-28"));
+
+        assertThat(out.schedule().getFirst().date()).isEqualTo(LocalDate.parse("2026-02-28"));
+        assertThat(out.summary().paidInstallments()).isEqualTo(1);
+    }
+
     private static Debt debt(String borrowed, String rate, String monthly, String start, String end) {
         return Debt.builder()
             .borrowedAmount(new BigDecimal(borrowed))

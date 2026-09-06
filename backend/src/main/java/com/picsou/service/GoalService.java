@@ -358,6 +358,7 @@ public class GoalService {
 
     @Transactional
     public GoalMonthEntryResponse setMonthOverride(Long goalId, String yearMonth, BigDecimal amount, Long memberId) {
+        YearMonth month = parseYearMonth(yearMonth);
         Goal goal = getOrThrow(goalId, memberId);
         GoalMonthOverride entry = overrideRepository
             .findByGoalIdAndYearMonth(goalId, yearMonth)
@@ -368,7 +369,7 @@ public class GoalService {
         overrideRepository.save(entry);
 
         BigDecimal objective = toProgressResponse(goal).monthlyNeeded();
-        BigDecimal actual = calculateActualForMonth(goal, YearMonth.parse(yearMonth));
+        BigDecimal actual = calculateActualForMonth(goal, month);
         BigDecimal manualActual = manualContributionRepository.findByGoalIdAndYearMonth(goalId, yearMonth)
             .map(GoalManualContribution::getAmount).orElse(null);
         return new GoalMonthEntryResponse(yearMonth, objective, actual, manualActual, amount, amount);
@@ -376,11 +377,12 @@ public class GoalService {
 
     @Transactional
     public GoalMonthEntryResponse deleteMonthOverride(Long goalId, String yearMonth, Long memberId) {
+        YearMonth month = parseYearMonth(yearMonth);
         Goal goal = getOrThrow(goalId, memberId);
         overrideRepository.findByGoalIdAndYearMonth(goal.getId(), yearMonth)
             .ifPresent(overrideRepository::delete);
         BigDecimal objective = toProgressResponse(goal).monthlyNeeded();
-        BigDecimal actual = calculateActualForMonth(goal, YearMonth.parse(yearMonth));
+        BigDecimal actual = calculateActualForMonth(goal, month);
         BigDecimal manualActual = manualContributionRepository.findByGoalIdAndYearMonth(goal.getId(), yearMonth)
             .map(GoalManualContribution::getAmount).orElse(null);
         BigDecimal effective = manualActual != null ? manualActual : actual;
@@ -389,6 +391,7 @@ public class GoalService {
 
     @Transactional
     public GoalMonthEntryResponse setManualContribution(Long goalId, String yearMonth, BigDecimal amount, Long memberId) {
+        YearMonth month = parseYearMonth(yearMonth);
         Goal goal = getOrThrow(goalId, memberId);
         GoalManualContribution entry = manualContributionRepository
             .findByGoalIdAndYearMonth(goalId, yearMonth)
@@ -402,7 +405,7 @@ public class GoalService {
         manualContributionRepository.save(entry);
 
         BigDecimal objective = toProgressResponse(goal).monthlyNeeded();
-        BigDecimal actual = calculateActualForMonth(goal, YearMonth.parse(yearMonth));
+        BigDecimal actual = calculateActualForMonth(goal, month);
         BigDecimal override = overrideRepository.findByGoalIdAndYearMonth(goalId, yearMonth)
             .map(GoalMonthOverride::getAmount).orElse(null);
         BigDecimal effective = override != null ? override : amount;
@@ -411,15 +414,30 @@ public class GoalService {
 
     @Transactional
     public GoalMonthEntryResponse deleteManualContribution(Long goalId, String yearMonth, Long memberId) {
+        YearMonth month = parseYearMonth(yearMonth);
         Goal goal = getOrThrow(goalId, memberId);
         manualContributionRepository.findByGoalIdAndYearMonth(goal.getId(), yearMonth)
             .ifPresent(manualContributionRepository::delete);
         BigDecimal objective = toProgressResponse(goal).monthlyNeeded();
-        BigDecimal actual = calculateActualForMonth(goal, YearMonth.parse(yearMonth));
+        BigDecimal actual = calculateActualForMonth(goal, month);
         BigDecimal override = overrideRepository.findByGoalIdAndYearMonth(goal.getId(), yearMonth)
             .map(GoalMonthOverride::getAmount).orElse(null);
         BigDecimal effective = override != null ? override : actual;
         return new GoalMonthEntryResponse(yearMonth, objective, actual, null, override, effective);
+    }
+
+    /**
+     * The month key of an override / manual contribution, validated before anything is looked up
+     * or written. The path variable arrives as a raw string and is persisted as the row key, so a
+     * loose value ("2025-3", "foo") used to be saved first and only then fail in
+     * {@code YearMonth.parse} — a rolled-back transaction surfacing as a 500 instead of a 400.
+     * Strict {@code YYYY-MM} keeps the stored keys byte-identical to what the calendar computes.
+     */
+    private static YearMonth parseYearMonth(String yearMonth) {
+        if (yearMonth == null || !yearMonth.matches("\\d{4}-(0[1-9]|1[0-2])")) {
+            throw new IllegalArgumentException("Month must be formatted as YYYY-MM");
+        }
+        return YearMonth.parse(yearMonth);
     }
 
     private BigDecimal calculateActualForMonth(Goal goal, YearMonth ym) {

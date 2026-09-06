@@ -3,6 +3,7 @@ package com.picsou.mcp.tools;
 import com.picsou.config.McpToolConfig;
 import com.picsou.mcp.RequiresScope;
 import com.picsou.mcp.Scopes;
+import com.picsou.service.AccountConnectionService;
 import com.picsou.service.AccountService;
 import com.picsou.service.BoursoSyncService;
 import com.picsou.service.CryptoExchangeSyncService;
@@ -63,7 +64,8 @@ class McpToolCatalogTest {
 
     /** Build the provider exactly as production does, with mocked services (never invoked during catalog build). */
     private ToolCallbackProvider buildProvider() {
-        AccountTools account = new AccountTools(mock(AccountService.class), mock(UserContext.class));
+        AccountTools account = new AccountTools(
+            mock(AccountService.class), mock(AccountConnectionService.class), mock(UserContext.class));
         TransactionTools tx = new TransactionTools(
             mock(AccountService.class), mock(ManualTransactionService.class), mock(UserContext.class));
         GoalTools goal = new GoalTools(mock(GoalService.class), mock(UserContext.class));

@@ -28,7 +28,8 @@ survives is a row that syncs forever, costs an outbound call per run, and can on
 
 Deleting an account also removes its connection, once no live account is left on that
 connection. `AccountConnectionService` owns the rule; `AccountController.delete` goes through it
-rather than through `AccountService.delete`.
+rather than through `AccountService.delete`, and so does the MCP `delete_account` tool
+(`AccountTools`) — every user-facing deletion path, whichever surface it comes from.
 
 "Its connection" is resolved from `external_account_id`, whose namespaces are disjoint —
 `wallet_`, `crypto_exchange_`, `amundi_`, `tr_`, `bd_`, `ibkr_`, `degiro-portfolio` — falling
@@ -89,6 +90,10 @@ Enable Banking requisition costs a full OAuth round trip through the bank.
   (`removeWallet`, `removeExchange`, each `clearSession`, `deleteConnection`,
   `deleteRequisition`). It sits outside `AccountService` because the connectors already depend
   on it, and calling them from there would close a Spring dependency cycle.
+- The MCP `delete_account` tool takes the same path (it is also limited to manual accounts, per the
+  MCP write contract); `AccountService.delete` keeps no caller that a user can reach. A new
+  deletion surface must go through `AccountConnectionService` too, or it reopens the orphan state
+  above.
 - Deletion order is fixed: the account is soft-deleted first, so a connector running
   concurrently finds the soft-deleted row and refuses to rebuild it rather than racing the
   removal.

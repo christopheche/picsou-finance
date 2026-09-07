@@ -120,8 +120,11 @@ class PortfolioCompletenessTest(unittest.TestCase):
         self.assertEqual(response.json()["detail"], "UPSTREAM_FORMAT_CHANGED")
 
     def test_a_row_without_a_price_is_refused(self):
+        # LIVE_SHAPED_UPDATE["cashFunds"] is already a {"value": rows} block;
+        # passing it through update_response() again would wrap it twice and
+        # fail as "Missing cashFunds" instead of exercising the missing price.
         body = update_response(
-            cashFunds=LIVE_SHAPED_UPDATE["cashFunds"],
+            cashFunds=LIVE_SHAPED_UPDATE["cashFunds"]["value"],
             portfolio=[{"id": "15690087", "value": pairs(size=290.67)}],
         )
         with mocked_degiro(200, body):

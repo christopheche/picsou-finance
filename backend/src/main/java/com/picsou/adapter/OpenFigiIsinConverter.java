@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.picsou.port.SymbolCatalogPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 
@@ -208,6 +209,9 @@ public class OpenFigiIsinConverter {
         }
     }
 
+    // Two constructors (production + test seam). Without this, Spring 6 refuses to
+    // pick either and looks for a no-arg constructor that does not exist.
+    @Autowired
     public OpenFigiIsinConverter(CoinGeckoPriceProvider coinGecko, SymbolCatalogPort symbolCatalog) {
         this(coinGecko, symbolCatalog, WebClient.builder()
             .baseUrl("https://api.openfigi.com")

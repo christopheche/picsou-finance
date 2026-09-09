@@ -21,6 +21,20 @@ vi.mock('react-i18next', () => ({
   }),
 }))
 
+// zustand persist (app-store dateFormat) writes localStorage; jsdom here has none.
+function memoryStorage(): Storage {
+  const m = new Map<string, string>()
+  return {
+    getItem: (k) => m.get(k) ?? null,
+    setItem: (k, v) => void m.set(k, String(v)),
+    removeItem: (k) => void m.delete(k),
+    clear: () => m.clear(),
+    key: (i) => [...m.keys()][i] ?? null,
+    get length() { return m.size },
+  } as Storage
+}
+vi.stubGlobal('localStorage', memoryStorage())
+
 const { SessionsList } = await import('./SessionsList')
 const { useAppStore } = await import('@/stores/app-store')
 
